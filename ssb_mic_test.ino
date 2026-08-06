@@ -1,4 +1,5 @@
 /**
+* PWM version (pre DAC)
  * ssb_mic_test.ino
  *
  * Arduino-IDE test bed for the SSB mic/DSP pipeline, refactored from the
