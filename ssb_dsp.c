@@ -4,6 +4,7 @@
 #include "ssb_dsp.h"
 #include "esp_log.h"
 
+
 static const char *TAG = "ssb_dsp";
 
 #ifndef M_PI
@@ -94,7 +95,7 @@ static inline float wrap_pi(float x)
     return x;
 }
 
-void ssb_dsp_process_sample(ssb_dsp_handle_t handle,
+void IRAM_ATTR ssb_dsp_process_sample(ssb_dsp_handle_t handle,
                              float audio_sample,
                              ssb_sideband_t sideband,
                              float *out_freq_dev_hz,

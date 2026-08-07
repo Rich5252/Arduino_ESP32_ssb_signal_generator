@@ -15,7 +15,12 @@
  *   dac_task  (Core 1, lower priority) - blocks waiting for a new envelope
  *             value, then does the MCP4725 I2C fast-write (~70us at
  *             400kHz - far too slow to share a task with the phase-
- *             critical AD9851 update without risking it).
+ *             critical AD9851 update without risking it). At the current
+ *             SAMPLE_RATE_HZ (9600, ~104us/sample) this comfortably fits
+ *             within one sample period. If you ever raise the sample rate
+ *             materially, revisit this - the I2C write doesn't scale down
+ *             with a faster sample clock, and an SPI DAC (e.g. MCP4921)
+ *             would be the fix at that point.
  *
  * Why a DAC instead of PWM+RC filter: at a -70dBc spurious target, a
  * switched (PWM) envelope needs either an impractically high switching
@@ -24,21 +29,24 @@
  * at that level regardless of filter order. A true DAC output has no
  * switching-frequency energy to suppress in the first place.
  *
+ * PWM_COMPARISON_ENABLED (below) adds the old LEDC+RC path back in,
+ * driven from the same envelope value as the DAC, purely so the two can
+ * be scoped side by side against the same source signal. Set to 0 once
+ * you're done comparing.
+ *
  * Completely standalone - doesn't touch or depend on TXlink at all yet.
  * Drop this .ino into a sketch folder of the same name, next to
  * ssb_dsp.c / ssb_dsp.h (already added to your project per last session).
  *
  * WIRING:
- *  - Mic preamp -> GPIO7 (ADC1 channel 6 on ESP32-S3 - NOT GPIO34, that's
- *    classic ESP32's mapping).
- *  - MCP4725 SDA -> MCP4725_SDA_GPIO, SCL -> MCP4725_SCL_GPIO (defaults
- *    below are placeholders - adjust to your wiring). Needs external
- *    ~4.7k pull-ups on both lines for reliable 400kHz operation - the
- *    ESP32's internal pull-ups are too weak on their own.
- *  - MCP4725 I2C address defaults to 0x60 (A0 pin tied low) - change
- *    MCP4725_I2C_ADDR if your board's A0 is wired differently.
- *  - MCP4725 VOUT feeds your RSET modulation circuit, same physical
- *    connection point the PWM+RC output used to feed.
+ *  - Mic preamp -> GPIO6 (ADC1 channel 5 on ESP32-S3).
+ *  - MCP4725 SDA -> MCP4725_SDA_GPIO, SCL -> MCP4725_SCL_GPIO. Needs
+ *    external ~4.7k pull-ups on both lines for reliable 400kHz operation -
+ *    the ESP32's internal pull-ups are too weak on their own.
+ *  - MCP4725 I2C address 0x61 (A0 pin tied high).
+ *  - MCP4725 VOUT feeds your RSET modulation circuit.
+ *  - PWM comparison output (RSET_MOD_LEDC_GPIO) -> RC filter -> scope,
+ *    for side-by-side comparison against the DAC output only.
  *
  * What to check once the preamp and DAC are wired up:
  *  - Serial monitor (115200): throttled envelope/freq-dev/DAC-code
@@ -47,7 +55,7 @@
  *  - Scope on the MCP4725's VOUT pin: should track your voice envelope
  *    directly, no switching ripple to look for at all.
  *  - TWOTONE_TEST_MODE below bypasses the mic with a synthesized signal -
- *    a zero-hardware smoke test of the DSP chain. Defaults to 0 (mic).
+ *    a zero-hardware smoke test of the DSP chain.
  *
  * When the AD9851 board arrives: flip AD9851_ATTACHED to 1 and fill in
  * ad9851_init()/ad9851_set_frequency() calls - the DSP/task/timer/DAC
@@ -61,7 +69,15 @@
 #include "driver/gptimer.h"
 #include "driver/i2c.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_attr.h"
 #include "esp_log.h"
+
+// Defined here (before includes that depend on it) rather than down with
+// the other PWM defines below - #if needs this to already be known.
+#define PWM_COMPARISON_ENABLED 1
+#if PWM_COMPARISON_ENABLED
+#include "driver/ledc.h"
+#endif
 
 #include "ssb_dsp.h"
 
@@ -72,32 +88,59 @@ static const char *TAG = "ssb_mic_test";
 #define AD9851_ATTACHED 0
 
 // ---- Two-tone test mode: bypass the mic ADC with a synthesized signal.
-// Zero-hardware smoke test of the DSP chain. Flip to 1 if you want to
-// sanity-check the chain before the preamp is wired up; 0 tests the
-// real mic path, which is the point of this sketch. ----
+// Zero-hardware smoke test of the DSP chain. ----
 #define TWOTONE_TEST_MODE   1
 #define TWOTONE_F1_HZ        700.0f
 #define TWOTONE_F2_HZ       1900.0f
 #define TWOTONE_AMPLITUDE    0.45f   // keep below 0.5 so peaks don't clip when summed
 
 // ---- MCP4725 DAC (RSET modulation output) ----
-// Adjust SDA/SCL to your actual wiring - these are placeholders.
-#define MCP4725_SDA_GPIO      8
-#define MCP4725_SCL_GPIO      9
+#define MCP4725_SDA_GPIO      13
+#define MCP4725_SCL_GPIO      12
 #define MCP4725_I2C_PORT      I2C_NUM_0
 #define MCP4725_I2C_FREQ_HZ   400000        // fast mode - standard (100kHz) is too slow to fit the sample period
-#define MCP4725_I2C_ADDR      0x60          // 0x60 with A0 tied low, 0x61 with A0 tied high
+#define MCP4725_I2C_ADDR      0x61          // 0x60 with A0 tied low, 0x61 with A0 tied high
 // Keep output codes off the 0/4095 rails - MCP4725 linearity degrades
 // near the extremes (datasheet-recommended usable range).
 #define DAC_CODE_MIN           100
 #define DAC_CODE_MAX          4000
 
-#define ADC_UNIT       ADC_UNIT_1
-#define ADC_CHANNEL    ADC_CHANNEL_6   // GPIO7 on ESP32-S3 (NOT GPIO34 - that's classic ESP32) - wire preamp output here
+// ---- PWM comparison path: drives the same envelope value out via
+// LEDC+RC as well as the DAC, so you can scope both side by side against
+// the same source signal. Set PWM_COMPARISON_ENABLED (above, near the
+// includes) to 0 once you're done comparing - this was removed from the
+// main design in favour of the DAC (imaging/spurious concerns discussed
+// earlier), this is just for a direct side-by-side look.
+#define RSET_MOD_LEDC_GPIO    2      // within the board's easy-access GPIO1-13 range; not otherwise used
+#define RSET_MOD_LEDC_TIMER   LEDC_TIMER_0
+#define RSET_MOD_LEDC_CH      LEDC_CHANNEL_0
+#define RSET_MOD_LEDC_FREQ_HZ 78125  // max achievable at 10-bit res on 80MHz APB clock (see earlier discussion)
+#define RSET_MOD_LEDC_RES     LEDC_TIMER_10_BIT
 
-#define SAMPLE_RATE_HZ     9600u
+#define ADC_UNIT       ADC_UNIT_1
+#define ADC_CHANNEL    ADC_CHANNEL_5   // GPIO6 on ESP32-S3 - Micr input
+
+// ---- Timing debug pin: toggled high at the start of dsp_task's real work
+// and low at the end, so a scope on this pin directly measures the actual
+// loop iteration time on real hardware - much more trustworthy than
+// estimating it. Set to 0 to remove once you've got your measurement.
+#define TIMING_DEBUG_ENABLED 1
+#define TIMING_DEBUG_GPIO     4   // within the board's easy-access GPIO1-13 range; not otherwise used
+
+#define SAMPLE_RATE_HZ     20000u
 #define HILBERT_TAPS       65
 #define MAX_FREQ_DEV_HZ    2800.0f
+
+// Target max DAC update rate. The envelope only carries content up to
+// ~3.5-4kHz, so ~10kHz comfortably clears Nyquist. Deliberately throttling
+// down from "as fast as the I2C bus allows" (~14kHz back-to-back) reduces
+// how often the I2C driver's ISR fires - which we've confirmed is the
+// actual source of the cross-core timing jitter on dsp_task, not flash
+// cache eviction. This trades unneeded DAC update margin for reduced
+// disruption, at no audio-quality cost. Applied on the SENDING side
+// (dsp_task skips xQueueOverwrite itself) - see dsp_task for why.
+#define DAC_TARGET_UPDATE_RATE_HZ 10000u
+#define DAC_WRITE_DECIMATION ((SAMPLE_RATE_HZ + DAC_TARGET_UPDATE_RATE_HZ - 1) / DAC_TARGET_UPDATE_RATE_HZ)  // round up
 
 #if AD9851_ATTACHED
 #include "ad9851.h"
@@ -148,15 +191,25 @@ static inline float generate_twotone_sample(void)
 }
 #endif
 
-static void dsp_task(void *arg)
+// IRAM_ATTR - keeps this task's code in internal RAM rather than flash,
+// so it's immune to cache-line stalls caused by Core 1 activity (dac_task's
+// I2C driver work) touching flash. Confirmed by disabling dac_task and
+// seeing timing clean up - this is the structural fix rather than just
+// working around it by leaving dac_task off.
+static void IRAM_ATTR dsp_task(void* arg)
 {
     // Simple DC-blocking single-pole high-pass state (mic path only)
     float dc_estimate = 0.0f;
     const float dc_alpha = 0.995f;
+    uint32_t dac_skip_count = 0;
 
     while (1) {
         // Block until the timer ISR notifies us - this sets our sample rate.
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+#if TIMING_DEBUG_ENABLED
+        digitalWrite(TIMING_DEBUG_GPIO, HIGH);
+#endif
 
         float sample;
 #if TWOTONE_TEST_MODE
@@ -181,16 +234,45 @@ static void dsp_task(void *arg)
 
         // envelope is roughly [0,1] for typical mic levels but not
         // rigorously bounded - clamp before handing off.
-        if (envelope < 0.0f) envelope = 0.0f;
+        envelope = envelope * 0.9 + 0.2;
+        if (envelope < 0.2f) envelope = 0.2f;
         if (envelope > 1.0f) envelope = 1.0f;
 
         // Non-blocking, always succeeds - overwrites whatever was there.
         // dac_task will pick up the latest value whenever it next runs;
         // this call never waits on the I2C bus.
-        xQueueOverwrite(s_envelope_queue, &envelope);
+        //
+        // Throttled to DAC_TARGET_UPDATE_RATE_HZ: xQueueOverwrite wakes
+        // dac_task's blocked receiver on every call, so calling it every
+        // sample means waking the other core at the full DSP rate even
+        // when most of those wakes would do nothing but immediately
+        // re-block. Skipping the call itself (not just the write on the
+        // receiving end) genuinely reduces cross-core wake frequency,
+        // which is what we've confirmed actually causes the jitter.
+        dac_skip_count++;
+        if (dac_skip_count >= DAC_WRITE_DECIMATION) {
+            dac_skip_count = 0;
+            xQueueOverwrite(s_envelope_queue, &envelope);
+        }
+
+#if PWM_COMPARISON_ENABLED
+        // Same envelope value, driven out via LEDC - this write is a
+        // near-instant register write (unlike the DAC's I2C transaction),
+        // so it's safe to do directly here in dsp_task without decoupling.
+        {
+            uint32_t max_duty = (1u << RSET_MOD_LEDC_RES) - 1u;
+            uint32_t duty = (uint32_t)(envelope * (float)max_duty);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_CH, duty);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_CH);
+        }
+#endif
 
         s_dbg_envelope = envelope;
         s_dbg_freq_dev = freq_dev_hz;
+
+#if TIMING_DEBUG_ENABLED
+        digitalWrite(TIMING_DEBUG_GPIO, LOW);
+#endif    
     }
 }
 
@@ -205,7 +287,18 @@ static void mcp4725_fast_write(uint16_t code12)
         (uint8_t)((code12 >> 8) & 0x0F),
         (uint8_t)(code12 & 0xFF),
     };
-    i2c_master_write_to_device(MCP4725_I2C_PORT, MCP4725_I2C_ADDR, buf, sizeof(buf), pdMS_TO_TICKS(10));
+    esp_err_t err = i2c_master_write_to_device(MCP4725_I2C_PORT, MCP4725_I2C_ADDR, buf, sizeof(buf), pdMS_TO_TICKS(10));
+    if (err != ESP_OK) {
+        // Throttled - at 9600Hz we'd otherwise flood the log if the bus is
+        // genuinely broken (wrong address, no pull-ups, no ACK, etc.)
+        static uint32_t last_err_log_ms = 0;
+        uint32_t now = millis();
+        if (now - last_err_log_ms >= 1000) {
+            last_err_log_ms = now;
+            ESP_LOGW(TAG, "MCP4725 write failed: %s (check address 0x%02X, pull-ups, wiring)",
+                esp_err_to_name(err), MCP4725_I2C_ADDR);
+        }
+    }
 }
 
 static void dac_task(void *arg)
@@ -215,6 +308,13 @@ static void dac_task(void *arg)
         // Blocks here - this task's whole job is to wait for a value and
         // write it out. Whatever this ~70us I2C write costs, it only
         // delays how fresh THIS task's own output is, never dsp_task.
+        // Throttling now happens on the SENDING side (dsp_task) - see
+        // DAC_WRITE_DECIMATION there. Doing it here via "continue" instead
+        // made things worse: xQueueOverwrite wakes a blocked receiver on
+        // every call regardless of whether work is skipped, so skipping
+        // the write but still re-blocking immediately just meant MORE
+        // frequent cross-core wake events, not fewer - the opposite of
+        // what we wanted.
         xQueueReceive(s_envelope_queue, &envelope, portMAX_DELAY);
 
         uint16_t code = (uint16_t)(DAC_CODE_MIN + envelope * (float)(DAC_CODE_MAX - DAC_CODE_MIN));
@@ -236,6 +336,30 @@ static void init_i2c_dac(void)
     i2c_param_config(MCP4725_I2C_PORT, &conf);
     i2c_driver_install(MCP4725_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
 }
+
+#if PWM_COMPARISON_ENABLED
+static void init_rset_mod_pwm(void)
+{
+    ledc_timer_config_t timer_cfg = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = RSET_MOD_LEDC_RES,
+        .timer_num = RSET_MOD_LEDC_TIMER,
+        .freq_hz = RSET_MOD_LEDC_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ledc_timer_config(&timer_cfg);
+
+    ledc_channel_config_t ch_cfg = {
+        .gpio_num = RSET_MOD_LEDC_GPIO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = RSET_MOD_LEDC_CH,
+        .timer_sel = RSET_MOD_LEDC_TIMER,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    ledc_channel_config(&ch_cfg);
+}
+#endif
 
 static void init_adc(void)
 {
@@ -282,6 +406,11 @@ void setup()
     Serial.begin(115200);
     delay(200);   // give USB CDC a moment to enumerate before we print
 
+#if TIMING_DEBUG_ENABLED
+    pinMode(TIMING_DEBUG_GPIO, OUTPUT);
+    digitalWrite(TIMING_DEBUG_GPIO, LOW);
+#endif
+
 #if AD9851_ATTACHED
     ad9851_config_t ad_cfg = {
         .spi_host = SPI2_HOST,
@@ -306,6 +435,25 @@ void setup()
 
     init_adc();
     init_i2c_dac();
+#if PWM_COMPARISON_ENABLED
+    init_rset_mod_pwm();
+#endif
+    // Explicit connectivity probe - writes mid-scale once so success/failure
+    // is obvious in the log immediately at boot, rather than inferred later
+    // from DAC behavior.
+    {
+        uint8_t probe_buf[2] = { 0x08, 0x00 };  // code 0x800 = mid-scale
+        esp_err_t probe_err = i2c_master_write_to_device(MCP4725_I2C_PORT, MCP4725_I2C_ADDR,
+            probe_buf, sizeof(probe_buf), pdMS_TO_TICKS(50));
+        if (probe_err == ESP_OK) {
+            ESP_LOGI(TAG, "MCP4725 probe OK at address 0x%02X", MCP4725_I2C_ADDR);
+        }
+        else {
+            ESP_LOGE(TAG, "MCP4725 probe FAILED at address 0x%02X: %s - check wiring/pull-ups/address before proceeding",
+                MCP4725_I2C_ADDR, esp_err_to_name(probe_err));
+        }
+    }
+
 
     s_envelope_queue = xQueueCreate(1, sizeof(float));
 
@@ -321,11 +469,12 @@ void setup()
 
     init_sample_timer();
 
-    ESP_LOGI(TAG, "SSB mic test running: taps=%d fs=%uHz mode=%s ad9851=%s dac=MCP4725@0x%02X",
+    ESP_LOGI(TAG, "SSB mic test running: taps=%d fs=%uHz mode=%s ad9851=%s dac=MCP4725@0x%02X pwm_compare=%s",
              HILBERT_TAPS, SAMPLE_RATE_HZ,
              TWOTONE_TEST_MODE ? "TWO-TONE TEST" : "mic",
              AD9851_ATTACHED ? "attached" : "not attached (stubbed)",
-             MCP4725_I2C_ADDR);
+             MCP4725_I2C_ADDR,
+             PWM_COMPARISON_ENABLED ? "on" : "off");
 }
 
 void loop()
@@ -337,7 +486,7 @@ void loop()
     uint32_t now = millis();
     if (now - last_print_ms >= 200) {
         last_print_ms = now;
-        Serial.printf("envelope=%.3f  freq_dev=%.1fHz  dac_code=%u\n",
+        Serial.printf("envelope=,%.3f  ,freq_dev=,%.1f,Hz  dac_code=,%u\r\n",
                       s_dbg_envelope, s_dbg_freq_dev, s_dbg_dac_code);
     }
     delay(10);

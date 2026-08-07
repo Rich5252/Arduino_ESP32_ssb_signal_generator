@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
+#include "esp_attr.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -71,7 +72,7 @@ esp_err_t ssb_dsp_init(const ssb_dsp_config_t *cfg, ssb_dsp_handle_t *out_handle
  *                          full-scale input; caller may need their own gain
  *                          scaling depending on input signal levels.
  */
-void ssb_dsp_process_sample(ssb_dsp_handle_t handle,
+void IRAM_ATTR ssb_dsp_process_sample(ssb_dsp_handle_t handle,
                              float audio_sample,
                              ssb_sideband_t sideband,
                              float *out_freq_dev_hz,
