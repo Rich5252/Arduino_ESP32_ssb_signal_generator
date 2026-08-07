@@ -460,8 +460,8 @@ void setup()
     // dac_task on Core 1 (with Arduino's own loop(), which is mostly idle
     // here) at low priority - keeps it fully off Core 0, no scheduling
     // interaction with dsp_task at all.
-    xTaskCreatePinnedToCore(dac_task, "ssb_dac_task", 3072, NULL,
-                             tskIDLE_PRIORITY + 1, &s_dac_task, 1);
+    //xTaskCreatePinnedToCore(dac_task, "ssb_dac_task", 3072, NULL,
+    //                       tskIDLE_PRIORITY + 1, &s_dac_task, 1);
 
     // dsp_task on Core 0, high priority - the phase-critical path.
     xTaskCreatePinnedToCore(dsp_task, "ssb_dsp_task", 4096, NULL,
