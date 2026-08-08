@@ -79,6 +79,8 @@
 #include "driver/ledc.h"
 #endif
 
+#define dac_task_enabled 0
+
 #include "ssb_dsp.h"
 
 static const char *TAG = "ssb_mic_test";
@@ -89,7 +91,7 @@ static const char *TAG = "ssb_mic_test";
 
 // ---- Two-tone test mode: bypass the mic ADC with a synthesized signal.
 // Zero-hardware smoke test of the DSP chain. ----
-#define TWOTONE_TEST_MODE   1
+#define TWOTONE_TEST_MODE   0
 #define TWOTONE_F1_HZ        700.0f
 #define TWOTONE_F2_HZ       1900.0f
 #define TWOTONE_AMPLITUDE    0.45f   // keep below 0.5 so peaks don't clip when summed
@@ -381,7 +383,7 @@ static void init_sample_timer(void)
     gptimer_config_t timer_cfg = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 1000000, // 1MHz tick = 1us resolution
+        .resolution_hz = 2000000, // 1MHz tick = 1us resolution
     };
     gptimer_new_timer(&timer_cfg, &timer);
 
@@ -391,7 +393,7 @@ static void init_sample_timer(void)
     gptimer_register_event_callbacks(timer, &cbs, NULL);
 
     gptimer_alarm_config_t alarm_cfg = {
-        .alarm_count = 1000000 / SAMPLE_RATE_HZ,
+        .alarm_count = 2000000 / SAMPLE_RATE_HZ,
         .reload_count = 0,
     };
     alarm_cfg.flags.auto_reload_on_alarm = true;  // nested dotted designators aren't valid C++
@@ -460,8 +462,10 @@ void setup()
     // dac_task on Core 1 (with Arduino's own loop(), which is mostly idle
     // here) at low priority - keeps it fully off Core 0, no scheduling
     // interaction with dsp_task at all.
-    //xTaskCreatePinnedToCore(dac_task, "ssb_dac_task", 3072, NULL,
-    //                       tskIDLE_PRIORITY + 1, &s_dac_task, 1);
+#if dac_task_enabled
+    xTaskCreatePinnedToCore(dac_task, "ssb_dac_task", 3072, NULL,
+                           tskIDLE_PRIORITY + 1, &s_dac_task, 1);
+#endif
 
     // dsp_task on Core 0, high priority - the phase-critical path.
     xTaskCreatePinnedToCore(dsp_task, "ssb_dsp_task", 4096, NULL,
@@ -484,7 +488,7 @@ void loop()
     // competes with either for CPU time or bus access.
     static uint32_t last_print_ms = 0;
     uint32_t now = millis();
-    if (now - last_print_ms >= 200) {
+    if (now - last_print_ms >= 20) {
         last_print_ms = now;
         Serial.printf("envelope=,%.3f  ,freq_dev=,%.1f,Hz  dac_code=,%u\r\n",
                       s_dbg_envelope, s_dbg_freq_dev, s_dbg_dac_code);
