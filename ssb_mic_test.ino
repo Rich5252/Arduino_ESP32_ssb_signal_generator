@@ -60,17 +60,38 @@
  * When the AD9851 board arrives: flip AD9851_ATTACHED to 1 and fill in
  * ad9851_init()/ad9851_set_frequency() calls - the DSP/task/timer/DAC
  * structure here doesn't need to change either way.
+ *
+ * AUDIO_FX_ENABLED (below) turns on an optional pre-Hilbert conditioning
+ * stage inside ssb_dsp itself (HPF + presence peak + compressor, see
+ * ssb_dsp.h). Runs on plain mult/add per sample - no measurable timing
+ * impact expected, but re-check the TIMING_DEBUG_GPIO scope trace after
+ * enabling to confirm rather than assume.
+ *
+ * ADC: uses adc_continuous (DMA), not adc_oneshot. Measured overhead of
+ * adc_oneshot_read() at this sample rate (~147us/call) made it unusable
+ * for a 50us period - adc_oneshot is documented as intended for
+ * occasional reads, not audio-rate polling. adc_continuous free-runs the
+ * ADC into a DMA buffer on its own clock (ADC_CONT_SAMPLE_FREQ_HZ,
+ * slightly above SAMPLE_RATE_HZ); dsp_task's gptimer-driven cadence is
+ * UNCHANGED - it still fires at exactly SAMPLE_RATE_HZ, one sample per
+ * tick, which is what keeps AD9851/PWM updates correctly paced. Each
+ * tick just pops whatever's newest out of the DMA buffer (cheap) instead
+ * of triggering a fresh blocking conversion (expensive). See dsp_task
+ * and init_adc() for the details.
  */
 
 #include <math.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/gptimer.h"
 #include "driver/i2c.h"
-#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_continuous.h"
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
 
 // Defined here (before includes that depend on it) rather than down with
 // the other PWM defines below - #if needs this to already be known.
@@ -83,7 +104,9 @@
 
 #include "ssb_dsp.h"
 
-static const char *TAG = "ssb_mic_test";
+// (No TAG/ESP_LOG here - everything in this file uses Serial.printf so it's
+// visible regardless of the IDE's Core Debug Level setting. ssb_dsp.c has
+// its own separate TAG for its internal ESP_LOG calls.)
 
 // ---- Set to 1 once the AD9851 board is wired up and its driver calls
 // below are filled in. Until then this runs mic->DSP->DAC standalone. ----
@@ -91,10 +114,17 @@ static const char *TAG = "ssb_mic_test";
 
 // ---- Two-tone test mode: bypass the mic ADC with a synthesized signal.
 // Zero-hardware smoke test of the DSP chain. ----
-#define TWOTONE_TEST_MODE   0
+#define TWOTONE_TEST_MODE   1
 #define TWOTONE_F1_HZ        700.0f
 #define TWOTONE_F2_HZ       1900.0f
 #define TWOTONE_AMPLITUDE    0.45f   // keep below 0.5 so peaks don't clip when summed
+
+// ---- Pre-Hilbert audio conditioning (HPF + presence EQ + compressor) ----
+// See ssb_dsp.h's ssb_audio_fx_config_t for the individual parameters,
+// set below in dsp_cfg.audio_fx. Leave off with TWOTONE_TEST_MODE if you
+// want to look at the raw DSP chain's spurious performance without any
+// conditioning in the signal path.
+#define AUDIO_FX_ENABLED 0
 
 // ---- MCP4725 DAC (RSET modulation output) ----
 #define MCP4725_SDA_GPIO      13
@@ -121,6 +151,68 @@ static const char *TAG = "ssb_mic_test";
 
 #define ADC_UNIT       ADC_UNIT_1
 #define ADC_CHANNEL    ADC_CHANNEL_5   // GPIO6 on ESP32-S3 - Micr input
+
+// ---- adc_continuous (DMA) config, replacing adc_oneshot ----
+// adc_oneshot's per-call overhead (~147us measured) is documented as
+// unsuitable for audio-rate polling - it's built for occasional reads.
+//
+// HISTORY (kept for context, since this took a few iterations to land on):
+// v1 (polling adc_continuous_read() from dsp_task each tick) hit two
+// separate problems depending on frame size: a large frame (64 samples
+// @ ~21kHz, ~3ms to fill) meant most ticks found nothing ready and reused
+// a stale sample for milliseconds at a time (measured as "low and
+// non-monotonic, with inversions"). Shrinking the frame to reduce
+// staleness (4 samples @ 80kHz) instead made adc_continuous_read() itself
+// land at nearly the SAME rate as dsp_task's own tick, and the read call
+// jumped to ~50-53us regardless of further frame/rate tuning - evidence
+// that ~50us is close to the real cost of a genuinely successful
+// (non-stale) read on this build, not something more tuning would fix.
+//
+// v2 (this version): register adc_continuous's on_conv_done EVENT
+// CALLBACK instead of polling. The callback runs in ISR context right
+// when a frame completes and hands us a direct pointer to the frame data
+// (adc_continuous_evt_data_t::conv_frame_buffer) - no adc_continuous_read()
+// call needed there at all (the ESP-IDF docs are explicit that read()
+// isn't ISR-safe to call from within the callback anyway). The callback
+// just decodes the newest sample and stores it in s_last_adc_raw
+// (volatile). dsp_task then does a plain volatile read - no driver call,
+// no locking, in its hot path at all. This decouples freshness (still
+// governed by frame size - the callback only fires once per completed
+// frame, so a smaller frame is still fresher) from dsp_task's per-tick
+// COST, which is now negligible regardless of frame size.
+//
+// The underlying pool still needs periodic draining via
+// adc_continuous_read() to avoid on_pool_ovf - see loop(), where this
+// happens at low priority on Core 1, fully decoupled from dsp_task.
+//
+// AVERAGING: frame=1 (the original version of this section) meant the
+// callback only ever kept the single freshest raw ADC reading - real
+// oversampling was happening (ADC running faster than the tick rate) but
+// none of it was being used to reduce noise, since every sample but the
+// last was simply discarded. adc_conv_done_cb now averages across the
+// whole frame instead of just taking its tail sample, which is free
+// (happens once per callback, not per tick) now that the callback
+// architecture has already removed dsp_task's per-tick driver cost.
+// N=16 samples at 80kHz gives a ~200us averaging window (~4 ticks' worth
+// of latency - a deliberate trade, same order as the earlier "middle
+// ground" frame-size attempt, but this time buying real noise reduction
+// via averaging rather than nothing) and reduces noise by roughly
+// sqrt(16)=4x. The averaging itself acts as a mild low-pass filter
+// (~ADC_CONT_SAMPLE_FREQ_HZ/N = 5kHz here), deliberately kept above the
+// ~3-4kHz voice band so it's filtering noise, not attenuating wanted
+// audio. Reduce N (or lower ADC_CONT_SAMPLE_FREQ_HZ/N further) if 5kHz
+// turns out to still be clipping audible content; raise N for more noise
+// reduction if there's margin to spare - this is a real tuning knob,
+// worth listening to the result rather than assuming these numbers are
+// final.
+#define ADC_CONT_SAMPLE_FREQ_HZ   80000u   // within ESP32-S3's continuous-mode range
+#define ADC_CONT_FRAME_SAMPLES    16    // averaged in adc_conv_done_cb - see note above.
+                                         // If adc_continuous_new_handle() errors on this, the
+                                         // driver enforces a different frame-size constraint -
+                                         // report the exact error and we'll adjust.
+#define ADC_CONT_FRAME_BYTES      (ADC_CONT_FRAME_SAMPLES * SOC_ADC_DIGI_DATA_BYTES_PER_CONV)
+#define ADC_CONT_BUF_BYTES        4096  // sized for periodic draining from loop() (~10ms cadence) rather
+                                         // than tied to frame size
 
 // ---- Timing debug pin: toggled high at the start of dsp_task's real work
 // and low at the end, so a scope on this pin directly measures the actual
@@ -157,7 +249,8 @@ static volatile uint32_t s_carrier_hz = CARRIER_HZ;
 #endif
 
 static ssb_dsp_handle_t s_ssb;
-static adc_oneshot_unit_handle_t s_adc;
+static adc_continuous_handle_t s_adc;
+static volatile int s_last_adc_raw = 2048;   // mid-scale fallback for the rare DMA-underrun case (see dsp_task)
 static TaskHandle_t s_dsp_task;
 static TaskHandle_t s_dac_task;
 static QueueHandle_t s_envelope_queue;   // length 1, "latest value wins" (xQueueOverwrite)
@@ -169,11 +262,63 @@ static volatile float s_dbg_envelope = 0.0f;
 static volatile float s_dbg_freq_dev = 0.0f;
 static volatile uint16_t s_dbg_dac_code = 0;
 
+// Worst-case timing diagnostics for dsp_task. Read/printed from loop()
+// only (never from dsp_task itself - no Serial calls on the real-time
+// path). max_busy_us is a running high-water mark, never reset, so it
+// captures the worst case seen since boot even if it only happens once.
+// overrun_count increments any sample whose processing took longer than
+// one sample period - if this climbs, dsp_task is at risk of never
+// yielding back to ulTaskNotifyTake, which starves IDLE0 and trips the
+// task watchdog (this is what happened before the denormal-flush fix).
+static volatile uint32_t s_dbg_max_busy_us = 0;
+static volatile uint32_t s_dbg_overrun_count = 0;
+static const uint32_t k_sample_period_us = 1000000UL / SAMPLE_RATE_HZ;
+
+// Phase breakdown of the same total: which part of dsp_task's work is
+// actually costing the most. Same rules as above - volatile, plain
+// writes only, read/printed from loop(), never touched from dsp_task
+// beyond these updates.
+static volatile uint32_t s_dbg_max_adc_us = 0;
+static volatile uint32_t s_dbg_max_dsp_us = 0;
+static volatile uint32_t s_dbg_max_write_us = 0;
+
 static bool IRAM_ATTR on_timer_alarm(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
     BaseType_t high_task_woken = pdFALSE;
     vTaskNotifyGiveFromISR(s_dsp_task, &high_task_woken);
     return high_task_woken == pdTRUE;
+}
+
+// adc_continuous's on_conv_done callback - ISR context, fires once per
+// completed conversion frame. edata->conv_frame_buffer is a direct
+// pointer into driver-owned memory (never free it) containing that
+// frame's raw bytes. No adc_continuous_read() call here - the ESP-IDF
+// docs are explicit that blocking driver calls don't belong in this
+// callback; the pool still needs periodic draining, but that happens
+// separately in loop() (see there), fully decoupled from this.
+//
+// Averages across the whole frame (ADC_CONT_FRAME_SAMPLES readings)
+// rather than just keeping the last one - see the comment by
+// ADC_CONT_FRAME_SAMPLES for why. Sums edata->size (not the FRAME_SAMPLES
+// constant directly) in case the driver ever delivers a partial frame,
+// clamped defensively either way; integer sum + one runtime divide by a
+// small N is negligible cost even in ISR context.
+static bool IRAM_ATTR adc_conv_done_cb(adc_continuous_handle_t handle,
+                                        const adc_continuous_evt_data_t *edata,
+                                        void *user_data)
+{
+    uint32_t n = edata->size / SOC_ADC_DIGI_DATA_BYTES_PER_CONV;
+    if (n == 0) return false;
+    if (n > ADC_CONT_FRAME_SAMPLES) n = ADC_CONT_FRAME_SAMPLES;   // defensive - shouldn't happen
+
+    uint32_t sum = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        adc_digi_output_data_t *p = (adc_digi_output_data_t *)
+            (edata->conv_frame_buffer + i * SOC_ADC_DIGI_DATA_BYTES_PER_CONV);
+        sum += p->type2.data;
+    }
+    s_last_adc_raw = (int)(sum / n);
+    return false;   // no higher-priority task needs waking from this event
 }
 
 #if TWOTONE_TEST_MODE
@@ -212,22 +357,29 @@ static void IRAM_ATTR dsp_task(void* arg)
 #if TIMING_DEBUG_ENABLED
         digitalWrite(TIMING_DEBUG_GPIO, HIGH);
 #endif
+        int64_t t_start_us = esp_timer_get_time();
 
         float sample;
 #if TWOTONE_TEST_MODE
         sample = generate_twotone_sample();
 #else
-        int raw = 0;
-        adc_oneshot_read(s_adc, ADC_CHANNEL, &raw);
+        // s_last_adc_raw is kept fresh by adc_conv_done_cb (ISR context,
+        // fires once per completed DMA frame) - no driver call here at
+        // all, just a plain volatile read. This is what actually removed
+        // the ~50us adc_continuous_read() cost from the hot path; the
+        // earlier drain-loop-per-tick approach is gone.
+        int raw = s_last_adc_raw;
         // Normalize 12-bit ADC (0-4095) to roughly [-1, 1] with DC removal.
         sample = (float)raw / 2048.0f - 1.0f;
         dc_estimate = dc_alpha * dc_estimate + (1.0f - dc_alpha) * sample;
         sample -= dc_estimate;
 #endif
+        int64_t t_adc_done_us = esp_timer_get_time();
 
         float freq_dev_hz = 0.0f;
         float envelope = 0.0f;
         ssb_dsp_process_sample(s_ssb, sample, s_sideband, &freq_dev_hz, &envelope);
+        int64_t t_dsp_done_us = esp_timer_get_time();
 
 #if AD9851_ATTACHED
         uint32_t tx_freq = s_carrier_hz + (int32_t)freq_dev_hz;
@@ -237,7 +389,7 @@ static void IRAM_ATTR dsp_task(void* arg)
         // envelope is roughly [0,1] for typical mic levels but not
         // rigorously bounded - clamp before handing off.
         envelope = envelope * 0.9 + 0.2;
-        if (envelope < 0.2f) envelope = 0.2f;
+        if (envelope < 0.0f) envelope = 0.0f;
         if (envelope > 1.0f) envelope = 1.0f;
 
         // Non-blocking, always succeeds - overwrites whatever was there.
@@ -272,6 +424,20 @@ static void IRAM_ATTR dsp_task(void* arg)
         s_dbg_envelope = envelope;
         s_dbg_freq_dev = freq_dev_hz;
 
+        // Diagnostics: plain volatile writes, no Serial/printf here -
+        // this stays cheap enough to leave enabled permanently rather
+        // than only turning it on when chasing a specific problem.
+        int64_t t_write_done_us = esp_timer_get_time();
+        uint32_t adc_us   = (uint32_t)(t_adc_done_us   - t_start_us);
+        uint32_t dsp_us   = (uint32_t)(t_dsp_done_us   - t_adc_done_us);
+        uint32_t write_us = (uint32_t)(t_write_done_us - t_dsp_done_us);
+        uint32_t busy_us  = (uint32_t)(t_write_done_us - t_start_us);
+        if (adc_us   > s_dbg_max_adc_us)   s_dbg_max_adc_us   = adc_us;
+        if (dsp_us   > s_dbg_max_dsp_us)   s_dbg_max_dsp_us   = dsp_us;
+        if (write_us > s_dbg_max_write_us) s_dbg_max_write_us = write_us;
+        if (busy_us  > s_dbg_max_busy_us)  s_dbg_max_busy_us  = busy_us;
+        if (busy_us  > k_sample_period_us) s_dbg_overrun_count++;
+
 #if TIMING_DEBUG_ENABLED
         digitalWrite(TIMING_DEBUG_GPIO, LOW);
 #endif    
@@ -297,7 +463,7 @@ static void mcp4725_fast_write(uint16_t code12)
         uint32_t now = millis();
         if (now - last_err_log_ms >= 1000) {
             last_err_log_ms = now;
-            ESP_LOGW(TAG, "MCP4725 write failed: %s (check address 0x%02X, pull-ups, wiring)",
+            Serial.printf("MCP4725 write failed: %s (check address 0x%02X, pull-ups, wiring)\r\n",
                 esp_err_to_name(err), MCP4725_I2C_ADDR);
         }
     }
@@ -365,16 +531,73 @@ static void init_rset_mod_pwm(void)
 
 static void init_adc(void)
 {
-    adc_oneshot_unit_init_cfg_t unit_cfg = {
-        .unit_id = ADC_UNIT,
+    adc_continuous_handle_cfg_t handle_cfg = {
+        .max_store_buf_size = ADC_CONT_BUF_BYTES,
+        .conv_frame_size = ADC_CONT_FRAME_BYTES,
     };
-    adc_oneshot_new_unit(&unit_cfg, &s_adc);
+    ESP_ERROR_CHECK(adc_continuous_new_handle(&handle_cfg, &s_adc));
 
-    adc_oneshot_chan_cfg_t chan_cfg = {
-        .atten = ADC_ATTEN_DB_12,
-        .bitwidth = ADC_BITWIDTH_12,
+    adc_digi_pattern_config_t adc_pattern[1] = {
+        {
+            .atten = ADC_ATTEN_DB_12,
+            .channel = ADC_CHANNEL,
+            .unit = ADC_UNIT,
+            .bit_width = ADC_BITWIDTH_12,
+        },
     };
-    adc_oneshot_config_channel(s_adc, ADC_CHANNEL, &chan_cfg);
+    adc_continuous_config_t dig_cfg = {
+        .pattern_num = 1,
+        .adc_pattern = adc_pattern,
+        .sample_freq_hz = ADC_CONT_SAMPLE_FREQ_HZ,
+        .conv_mode = ADC_CONV_SINGLE_UNIT_1,
+        .format = ADC_DIGI_OUTPUT_FORMAT_TYPE2,   // S3 result format
+    };
+    ESP_ERROR_CHECK(adc_continuous_config(s_adc, &dig_cfg));
+
+    // Must register before starting - the driver returns ESP_ERR_INVALID_STATE
+    // if you try to add a callback while already running.
+    adc_continuous_evt_cbs_t cbs = {
+        .on_conv_done = adc_conv_done_cb,
+    };
+    ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(s_adc, &cbs, NULL));
+
+    ESP_ERROR_CHECK(adc_continuous_start(s_adc));
+
+    Serial.printf("adc_continuous started: target=%uHz (gptimer tick=%uHz), frame=%u samples\r\n",
+                  ADC_CONT_SAMPLE_FREQ_HZ, SAMPLE_RATE_HZ, ADC_CONT_FRAME_SAMPLES);
+
+    // ---- One-time raw diagnostic dump, NOT on the real-time path ----
+    // Prints the exact bytes adc_continuous_read() actually returns
+    // (individual raw samples, NOT the running average adc_conv_done_cb
+    // computes for real-time use - this dump predates the averaging and
+    // is purely a structural sanity check of the byte layout), plus how
+    // our code decodes them (channel/data via adc_digi_output_data_t)
+    // and the resolved value of SOC_ADC_DIGI_DATA_BYTES_PER_CONV itself.
+    // The "channel" field decoded from each sample SHOULD read back as
+    // ADC_CHANNEL (5) consistently - if it doesn't, that's hard evidence
+    // the struct layout or per-sample byte stride assumed in dsp_task's
+    // read loop doesn't match this specific ESP-IDF version, rather than
+    // guessing at the fix blind. Serial.printf, not ESP_LOGI - guaranteed
+    // visible regardless of the IDE's Core Debug Level setting.
+    Serial.printf("ADC debug: SOC_ADC_DIGI_DATA_BYTES_PER_CONV = %d (expected sample stride in bytes)\r\n",
+                  (int)SOC_ADC_DIGI_DATA_BYTES_PER_CONV);
+    vTaskDelay(pdMS_TO_TICKS(50));   // let a few real conversions accumulate
+    {
+        uint8_t dbg_buf[64];
+        uint32_t dbg_bytes = 0;
+        esp_err_t derr = adc_continuous_read(s_adc, dbg_buf, sizeof(dbg_buf), &dbg_bytes, 100);
+        Serial.printf("ADC debug: read returned err=%s bytes=%u\r\n", esp_err_to_name(derr), dbg_bytes);
+        for (uint32_t off = 0; off + SOC_ADC_DIGI_DATA_BYTES_PER_CONV <= dbg_bytes;
+             off += SOC_ADC_DIGI_DATA_BYTES_PER_CONV) {
+            adc_digi_output_data_t *p = (adc_digi_output_data_t *)(dbg_buf + off);
+            Serial.printf("  [%u] raw=%02X %02X %02X %02X  decoded: channel=%u data=%u\r\n",
+                          off / SOC_ADC_DIGI_DATA_BYTES_PER_CONV,
+                          dbg_buf[off], dbg_buf[off + 1],
+                          (SOC_ADC_DIGI_DATA_BYTES_PER_CONV > 2 ? dbg_buf[off + 2] : 0),
+                          (SOC_ADC_DIGI_DATA_BYTES_PER_CONV > 3 ? dbg_buf[off + 3] : 0),
+                          p->type2.channel, p->type2.data);
+        }
+    }
 }
 
 static void init_sample_timer(void)
@@ -406,7 +629,15 @@ static void init_sample_timer(void)
 void setup()
 {
     Serial.begin(115200);
-    delay(200);   // give USB CDC a moment to enumerate before we print
+    delay(1000);  // give USB CDC time to enumerate before we print - 200ms
+                  // wasn't enough on this board, confirmed empirically
+
+    // Direct confirmation of actual CPU clock - cheap, definitive, and
+    // worth checking given max_busy_us has been running ~3x higher than
+    // expected. 240 = full speed; if this prints 80 or 160, the board is
+    // NOT at max clock (check Arduino IDE: Tools > CPU Frequency) and
+    // that alone would explain a roughly-3x-too-slow measurement.
+    Serial.printf("CPU ticks/us = %u (240 = full speed 240MHz)\r\n", esp_rom_get_cpu_ticks_per_us());
 
 #if TIMING_DEBUG_ENABLED
     pinMode(TIMING_DEBUG_GPIO, OUTPUT);
@@ -432,10 +663,27 @@ void setup()
         .sample_rate_hz = SAMPLE_RATE_HZ,
         .num_taps = HILBERT_TAPS,
         .max_freq_dev_hz = MAX_FREQ_DEV_HZ,
+        // Pre-Hilbert EQ (HPF + presence peak) and feed-forward compressor.
+        // Runs on plain mults/adds per sample (no log/exp/pow in the hot
+        // path - only at init), so this is negligible against the DSP
+        // budget. Set .enable = false to go back to raw mic passthrough.
+        .audio_fx = {
+            .enable = AUDIO_FX_ENABLED,
+            .hpf_freq_hz = 300.0f,
+            .presence_freq_hz = 2200.0f,
+            .presence_gain_db = 4.0f,
+            .presence_q = 1.0f,
+            .comp_threshold = 0.3f,
+            .comp_ratio = 3.5f,
+            .comp_attack_ms = 3.0f,
+            .comp_release_ms = 120.0f,
+        },
     };
     ESP_ERROR_CHECK(ssb_dsp_init(&dsp_cfg, &s_ssb));
 
+#if !TWOTONE_TEST_MODE
     init_adc();
+#endif
     init_i2c_dac();
 #if PWM_COMPARISON_ENABLED
     init_rset_mod_pwm();
@@ -448,10 +696,10 @@ void setup()
         esp_err_t probe_err = i2c_master_write_to_device(MCP4725_I2C_PORT, MCP4725_I2C_ADDR,
             probe_buf, sizeof(probe_buf), pdMS_TO_TICKS(50));
         if (probe_err == ESP_OK) {
-            ESP_LOGI(TAG, "MCP4725 probe OK at address 0x%02X", MCP4725_I2C_ADDR);
+            Serial.printf("MCP4725 probe OK at address 0x%02X\r\n", MCP4725_I2C_ADDR);
         }
         else {
-            ESP_LOGE(TAG, "MCP4725 probe FAILED at address 0x%02X: %s - check wiring/pull-ups/address before proceeding",
+            Serial.printf("MCP4725 probe FAILED at address 0x%02X: %s - check wiring/pull-ups/address before proceeding\r\n",
                 MCP4725_I2C_ADDR, esp_err_to_name(probe_err));
         }
     }
@@ -473,7 +721,7 @@ void setup()
 
     init_sample_timer();
 
-    ESP_LOGI(TAG, "SSB mic test running: taps=%d fs=%uHz mode=%s ad9851=%s dac=MCP4725@0x%02X pwm_compare=%s",
+    Serial.printf("SSB mic test running: taps=%d fs=%uHz mode=%s ad9851=%s dac=MCP4725@0x%02X pwm_compare=%s\r\n",
              HILBERT_TAPS, SAMPLE_RATE_HZ,
              TWOTONE_TEST_MODE ? "TWO-TONE TEST" : "mic",
              AD9851_ATTACHED ? "attached" : "not attached (stubbed)",
@@ -483,15 +731,54 @@ void setup()
 
 void loop()
 {
+    // Keep adc_continuous's internal pool from filling up. The
+    // on_conv_done callback (see adc_conv_done_cb) already captures every
+    // frame's newest sample for dsp_task's use as it arrives - this call's
+    // only job is freeing up the underlying pool so it doesn't overflow
+    // (on_pool_ovf), so its contents are simply discarded. Low priority,
+    // not time-critical - fine to do here alongside the other loop() work.
+#if !TWOTONE_TEST_MODE
+    {
+        uint8_t drain_buf[256];
+        uint32_t drain_bytes = 0;
+        while (adc_continuous_read(s_adc, drain_buf, sizeof(drain_buf), &drain_bytes, 0) == ESP_OK
+               && drain_bytes > 0) {
+            // discarded
+        }
+    }
+#endif
+
     // Diagnostics only - throttled well below the sample rate, and this
     // task is lower priority than both real-time tasks, so it never
     // competes with either for CPU time or bus access.
     static uint32_t last_print_ms = 0;
     uint32_t now = millis();
-    if (now - last_print_ms >= 20) {
+    if (now - last_print_ms >= 45) {
         last_print_ms = now;
         Serial.printf("envelope=,%.3f  ,freq_dev=,%.1f,Hz  dac_code=,%u\r\n",
                       s_dbg_envelope, s_dbg_freq_dev, s_dbg_dac_code);
     }
+
+    // Worst-case dsp_task timing, once a second - watch max_busy_us stay
+    // under period_us with margin, and overruns stay at 0. If overruns
+    // climb, dsp_task risks starving IDLE0 and tripping the task
+    // watchdog - see the k_sample_period_us comment above.
+    static uint32_t last_timing_print_ms = 0;
+    if (now - last_timing_print_ms >= 1000) {
+        last_timing_print_ms = now;
+        Serial.printf("[timing] max_busy_us=%u (adc=%u dsp=%u write=%u) period_us=%u overruns=%u\r\n",
+                      s_dbg_max_busy_us, s_dbg_max_adc_us, s_dbg_max_dsp_us, s_dbg_max_write_us,
+                      k_sample_period_us, s_dbg_overrun_count);
+
+        // Sub-phase breakdown of dsp_us itself, from ssb_dsp's internal
+        // profiling - lets us see which part of the DSP call (audio_fx,
+        // the Hilbert FIR, or atan2f/sqrtf) is actually costing time,
+        // rather than guessing again.
+        ssb_dsp_profile_t prof;
+        ssb_dsp_get_profile(s_ssb, &prof);
+        Serial.printf("[timing]   dsp breakdown: audio_fx=%u fir=%u atan2=%u sqrt=%u\r\n",
+                      prof.max_audio_fx_us, prof.max_fir_us, prof.max_atan2_us, prof.max_sqrt_us);
+    }
+
     delay(10);
 }

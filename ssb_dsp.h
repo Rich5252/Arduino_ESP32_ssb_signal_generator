@@ -40,6 +40,35 @@ typedef enum {
     SSB_SIDEBAND_LSB = 1,
 } ssb_sideband_t;
 
+/**
+ * @brief Optional pre-Hilbert audio conditioning: two cascaded biquads
+ *        (high-pass + presence peak) followed by a feed-forward envelope
+ *        compressor, applied to the raw audio sample BEFORE it enters the
+ *        Hilbert delay line. Runs entirely on adds/mults/one divide per
+ *        sample - no log/exp/pow in the per-sample path - so it stays
+ *        negligible against the DSP budget regardless of Fs.
+ *
+ *        Processing order is compressor -> EQ (compress-then-EQ), the
+ *        more common choice for SSB voice punch: it avoids the presence
+ *        boost itself tripping the compressor.
+ *
+ *        Leave `enable = false` (or zero-initialize this struct, e.g. via
+ *        a designated initializer that omits it) to reproduce the exact
+ *        prior behavior with zero added cost.
+ */
+typedef struct {
+    bool enable;                ///< Master enable for this whole stage.
+    float hpf_freq_hz;          ///< High-pass corner, e.g. 300.0f (rumble/proximity cut).
+    float presence_freq_hz;     ///< Presence-peak center, e.g. 2200.0f.
+    float presence_gain_db;     ///< Presence-peak gain in dB, e.g. 4.0f. 0.0f = no boost (filter still runs).
+    float presence_q;           ///< Presence-peak Q, e.g. 1.0f.
+    float comp_threshold;       ///< Compressor threshold, linear envelope units (post-HPF signal is
+                                 ///< typically < ~1.0), e.g. 0.3f. Only levels above this are compressed.
+    float comp_ratio;           ///< Compression ratio above threshold, e.g. 3.5f means 3.5:1.
+    float comp_attack_ms;       ///< Envelope-follower attack time, e.g. 3.0f.
+    float comp_release_ms;      ///< Envelope-follower release time, e.g. 120.0f.
+} ssb_audio_fx_config_t;
+
 typedef struct {
     uint32_t sample_rate_hz;   ///< Audio sample rate, e.g. 8000-19200 Hz. Must match your ADC/timer rate.
     int num_taps;              ///< Hilbert FIR length, ODD, e.g. 33 or 65. Longer = better opposite-sideband
@@ -48,6 +77,7 @@ typedef struct {
                                 ///< phase noise near zero envelope crossings can produce huge spurious
                                 ///< instantaneous frequency spikes (a well-known issue in this technique;
                                 ///< QCX-SSB refers to this as "restricting" the phase changes).
+    ssb_audio_fx_config_t audio_fx;  ///< Optional pre-Hilbert EQ/compression. See ssb_audio_fx_config_t.
 } ssb_dsp_config_t;
 
 typedef struct ssb_dsp_s *ssb_dsp_handle_t;
@@ -89,6 +119,36 @@ void ssb_dsp_deinit(ssb_dsp_handle_t handle);
  *        against another (e.g. a sidetone or receive-side monitor).
  */
 int ssb_dsp_group_delay_samples(ssb_dsp_handle_t handle);
+
+/**
+ * @brief Live-tweak the compressor's threshold/ratio without re-running
+ *        ssb_dsp_init(). EQ shape and attack/release are fixed at init
+ *        (they involve trig/exp, deliberately kept out of any per-sample
+ *        or frequently-called path); threshold/ratio are cheap to change
+ *        on the fly if you want a physical pot or serial command for it.
+ *        No-op if audio_fx wasn't enabled at init.
+ */
+void ssb_dsp_set_compressor(ssb_dsp_handle_t handle, float threshold, float ratio);
+
+/**
+ * @brief Sub-phase timing breakdown of ssb_dsp_process_sample, each a
+ *        running high-water mark in microseconds since ssb_dsp_init().
+ *        Measured internally via esp_timer_get_time() - negligible
+ *        overhead (a handful of reads/compares), safe to leave enabled
+ *        permanently rather than only when chasing a specific problem.
+ *        Use this to find out where time is actually going inside the
+ *        DSP call instead of guessing - e.g. after removing the FIR
+ *        loop's modulo only shaved ~2us off the total, so the real cost
+ *        is evidently elsewhere.
+ */
+typedef struct {
+    uint32_t max_audio_fx_us;  ///< Compressor + 2 biquads (0 if audio_fx wasn't enabled at init).
+    uint32_t max_fir_us;       ///< Hilbert FIR convolution (num_taps multiply-adds).
+    uint32_t max_atan2_us;     ///< atan2f() alone (instantaneous phase).
+    uint32_t max_sqrt_us;      ///< sqrtf() alone (envelope magnitude).
+} ssb_dsp_profile_t;
+
+void ssb_dsp_get_profile(ssb_dsp_handle_t handle, ssb_dsp_profile_t *out);
 
 #ifdef __cplusplus
 }

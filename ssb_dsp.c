@@ -3,6 +3,7 @@
 #include <math.h>
 #include "ssb_dsp.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 
 static const char *TAG = "ssb_dsp";
@@ -10,6 +11,167 @@ static const char *TAG = "ssb_dsp";
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
 #endif
+
+// ---- Pre-Hilbert audio conditioning: cascaded biquads + envelope compressor ----
+// Direct Form I, float. Coefficients set once at init (trig only there);
+// the per-sample path below is pure mult/add, no transcendentals.
+typedef struct {
+    float b0, b1, b2, a1, a2;
+    float x1, x2, y1, y2;
+} biquad_t;
+
+typedef struct {
+    float attack_coef, release_coef;   // one-pole envelope-follower coefficients
+    float threshold, inv_ratio;
+    float env;
+} compressor_t;
+
+// Denormal (subnormal) floats are numbers below ~1.2e-38f in magnitude -
+// still valid IEEE-754 values, but most FPUs (including Xtensa's) fall
+// back to a slow microcoded/trap path to handle them instead of the
+// normal single-cycle path. Filter/envelope state that decays toward
+// zero between speech bursts passes straight through this range, which
+// is the classic cause of exactly this kind of "goes slow when the
+// signal goes quiet" timing jump in audio DSP code. Flushing anything
+// below this threshold straight to 0.0f keeps state out of that range;
+// 1e-15f is many orders of magnitude below anything audible, so this has
+// no effect on the signal itself.
+static inline float IRAM_ATTR flush_denorm(float x)
+{
+    return (fabsf(x) < 1e-15f) ? 0.0f : x;
+}
+
+// ---- Fast atan2f/sqrtf replacements ----
+// Measured: libm atan2f ~28us, sqrtf ~12us per call on this build - both
+// far higher than single-precision hardware-FPU math should cost, which
+// strongly suggests this libm promotes to double internally (Xtensa LX7's
+// FPU is single-precision only, so double math falls back to a slow
+// software-emulated path). The FIR/EQ code right above this, which is
+// pure single-precision add/multiply, stays cheap - it's specifically
+// these two library calls that are the outlier.
+//
+// Set SSB_DSP_FAST_TRIG to 0 to fall back to plain atan2f/sqrtf, e.g. for
+// an A/B comparison once real hardware + a spectrum analyzer are in the
+// loop. Default 1 (fast path).
+#ifndef SSB_DSP_FAST_TRIG
+#define SSB_DSP_FAST_TRIG 1
+#endif
+
+#if SSB_DSP_FAST_TRIG
+
+// Minimax polynomial approximation of atan(x) for x in [-1, 1].
+// Coefficients are a well-known published 5-term minimax fit (this exact
+// numeric set is widely reproduced across DSP references, not from any
+// single source) - worst-case error is on the order of 1e-3 rad across
+// the domain; spot-checked here at x=1 against the exact value:
+// atan(1) = pi/4 = 0.7853982, polynomial evaluates to ~0.7854096,
+// error ~1.1e-5 rad at that point.
+static inline float IRAM_ATTR fast_atan(float x)
+{
+    float x2 = x * x;
+    return x * (0.9998660f + x2 * (-0.3302995f + x2 * (0.1801410f
+                + x2 * (-0.0851330f + x2 * 0.0208351f))));
+}
+
+// Full-range atan2 built from fast_atan via the standard reciprocal
+// (atan(1/t) = pi/2 - atan(t)) and quadrant identities, so fast_atan
+// only ever sees inputs in [-1, 1] where its error bound applies.
+static inline float IRAM_ATTR fast_atan2(float y, float x)
+{
+    if (x == 0.0f && y == 0.0f) return 0.0f;
+
+    float ax = fabsf(x), ay = fabsf(y);
+    float angle;
+    if (ax >= ay) {
+        angle = fast_atan(ay / ax);
+    } else {
+        angle = (float)M_PI * 0.5f - fast_atan(ax / ay);
+    }
+    if (x < 0.0f) angle = (float)M_PI - angle;
+    if (y < 0.0f) angle = -angle;
+    return angle;
+}
+
+// sqrt(x) via the classic fast-inverse-sqrt bit-hack seed, refined with
+// two Newton-Raphson iterations on the reciprocal before inverting back.
+// Two iterations (rather than the traditional single-iteration "Quake"
+// version) bring relative error down to roughly 1e-4 - below this
+// system's own 12-bit ADC quantization noise floor (~2e-4) - at the cost
+// of a handful more cycles, which is negligible against the ~12us this
+// replaces.
+static inline float IRAM_ATTR fast_sqrt(float x)
+{
+    if (x <= 0.0f) return 0.0f;
+    union { float f; uint32_t i; } conv = { .f = x };
+    conv.i = 0x5f3759dfu - (conv.i >> 1);
+    float y = conv.f;
+    y = y * (1.5f - 0.5f * x * y * y);
+    y = y * (1.5f - 0.5f * x * y * y);
+    return x * y;
+}
+#endif // SSB_DSP_FAST_TRIG
+
+static inline float IRAM_ATTR biquad_process(biquad_t *bq, float x)
+{
+    float y = bq->b0 * x + bq->b1 * bq->x1 + bq->b2 * bq->x2
+                          - bq->a1 * bq->y1 - bq->a2 * bq->y2;
+    y = flush_denorm(y);
+    bq->x2 = flush_denorm(bq->x1); bq->x1 = flush_denorm(x);
+    bq->y2 = bq->y1; bq->y1 = y;
+    return y;
+}
+
+// RBJ cookbook high-pass. fc/fs and Q -> normalized biquad coefficients.
+static void biquad_set_highpass(biquad_t *bq, float fc, float fs, float q)
+{
+    float w0 = 2.0f * M_PI * fc / fs;
+    float cosw0 = cosf(w0);
+    float alpha = sinf(w0) / (2.0f * q);
+
+    float a0 = 1.0f + alpha;
+    bq->b0 = ((1.0f + cosw0) / 2.0f) / a0;
+    bq->b1 = (-(1.0f + cosw0)) / a0;
+    bq->b2 = ((1.0f + cosw0) / 2.0f) / a0;
+    bq->a1 = (-2.0f * cosw0) / a0;
+    bq->a2 = (1.0f - alpha) / a0;
+    bq->x1 = bq->x2 = bq->y1 = bq->y2 = 0.0f;
+}
+
+// RBJ cookbook peaking EQ. fc/fs, Q, and gain in dB -> normalized coefficients.
+static void biquad_set_peaking(biquad_t *bq, float fc, float fs, float q, float gain_db)
+{
+    float A = powf(10.0f, gain_db / 40.0f);
+    float w0 = 2.0f * M_PI * fc / fs;
+    float cosw0 = cosf(w0);
+    float alpha = sinf(w0) / (2.0f * q);
+
+    float a0 = 1.0f + alpha / A;
+    bq->b0 = (1.0f + alpha * A) / a0;
+    bq->b1 = (-2.0f * cosw0) / a0;
+    bq->b2 = (1.0f - alpha * A) / a0;
+    bq->a1 = (-2.0f * cosw0) / a0;
+    bq->a2 = (1.0f - alpha / A) / a0;
+    bq->x1 = bq->x2 = bq->y1 = bq->y2 = 0.0f;
+}
+
+// Feed-forward soft limiter above threshold, fixed ratio. No log/exp/pow
+// per sample - attack/release coefficients (which DO need one expf each)
+// are computed once at init/reconfigure, never per sample.
+static inline float IRAM_ATTR compressor_process(compressor_t *c, float x)
+{
+    float ax = fabsf(x);
+    float coef = (ax > c->env) ? c->attack_coef : c->release_coef;
+    c->env = flush_denorm(c->env + coef * (ax - c->env));
+
+    float gain;
+    if (c->env > c->threshold) {
+        float compressed = c->threshold + (c->env - c->threshold) * c->inv_ratio;
+        gain = (c->env > 1e-6f) ? (compressed / c->env) : 1.0f;
+    } else {
+        gain = 1.0f;
+    }
+    return x * gain;
+}
 
 struct ssb_dsp_s {
     int num_taps;
@@ -21,6 +183,17 @@ struct ssb_dsp_s {
     bool have_prev_phase;
     float sample_rate_hz;
     float max_freq_dev_hz;
+
+    bool audio_fx_enable;
+    biquad_t eq_hpf;
+    biquad_t eq_presence;
+    compressor_t comp;
+
+    // Sub-phase timing high-water marks, see ssb_dsp_get_profile().
+    uint32_t max_audio_fx_us;
+    uint32_t max_fir_us;
+    uint32_t max_atan2_us;
+    uint32_t max_sqrt_us;
 };
 
 // Generate a windowed (Hamming) ideal discrete Hilbert transformer:
@@ -77,10 +250,54 @@ esp_err_t ssb_dsp_init(const ssb_dsp_config_t *cfg, ssb_dsp_handle_t *out_handle
 
     generate_hilbert_coeffs(h->hilbert_coeffs, h->num_taps);
 
+    h->audio_fx_enable = cfg->audio_fx.enable;
+    if (h->audio_fx_enable) {
+        float hpf_fc      = cfg->audio_fx.hpf_freq_hz > 0.0f ? cfg->audio_fx.hpf_freq_hz : 300.0f;
+        float presence_fc = cfg->audio_fx.presence_freq_hz > 0.0f ? cfg->audio_fx.presence_freq_hz : 2200.0f;
+        float presence_q  = cfg->audio_fx.presence_q > 0.0f ? cfg->audio_fx.presence_q : 1.0f;
+        float attack_ms   = cfg->audio_fx.comp_attack_ms > 0.0f ? cfg->audio_fx.comp_attack_ms : 3.0f;
+        float release_ms  = cfg->audio_fx.comp_release_ms > 0.0f ? cfg->audio_fx.comp_release_ms : 120.0f;
+        float threshold   = cfg->audio_fx.comp_threshold > 0.0f ? cfg->audio_fx.comp_threshold : 0.3f;
+        float ratio        = cfg->audio_fx.comp_ratio > 1.0f ? cfg->audio_fx.comp_ratio : 3.5f;
+
+        biquad_set_highpass(&h->eq_hpf, hpf_fc, h->sample_rate_hz, 0.707f);
+        biquad_set_peaking(&h->eq_presence, presence_fc, h->sample_rate_hz, presence_q,
+                            cfg->audio_fx.presence_gain_db);
+
+        // One-pole envelope-follower coefficients: expf() called here at
+        // init only, never in the per-sample compressor_process() path.
+        h->comp.attack_coef  = 1.0f - expf(-1.0f / (h->sample_rate_hz * (attack_ms / 1000.0f)));
+        h->comp.release_coef = 1.0f - expf(-1.0f / (h->sample_rate_hz * (release_ms / 1000.0f)));
+        h->comp.threshold = threshold;
+        h->comp.inv_ratio = 1.0f / ratio;
+        h->comp.env = 0.0f;
+
+        ESP_LOGI(TAG, "ssb_dsp audio_fx enabled: hpf=%.0fHz presence=%.0fHz/%+.1fdB/Q%.2f "
+                 "comp=thresh%.2f/ratio%.1f:1/atk%.1fms/rel%.1fms",
+                 hpf_fc, presence_fc, cfg->audio_fx.presence_gain_db, presence_q,
+                 threshold, ratio, attack_ms, release_ms);
+    }
+
     *out_handle = h;
     ESP_LOGI(TAG, "ssb_dsp initialized: taps=%d group_delay=%d samples, fs=%.0fHz, max_dev=%.0fHz",
              h->num_taps, h->center, h->sample_rate_hz, h->max_freq_dev_hz);
     return ESP_OK;
+}
+
+void ssb_dsp_set_compressor(ssb_dsp_handle_t handle, float threshold, float ratio)
+{
+    if (!handle || !handle->audio_fx_enable) return;
+    if (threshold > 0.0f) handle->comp.threshold = threshold;
+    if (ratio > 1.0f)     handle->comp.inv_ratio = 1.0f / ratio;
+}
+
+void ssb_dsp_get_profile(ssb_dsp_handle_t handle, ssb_dsp_profile_t *out)
+{
+    if (!handle || !out) return;
+    out->max_audio_fx_us = handle->max_audio_fx_us;
+    out->max_fir_us = handle->max_fir_us;
+    out->max_atan2_us = handle->max_atan2_us;
+    out->max_sqrt_us = handle->max_sqrt_us;
 }
 
 int ssb_dsp_group_delay_samples(ssb_dsp_handle_t handle)
@@ -103,26 +320,90 @@ void IRAM_ATTR ssb_dsp_process_sample(ssb_dsp_handle_t handle,
 {
     int N = handle->num_taps;
 
-    // Push new sample into circular delay line (most recent at delay_head)
-    handle->delay_head = (handle->delay_head + 1) % N;
-    handle->delay_line[handle->delay_head] = audio_sample;
+    // Optional pre-Hilbert conditioning: compressor -> EQ, on the raw
+    // sample, before anything enters the Hilbert delay line. This keeps
+    // it fully decoupled from the Hilbert filter's `center`-tap group
+    // delay - the Hilbert path never sees an unconditioned sample.
+    int64_t t0 = esp_timer_get_time();
+    if (handle->audio_fx_enable) {
+        audio_sample = compressor_process(&handle->comp, audio_sample);
+        audio_sample = biquad_process(&handle->eq_hpf, audio_sample);
+        audio_sample = biquad_process(&handle->eq_presence, audio_sample);
+    }
+    int64_t t1 = esp_timer_get_time();
+    uint32_t audio_fx_us = (uint32_t)(t1 - t0);
+    if (audio_fx_us > handle->max_audio_fx_us) handle->max_audio_fx_us = audio_fx_us;
+
+    // Push new sample into circular delay line (most recent at delay_head).
+    // Flushed here, not just on readback below, since a denormal value
+    // sitting in the buffer gets multiplied against every one of the
+    // num_taps Hilbert coefficients as it ages through - one flush here
+    // covers the whole FIR sum below, not just the direct I-path read.
+    //
+    // Branch instead of modulo for the wrap: Xtensa has no hardware
+    // integer divider, so % is a real (costly) division. A single
+    // modulo here is cheap on its own, but kept as a branch anyway for
+    // consistency with the FIR loop below, where the same pattern
+    // repeated N times was a real cost.
+    int head = handle->delay_head + 1;
+    if (head >= N) head = 0;
+    handle->delay_head = head;
+    handle->delay_line[head] = flush_denorm(audio_sample);
 
     // Direct ("I") path: the sample that is `center` samples old, i.e. time-
     // aligned with the Hilbert filter's group delay.
-    int i_idx = (handle->delay_head - handle->center + N) % N;
+    int i_idx = head - handle->center;
+    if (i_idx < 0) i_idx += N;
     float I = handle->delay_line[i_idx];
 
-    // Hilbert ("Q") path: convolve the whole delay line with the Hilbert taps.
-    // delay_line[(delay_head - n + N) % N] holds the sample that is n steps
-    // old, so this computes sum_n coeff[n] * x[k - n], a standard FIR.
+    // Hilbert ("Q") path: convolve the whole delay line with the Hilbert
+    // taps. delay_line[(head - n + N) % N] holds the sample that is n
+    // steps old, so this computes sum_n coeff[n] * x[k - n], a standard
+    // FIR - but computing that modulo N times per sample (once per tap)
+    // was a meaningful chunk of the measured dsp_us budget, since Xtensa
+    // has no hardware integer divider. Split into two modulo-free,
+    // contiguous ranges over the same circular buffer instead - the
+    // first covers n=0..head (idx counts down from head to 0, no wrap
+    // needed), the second covers n=head+1..N-1 (idx counts down from
+    // N-1 to head+1, the wrapped portion, needing only a plain add of N
+    // rather than a modulo). Mathematically identical to the original
+    // per-tap modulo formula - verified against it at both the head=0
+    // and head=N-1 wrap boundaries.
+    //
+    // I/Q are flushed here (not just the new EQ/compressor state above)
+    // because they decay toward zero during silence the same way - this
+    // path predates today's changes, consistent with the "very occasional,
+    // pre-existing" overruns rather than something newly introduced.
     float Q = 0.0f;
-    for (int n = 0; n < N; n++) {
-        int idx = (handle->delay_head - n + N) % N;
-        Q += handle->hilbert_coeffs[n] * handle->delay_line[idx];
+    int n = 0;
+    for (; n <= head; n++) {
+        Q += handle->hilbert_coeffs[n] * handle->delay_line[head - n];
     }
+    for (; n < N; n++) {
+        Q += handle->hilbert_coeffs[n] * handle->delay_line[head - n + N];
+    }
+    Q = flush_denorm(Q);
+    int64_t t2 = esp_timer_get_time();
+    uint32_t fir_us = (uint32_t)(t2 - t1);
+    if (fir_us > handle->max_fir_us) handle->max_fir_us = fir_us;
 
+#if SSB_DSP_FAST_TRIG
+    float phase = fast_atan2(Q, I);
+#else
     float phase = atan2f(Q, I);
+#endif
+    int64_t t3 = esp_timer_get_time();
+    uint32_t atan2_us = (uint32_t)(t3 - t2);
+    if (atan2_us > handle->max_atan2_us) handle->max_atan2_us = atan2_us;
+
+#if SSB_DSP_FAST_TRIG
+    float envelope = fast_sqrt(I * I + Q * Q);
+#else
     float envelope = sqrtf(I * I + Q * Q);
+#endif
+    int64_t t4 = esp_timer_get_time();
+    uint32_t sqrt_us = (uint32_t)(t4 - t3);
+    if (sqrt_us > handle->max_sqrt_us) handle->max_sqrt_us = sqrt_us;
 
     float dphi = 0.0f;
     if (handle->have_prev_phase) {
