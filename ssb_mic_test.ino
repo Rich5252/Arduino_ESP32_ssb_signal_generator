@@ -125,7 +125,7 @@
 // set below in dsp_cfg.audio_fx. Leave off with TWOTONE_TEST_MODE if you
 // want to look at the raw DSP chain's spurious performance without any
 // conditioning in the signal path.
-#define AUDIO_FX_ENABLED 0
+#define AUDIO_FX_ENABLED 1
 
 // ---- MCP4725 DAC (RSET modulation output) ----
 #define MCP4725_SDA_GPIO      13
