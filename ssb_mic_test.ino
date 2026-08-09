@@ -103,6 +103,7 @@
 #define dac_task_enabled 0
 
 #include "ssb_dsp.h"
+#include "ssb_adc_filter.h"
 
 // (No TAG/ESP_LOG here - everything in this file uses Serial.printf so it's
 // visible regardless of the IDE's Core Debug Level setting. ssb_dsp.c has
@@ -114,7 +115,7 @@
 
 // ---- Two-tone test mode: bypass the mic ADC with a synthesized signal.
 // Zero-hardware smoke test of the DSP chain. ----
-#define TWOTONE_TEST_MODE   1
+#define TWOTONE_TEST_MODE   0
 #define TWOTONE_F1_HZ        700.0f
 #define TWOTONE_F2_HZ       1900.0f
 #define TWOTONE_AMPLITUDE    0.45f   // keep below 0.5 so peaks don't clip when summed
@@ -168,51 +169,68 @@
 // that ~50us is close to the real cost of a genuinely successful
 // (non-stale) read on this build, not something more tuning would fix.
 //
-// v2 (this version): register adc_continuous's on_conv_done EVENT
-// CALLBACK instead of polling. The callback runs in ISR context right
-// when a frame completes and hands us a direct pointer to the frame data
+// v2: register adc_continuous's on_conv_done EVENT CALLBACK instead of
+// polling. The callback runs in ISR context right when a frame completes
+// and hands us a direct pointer to the frame data
 // (adc_continuous_evt_data_t::conv_frame_buffer) - no adc_continuous_read()
 // call needed there at all (the ESP-IDF docs are explicit that read()
 // isn't ISR-safe to call from within the callback anyway). The callback
-// just decodes the newest sample and stores it in s_last_adc_raw
-// (volatile). dsp_task then does a plain volatile read - no driver call,
-// no locking, in its hot path at all. This decouples freshness (still
-// governed by frame size - the callback only fires once per completed
-// frame, so a smaller frame is still fresher) from dsp_task's per-tick
-// COST, which is now negligible regardless of frame size.
+// pushes each raw sample into s_adc_raw_ring (plain integers only - see
+// why in the AVERAGING note below and the comment on adc_conv_done_cb);
+// dsp_task drains that ring each tick. Either way, no driver call and no
+// blocking in the hot ISR/task path.
 //
 // The underlying pool still needs periodic draining via
 // adc_continuous_read() to avoid on_pool_ovf - see loop(), where this
 // happens at low priority on Core 1, fully decoupled from dsp_task.
 //
-// AVERAGING: frame=1 (the original version of this section) meant the
-// callback only ever kept the single freshest raw ADC reading - real
-// oversampling was happening (ADC running faster than the tick rate) but
-// none of it was being used to reduce noise, since every sample but the
-// last was simply discarded. adc_conv_done_cb now averages across the
-// whole frame instead of just taking its tail sample, which is free
-// (happens once per callback, not per tick) now that the callback
-// architecture has already removed dsp_task's per-tick driver cost.
-// N=16 samples at 80kHz gives a ~200us averaging window (~4 ticks' worth
-// of latency - a deliberate trade, same order as the earlier "middle
-// ground" frame-size attempt, but this time buying real noise reduction
-// via averaging rather than nothing) and reduces noise by roughly
-// sqrt(16)=4x. The averaging itself acts as a mild low-pass filter
-// (~ADC_CONT_SAMPLE_FREQ_HZ/N = 5kHz here), deliberately kept above the
-// ~3-4kHz voice band so it's filtering noise, not attenuating wanted
-// audio. Reduce N (or lower ADC_CONT_SAMPLE_FREQ_HZ/N further) if 5kHz
-// turns out to still be clipping audible content; raise N for more noise
-// reduction if there's margin to spare - this is a real tuning knob,
-// worth listening to the result rather than assuming these numbers are
-// final.
+// AVERAGING (superseded, kept for context): frame=1 (the original version
+// of this section) meant the callback only ever kept the single freshest
+// raw ADC reading - real oversampling was happening (ADC running faster
+// than the tick rate) but none of it was being used to reduce noise,
+// since every sample but the last was simply discarded. A later version
+// averaged across the whole frame (N=16 boxcar, ~200us window,
+// sqrt(16)=4x noise reduction) instead of just taking the tail sample.
+//
+// SWAPPED FOR A REAL FILTER: spectrum-analyser check of the raw ADC
+// floor (mic grounded) showed it's flat/broadband, so oversampling+LPF
+// is the right approach in principle - but a boxcar's stopband is leaky
+// (sinc sidelobes only ~-13dB down at best) and it only updated once per
+// frame (200us @ N=16), leaving a zero-order-hold staircase between
+// updates. Tried running a proper 2nd-order Butterworth biquad
+// (ssb_adc_filter.h, s_adc_lpf) directly in adc_conv_done_cb first - that
+// crashed immediately (Guru Meditation, CoprocessorException): Xtensa
+// ISRs have no FPU register-save area, so float math isn't legal there
+// at all, only integer. The filter now runs in dsp_task instead (real
+// task context, FPU-safe) - the ISR's only job is pushing raw integer
+// samples into s_adc_raw_ring for dsp_task to drain and filter. Net
+// effect is the same as originally intended: real ~-12dB/octave rolloff
+// instead of a leaky boxcar, output effectively updating every raw
+// sample rather than every 16, just with the filtering relocated across
+// the ISR/task boundary to keep the FPU legal.
+// ADC_CONT_FRAME_SAMPLES below is now purely a DMA chunking size (how
+// many samples arrive per callback invocation) - it no longer sets the
+// averaging window or the effective update rate the way it used to.
+// ADC_LPF_CUTOFF_HZ (below) is the actual tuning knob for the noise/
+// bandwidth tradeoff now; not yet verified by ear or against real
+// spurious data - flagged for the same "listen to it, don't assume"
+// treatment the old N value got.
 #define ADC_CONT_SAMPLE_FREQ_HZ   80000u   // within ESP32-S3's continuous-mode range
-#define ADC_CONT_FRAME_SAMPLES    16    // averaged in adc_conv_done_cb - see note above.
+#define ADC_CONT_FRAME_SAMPLES    16    // DMA chunk size only now - see AVERAGING note above.
                                          // If adc_continuous_new_handle() errors on this, the
                                          // driver enforces a different frame-size constraint -
                                          // report the exact error and we'll adjust.
 #define ADC_CONT_FRAME_BYTES      (ADC_CONT_FRAME_SAMPLES * SOC_ADC_DIGI_DATA_BYTES_PER_CONV)
 #define ADC_CONT_BUF_BYTES        4096  // sized for periodic draining from loop() (~10ms cadence) rather
                                          // than tied to frame size
+
+// 2nd-order Butterworth LPF applied per raw sample in adc_conv_done_cb,
+// replacing the old N=16 boxcar average - see the AVERAGING comment
+// above. Sits at the top of the voice band on purpose (same reasoning
+// the old 5kHz boxcar corner used): filtering broadband ADC noise
+// without eating wanted audio. Real tuning knob now - not yet verified
+// by ear or spectrum analyser with the AD9851 in the loop.
+#define ADC_LPF_CUTOFF_HZ         3000.0f
 
 // ---- Timing debug pin: toggled high at the start of dsp_task's real work
 // and low at the end, so a scope on this pin directly measures the actual
@@ -250,7 +268,24 @@ static volatile uint32_t s_carrier_hz = CARRIER_HZ;
 
 static ssb_dsp_handle_t s_ssb;
 static adc_continuous_handle_t s_adc;
-static volatile int s_last_adc_raw = 2048;   // mid-scale fallback for the rare DMA-underrun case (see dsp_task)
+
+// Raw ADC samples cross the ISR->task boundary through this ring buffer
+// as plain integers - see the comment on adc_conv_done_cb for why: the
+// biquad LPF (float math) can't run in ISR context on Xtensa (no FPU
+// register-save area for ISRs -> CoprocessorException/Guru Meditation).
+// Single-producer (adc_conv_done_cb, ISR)/single-consumer (dsp_task) so
+// plain volatile head/tail indices are sufficient - no locking needed.
+// Size is power-of-two for cheap masking; 64 gives ~4x margin over one
+// ADC_CONT_FRAME_SAMPLES-sized frame (16), which is the largest single
+// burst the producer ever writes at once.
+#define ADC_RAW_RINGBUF_SIZE   64
+#define ADC_RAW_RINGBUF_MASK   (ADC_RAW_RINGBUF_SIZE - 1)
+static volatile uint16_t s_adc_raw_ring[ADC_RAW_RINGBUF_SIZE];
+static volatile uint32_t s_adc_ring_head = 0;   // written only by adc_conv_done_cb (ISR)
+static volatile uint32_t s_adc_ring_tail = 0;   // written only by dsp_task
+
+static ssb_biquad_t s_adc_lpf;   // now used from dsp_task (task context, FPU-safe), not the ISR -
+                                  // initialized once in init_adc() (also task context, that's fine)
 static TaskHandle_t s_dsp_task;
 static TaskHandle_t s_dac_task;
 static QueueHandle_t s_envelope_queue;   // length 1, "latest value wins" (xQueueOverwrite)
@@ -297,12 +332,15 @@ static bool IRAM_ATTR on_timer_alarm(gptimer_handle_t timer, const gptimer_alarm
 // callback; the pool still needs periodic draining, but that happens
 // separately in loop() (see there), fully decoupled from this.
 //
-// Averages across the whole frame (ADC_CONT_FRAME_SAMPLES readings)
-// rather than just keeping the last one - see the comment by
-// ADC_CONT_FRAME_SAMPLES for why. Sums edata->size (not the FRAME_SAMPLES
-// constant directly) in case the driver ever delivers a partial frame,
-// clamped defensively either way; integer sum + one runtime divide by a
-// small N is negligible cost even in ISR context.
+// Pushes each raw sample in the frame into s_adc_raw_ring as a plain
+// integer - INTEGER ONLY in this function, deliberately. This callback
+// runs in true ISR context (not a FreeRTOS task), and Xtensa has no FPU
+// register-save area for ISRs - any float op here trips a
+// CoprocessorException (Guru Meditation, EXCCAUSE 0x4). Learned this the
+// hard way: an earlier version of this callback ran the biquad LPF
+// directly here and crashed on first frame. The filtering itself now
+// happens in dsp_task (see there) - this function's only job is getting
+// the raw samples across the ISR->task boundary as cheaply as possible.
 static bool IRAM_ATTR adc_conv_done_cb(adc_continuous_handle_t handle,
                                         const adc_continuous_evt_data_t *edata,
                                         void *user_data)
@@ -311,13 +349,23 @@ static bool IRAM_ATTR adc_conv_done_cb(adc_continuous_handle_t handle,
     if (n == 0) return false;
     if (n > ADC_CONT_FRAME_SAMPLES) n = ADC_CONT_FRAME_SAMPLES;   // defensive - shouldn't happen
 
-    uint32_t sum = 0;
+    uint32_t head = s_adc_ring_head;
     for (uint32_t i = 0; i < n; i++) {
         adc_digi_output_data_t *p = (adc_digi_output_data_t *)
             (edata->conv_frame_buffer + i * SOC_ADC_DIGI_DATA_BYTES_PER_CONV);
-        sum += p->type2.data;
+
+        uint32_t next_head = (head + 1) & ADC_RAW_RINGBUF_MASK;
+        if (next_head == s_adc_ring_tail) {
+            // Ring full - dsp_task has fallen badly behind (shouldn't
+            // happen with 64 slots / 16-sample frames unless something
+            // else is starving it). Drop the sample rather than
+            // overwrite unread data or block in an ISR.
+            break;
+        }
+        s_adc_raw_ring[head] = (uint16_t)p->type2.data;
+        head = next_head;
     }
-    s_last_adc_raw = (int)(sum / n);
+    s_adc_ring_head = head;
     return false;   // no higher-priority task needs waking from this event
 }
 
@@ -363,12 +411,27 @@ static void IRAM_ATTR dsp_task(void* arg)
 #if TWOTONE_TEST_MODE
         sample = generate_twotone_sample();
 #else
-        // s_last_adc_raw is kept fresh by adc_conv_done_cb (ISR context,
-        // fires once per completed DMA frame) - no driver call here at
-        // all, just a plain volatile read. This is what actually removed
-        // the ~50us adc_continuous_read() cost from the hot path; the
-        // earlier drain-loop-per-tick approach is gone.
-        int raw = s_last_adc_raw;
+        // Drains whatever raw samples adc_conv_done_cb has pushed into
+        // s_adc_raw_ring since the last tick (usually 0-4 of them, given
+        // the ISR delivers 16 at a time roughly every 4 ticks) and runs
+        // each through s_adc_lpf HERE, in task context - unlike the ISR,
+        // dsp_task has a real FPU register-save area, so float math is
+        // safe. If the ring is empty this tick (frame hasn't completed
+        // yet), s_last_filtered_adc just holds its previous value - same
+        // "slightly stale is fine" tolerance the old single-scalar
+        // approach had, and the filter's own state carries over correctly
+        // across calls either way since it's not reset between drains.
+        static float s_last_filtered_adc = 2048.0f;
+        {
+            uint32_t tail = s_adc_ring_tail;
+            uint32_t head = s_adc_ring_head;   // snapshot - ISR may still be advancing it, fine for a single consumer
+            while (tail != head) {
+                s_last_filtered_adc = ssb_biquad_process(&s_adc_lpf, (float)s_adc_raw_ring[tail]);
+                tail = (tail + 1) & ADC_RAW_RINGBUF_MASK;
+            }
+            s_adc_ring_tail = tail;
+        }
+        int raw = (int)s_last_filtered_adc;
         // Normalize 12-bit ADC (0-4095) to roughly [-1, 1] with DC removal.
         sample = (float)raw / 2048.0f - 1.0f;
         dc_estimate = dc_alpha * dc_estimate + (1.0f - dc_alpha) * sample;
@@ -554,6 +617,11 @@ static void init_adc(void)
     };
     ESP_ERROR_CHECK(adc_continuous_config(s_adc, &dig_cfg));
 
+    // Must happen before the callback is registered/fires - adc_conv_done_cb
+    // starts calling ssb_biquad_process() on s_adc_lpf immediately once the
+    // driver is running.
+    ssb_biquad_lpf_init(&s_adc_lpf, ADC_LPF_CUTOFF_HZ, (float)ADC_CONT_SAMPLE_FREQ_HZ);
+
     // Must register before starting - the driver returns ESP_ERR_INVALID_STATE
     // if you try to add a callback while already running.
     adc_continuous_evt_cbs_t cbs = {
@@ -563,8 +631,8 @@ static void init_adc(void)
 
     ESP_ERROR_CHECK(adc_continuous_start(s_adc));
 
-    Serial.printf("adc_continuous started: target=%uHz (gptimer tick=%uHz), frame=%u samples\r\n",
-                  ADC_CONT_SAMPLE_FREQ_HZ, SAMPLE_RATE_HZ, ADC_CONT_FRAME_SAMPLES);
+    Serial.printf("adc_continuous started: target=%uHz (gptimer tick=%uHz), frame=%u samples, LPF=%.0fHz\r\n",
+                  ADC_CONT_SAMPLE_FREQ_HZ, SAMPLE_RATE_HZ, ADC_CONT_FRAME_SAMPLES, ADC_LPF_CUTOFF_HZ);
 
     // ---- One-time raw diagnostic dump, NOT on the real-time path ----
     // Prints the exact bytes adc_continuous_read() actually returns
