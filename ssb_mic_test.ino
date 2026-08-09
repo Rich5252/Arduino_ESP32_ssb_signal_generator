@@ -237,8 +237,12 @@
                                          // driver enforces a different frame-size constraint -
                                          // report the exact error and we'll adjust.
 #define ADC_CONT_FRAME_BYTES      (ADC_CONT_FRAME_SAMPLES * SOC_ADC_DIGI_DATA_BYTES_PER_CONV)
-#define ADC_CONT_BUF_BYTES        4096  // sized for periodic draining from loop() (~10ms cadence) rather
-                                         // than tied to frame size
+// 4x the original size - 4096 bytes (1024 samples, ~12.7ms headroom @
+// ~80.6kHz actual) turned out to be smaller than loop() could stall for
+// on a slow-baud Serial.printf() burst, causing real on_pool_ovf events
+// (see Serial.begin() and the [adc] pool_ovf_total diagnostic). Raising
+// baud rate is the primary fix; this is cheap additional margin on top.
+#define ADC_CONT_BUF_BYTES        16384  // ~4096 samples, ~50ms headroom @ 80kHz
 
 // 2nd-order Butterworth LPF applied per raw sample in adc_conv_done_cb,
 // replacing the old N=16 boxcar average - see the AVERAGING comment
@@ -348,6 +352,7 @@ static volatile uint32_t s_dbg_adc_pool_ovf_count = 0;  // on_pool_ovf events - 
 // s_dbg_* counters despite not being ISR-written this time.
 static volatile uint32_t s_dbg_adc_fifo_starve_count = 0;      // ticks where available < ADC_SAMPLES_PER_TICK
 static volatile uint32_t s_dbg_adc_fifo_min_available = 0xFFFFFFFFu;  // running low-water mark
+static volatile uint32_t s_dbg_adc_fifo_drop_count = 0;        // our FIFO overflowing (distinct from driver pool_ovf)
 
 static TaskHandle_t s_dsp_task;
 static TaskHandle_t s_dac_task;
@@ -438,6 +443,10 @@ static bool IRAM_ATTR adc_conv_done_cb(adc_continuous_handle_t handle,
             // ADC_FIFO_SIZE samples (shouldn't happen at 4x headroom
             // over one burst unless something else is starving it).
             // Drop rather than overwrite unread data or block in an ISR.
+            // Distinct from s_dbg_adc_pool_ovf_count - that's the
+            // DRIVER's own internal buffer overflowing before we even
+            // see the data; this is OUR software FIFO, further downstream.
+            s_dbg_adc_fifo_drop_count++;
             break;
         }
         s_adc_fifo[head] = (uint16_t)p->type2.data;
@@ -797,7 +806,7 @@ static void init_sample_timer(void)
 
 void setup()
 {
-    Serial.begin(115200);
+    Serial.begin(921600);
     delay(1000);  // give USB CDC time to enumerate before we print - 200ms
                   // wasn't enough on this board, confirmed empirically
 
@@ -991,9 +1000,9 @@ void loop()
                           actual_sps, ADC_CONT_SAMPLE_FREQ_HZ,
                           callbacks_now - last_callback_count, expected_cbs,
                           s_dbg_adc_pool_ovf_count);
-            Serial.printf("[adc]   fifo: min_available=%u (want>=%u) starve_ticks_total=%u\r\n",
+            Serial.printf("[adc]   fifo: min_available=%u (want>=%u) starve_ticks_total=%u drop_total=%u\r\n",
                           s_dbg_adc_fifo_min_available, ADC_SAMPLES_PER_TICK,
-                          s_dbg_adc_fifo_starve_count);
+                          s_dbg_adc_fifo_starve_count, s_dbg_adc_fifo_drop_count);
         }
         last_samples_total  = samples_now;
         last_callback_count = callbacks_now;
