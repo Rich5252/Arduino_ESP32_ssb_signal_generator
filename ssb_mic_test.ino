@@ -115,7 +115,7 @@
 
 // ---- Two-tone test mode: bypass the mic ADC with a synthesized signal.
 // Zero-hardware smoke test of the DSP chain. ----
-#define TWOTONE_TEST_MODE   1
+#define TWOTONE_TEST_MODE   0
 #define TWOTONE_F1_HZ        700.0f
 #define TWOTONE_F2_HZ       1900.0f
 #define TWOTONE_AMPLITUDE    0.45f   // keep below 0.5 so peaks don't clip when summed
@@ -324,11 +324,48 @@ static volatile uint16_t s_adc_fifo[ADC_FIFO_SIZE];
 static volatile uint32_t s_adc_fifo_head = 0;   // written only by adc_conv_done_cb (ISR)
 static volatile uint32_t s_adc_fifo_tail = 0;   // written only by dsp_task
 
-// How many raw ADC samples dsp_task consumes from the FIFO each tick -
-// must be the exact Fs_adc/Fs_dsp ratio for the FIFO to neither grow nor
-// starve in steady state. 80000/20000 = 4 exactly; if either rate ever
-// changes, check this stays an integer division with zero remainder.
-#define ADC_SAMPLES_PER_TICK   (ADC_CONT_SAMPLE_FREQ_HZ / SAMPLE_RATE_HZ)
+// How many raw ADC samples dsp_task nominally consumes from the FIFO
+// each tick - the exact Fs_adc/Fs_dsp ratio. 80000/20000 = 4 exactly; if
+// either rate ever changes, check this stays an integer division with
+// zero remainder.
+#define ADC_SAMPLES_PER_TICK       (ADC_CONT_SAMPLE_FREQ_HZ / SAMPLE_RATE_HZ)
+
+// CATCH-UP THRESHOLD - separate from the nominal rate above. This is
+// the "genuine backlog" cutoff dsp_task's drain logic uses (see there):
+// available <= this -> take nominal ADC_SAMPLES_PER_TICK; above it ->
+// something abnormal has happened (startup, mode switch) and dsp_task
+// drains aggressively to recover.
+//
+// History: a first version hard-capped consumption at exactly
+// ADC_SAMPLES_PER_TICK with NO way to ever consume more, even with a
+// backlog waiting. Fine only if production and consumption match
+// perfectly forever - they don't quite (measured ~80645 sps actual vs
+// 80000 nominal, i.e. dsp_task's true ADC_SAMPLES_PER_TICK ratio is
+// ~4.03, not exactly 4), so a one-time backlog (e.g. the startup window
+// before dsp_task starts draining) had no way to ever shrink again - the
+// FIFO filled once and stayed pinned full, dropping nearly everything
+// thereafter.
+//
+// A second version used min(available, this) as the drain count - which
+// sounds like "normally 4, catch up to this when backlogged" but isn't:
+// it actually means "always drain everything currently available, up to
+// this cap" - so the instant a 16-sample burst landed, that WHOLE tick
+// drained all 16 at once, leaving the FIFO empty and starving the next
+// several ticks until the next burst - reintroducing the exact
+// zero-order-hold staircase problem this FIFO design was built to fix,
+// just with a different trigger (confirmed empirically: ~75% of ticks
+// starved, matching "3 empty ticks per 4-tick burst cycle" almost
+// exactly).
+//
+// Current (correct) design: dsp_task takes nominal ADC_SAMPLES_PER_TICK
+// whenever that's available, and only exceeds it when available is
+// ALREADY above this threshold - i.e. genuinely more backlog than normal
+// bursty arrival ever produces on its own. The slow ~0.8% surplus lets
+// "available" drift up gradually over many tens of milliseconds; only
+// once it crosses this threshold does the aggressive catch-up kick in
+// briefly to bring it back down - a gentle, infrequent correction
+// instead of a violent one every single burst.
+#define ADC_SAMPLES_PER_TICK_MAX   (2 * ADC_CONT_FRAME_SAMPLES)
 
 static ssb_biquad_t s_adc_lpf;   // float biquad - safe here since only ever called from dsp_task now,
                                   // never from the ISR (which stays integer-only, see adc_conv_done_cb)
@@ -352,7 +389,24 @@ static volatile uint32_t s_dbg_adc_pool_ovf_count = 0;  // on_pool_ovf events - 
 // s_dbg_* counters despite not being ISR-written this time.
 static volatile uint32_t s_dbg_adc_fifo_starve_count = 0;      // ticks where available < ADC_SAMPLES_PER_TICK
 static volatile uint32_t s_dbg_adc_fifo_min_available = 0xFFFFFFFFu;  // running low-water mark
+static volatile uint32_t s_dbg_adc_fifo_max_available = 0;            // running high-water mark - confirms
+                                                                        // backlog actually drains back down
+                                                                        // rather than staying pinned near-full
 static volatile uint32_t s_dbg_adc_fifo_drop_count = 0;        // our FIFO overflowing (distinct from driver pool_ovf)
+static int64_t s_adc_start_us = 0;   // captured once at adc_continuous_start() - see the long-window
+                                      // rate measurement in loop(); a longer averaging window gives a
+                                      // much lower-noise estimate of the true achieved ADC rate than
+                                      // the existing 1s window can, which matters for pinning down a
+                                      // ~0.8%-scale mismatch with confidence rather than guessing
+
+// Same long-window measurement approach, but for dsp_task's OWN tick
+// rate via the gptimer - we'd only ever precisely measured the ADC side
+// before. Chronic FIFO starvation despite the ADC itself running fast
+// (not slow) only makes sense if dsp_task is also ticking faster than
+// its own 20000Hz nominal, by more than the ADC's ~0.8% - this measures
+// that directly instead of assuming gptimer is exact.
+static int64_t s_dsp_tick_start_us = 0;         // captured once at gptimer_start()
+static volatile uint32_t s_dbg_dsp_tick_count = 0;  // incremented once per dsp_task tick, unconditionally
 
 static TaskHandle_t s_dsp_task;
 static TaskHandle_t s_dac_task;
@@ -393,6 +447,21 @@ static volatile uint16_t s_dbg_dac_code = 0;
 static volatile uint32_t s_dbg_max_busy_us = 0;
 static volatile uint32_t s_dbg_overrun_count = 0;
 static const uint32_t k_sample_period_us = 1000000UL / SAMPLE_RATE_HZ;
+
+// WAKE-UP jitter - distinct from s_dbg_max_busy_us above, which only
+// measures how long dsp_task's OWN work takes once it resumes. This
+// measures the actual observed gap between successive ulTaskNotifyTake()
+// returns - i.e. was dsp_task woken up ON TIME, regardless of how fast
+// its own processing was. A task can have comfortable busy_us margin
+// every single tick and STILL be intermittently woken late (preempted,
+// scheduling delay, etc.) - that wouldn't show up in busy_us at all, but
+// would still starve anything timing-sensitive that assumes a strictly
+// periodic tick, like the ADC FIFO drain rate. Given this project's
+// earlier history of cross-core I2C-driver jitter on dsp_task, a prime
+// suspect if this climbs is PWM_COMPARISON_ENABLED running both DAC
+// paths (I2C + PWM) simultaneously.
+static volatile uint32_t s_dbg_max_tick_gap_us = 0;      // worst observed inter-tick gap
+static volatile uint32_t s_dbg_late_tick_count = 0;      // ticks where the gap exceeded 1.5x nominal
 
 // Phase breakdown of the same total: which part of dsp_task's work is
 // actually costing the most. Same rules as above - volatile, plain
@@ -446,7 +515,14 @@ static bool IRAM_ATTR adc_conv_done_cb(adc_continuous_handle_t handle,
             // Distinct from s_dbg_adc_pool_ovf_count - that's the
             // DRIVER's own internal buffer overflowing before we even
             // see the data; this is OUR software FIFO, further downstream.
-            s_dbg_adc_fifo_drop_count++;
+            //
+            // Counts every remaining sample in THIS frame as dropped
+            // (n - i), not just +1 for the break - an earlier version
+            // incremented by 1 per callback-that-hit-full, which
+            // massively undercounted true loss whenever a full 16-sample
+            // frame arrived against an already-full FIFO (up to 16 lost,
+            // only 1 counted).
+            s_dbg_adc_fifo_drop_count += (n - i);
             break;
         }
         s_adc_fifo[head] = (uint16_t)p->type2.data;
@@ -508,20 +584,31 @@ static void IRAM_ATTR dsp_task(void* arg)
         digitalWrite(TIMING_DEBUG_GPIO, HIGH);
 #endif
         int64_t t_start_us = esp_timer_get_time();
+        s_dbg_dsp_tick_count++;   // unconditional - counts real elapsed ticks regardless of mode
+
+        // Measured FIRST, before any other work this tick, so it reflects
+        // the true wake-up-to-wake-up gap rather than anything downstream.
+        {
+            static int64_t s_last_tick_start_us = 0;
+            if (s_last_tick_start_us != 0) {
+                uint32_t gap_us = (uint32_t)(t_start_us - s_last_tick_start_us);
+                if (gap_us > s_dbg_max_tick_gap_us) s_dbg_max_tick_gap_us = gap_us;
+                if (gap_us > (k_sample_period_us + k_sample_period_us / 2)) s_dbg_late_tick_count++;
+            }
+            s_last_tick_start_us = t_start_us;
+        }
 
         float sample;
         if (s_twotone_mode) {
             sample = generate_twotone_sample();
         } else {
-            // Pops exactly ADC_SAMPLES_PER_TICK raw samples from
-            // s_adc_fifo (fewer only if genuinely starved, e.g. the
-            // first few ticks at startup before the first burst has
-            // arrived) and runs each through s_adc_lpf HERE, in task
-            // context - safe for float now, unlike the ISR that fills
-            // this FIFO. Filtering every individual sample in order,
-            // at a steady rate matched to production, is what actually
-            // keeps this gap-free AND smooth - see the comment by
-            // s_adc_fifo for the reasoning.
+            // Pops up to ADC_SAMPLES_PER_TICK_MAX raw samples from
+            // s_adc_fifo (normally only ADC_SAMPLES_PER_TICK=4 will be
+            // available and that's all that gets consumed - the higher
+            // cap only engages to clear a genuine backlog, see the
+            // comment by ADC_SAMPLES_PER_TICK_MAX for why that matters)
+            // and runs each through s_adc_lpf HERE, in task context -
+            // safe for float now, unlike the ISR that fills this FIFO.
             static float s_last_filtered_adc = 2048.0f;
             bool bypass = s_adc_lpf_bypass;
             {
@@ -530,9 +617,48 @@ static void IRAM_ATTR dsp_task(void* arg)
                 uint32_t available = (head - tail) & ADC_FIFO_MASK;
 
                 if (available < s_dbg_adc_fifo_min_available) s_dbg_adc_fifo_min_available = available;
+                if (available > s_dbg_adc_fifo_max_available) s_dbg_adc_fifo_max_available = available;
                 if (available < ADC_SAMPLES_PER_TICK) s_dbg_adc_fifo_starve_count++;
 
-                uint32_t to_pop = (available < ADC_SAMPLES_PER_TICK) ? available : ADC_SAMPLES_PER_TICK;
+                // Nominal 4/tick whenever that many are genuinely
+                // available - NOT "everything available up to the cap"
+                // (an earlier version did that, which greedily drained
+                // the FIFO to near-zero the instant any burst landed,
+                // then starved for the next several ticks until the next
+                // one arrived - reintroducing the exact zero-order-hold
+                // staircase problem this whole FIFO design was meant to
+                // fix).
+                //
+                // ADC_SAMPLES_PER_TICK_NOMINAL_PLUS_ONE handles the small
+                // persistent surplus (true_ratio measured ~4.032, not
+                // exactly 4 - see the [dsp] long-window diagnostic) by
+                // opportunistically taking one extra sample whenever one
+                // happens to already be waiting, continuously bleeding
+                // off the surplus in the smallest possible increment.
+                // Without this, a fixed cap-of-32 catch-up threshold (see
+                // ADC_SAMPLES_PER_TICK_MAX) still works, but the ~0.8%
+                // surplus takes ~870 ticks (~43ms) to accumulate enough
+                // to trigger it - producing one big periodic 28-sample
+                // gulp roughly 23 times/sec, which shows up as regular
+                // visible/audible spikes (confirmed empirically: observed
+                // ~30/s). Soaking up 1 extra sample at a time instead
+                // means the correction is spread continuously rather than
+                // concentrated into periodic jolts.
+                //
+                // ADC_SAMPLES_PER_TICK_MAX is still checked first and
+                // kept as a genuine-backlog fallback (startup, mode
+                // switch) - that scenario needs to recover fast, not
+                // trickle back 1 sample at a time.
+                uint32_t to_pop;
+                if (available > ADC_SAMPLES_PER_TICK_MAX) {
+                    to_pop = ADC_SAMPLES_PER_TICK_MAX;              // genuine backlog - catch up fast
+                } else if (available >= ADC_SAMPLES_PER_TICK + 1) {
+                    to_pop = ADC_SAMPLES_PER_TICK + 1;              // small surplus present - bleed off 1
+                } else if (available >= ADC_SAMPLES_PER_TICK) {
+                    to_pop = ADC_SAMPLES_PER_TICK;                  // normal case - steady nominal pace
+                } else {
+                    to_pop = available;                              // genuinely starved - take what's there
+                }
                 for (uint32_t i = 0; i < to_pop; i++) {
                     float raw = (float)s_adc_fifo[tail];
                     s_last_filtered_adc = bypass ? raw : ssb_biquad_process(&s_adc_lpf, raw);
@@ -740,6 +866,7 @@ static void init_adc(void)
     ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(s_adc, &cbs, NULL));
 
     ESP_ERROR_CHECK(adc_continuous_start(s_adc));
+    s_adc_start_us = esp_timer_get_time();
 
     Serial.printf("adc_continuous started: target=%uHz (gptimer tick=%uHz), frame=%u samples, LPF=%.0fHz\r\n",
                   ADC_CONT_SAMPLE_FREQ_HZ, SAMPLE_RATE_HZ, ADC_CONT_FRAME_SAMPLES, ADC_LPF_CUTOFF_HZ);
@@ -802,6 +929,7 @@ static void init_sample_timer(void)
 
     gptimer_enable(timer);
     gptimer_start(timer);
+    s_dsp_tick_start_us = esp_timer_get_time();
 }
 
 void setup()
@@ -906,8 +1034,16 @@ void setup()
              AD9851_ATTACHED ? "attached" : "not attached (stubbed)",
              MCP4725_I2C_ADDR,
              PWM_COMPARISON_ENABLED ? "on" : "off");
-    Serial.println("Send 't' for two-tone test signal, 'm' for live mic input, 'f' to toggle the ADC LPF on/off.");
+    Serial.println("Send 't' for two-tone test signal, 'm' for live mic input, 'f' to toggle the ADC LPF on/off, 'r' to reset diagnostics.");
 }
+
+// Owned by the [adc] 1-second rate print below; file-scope (not a local
+// static) so the 'r' reset command can zero them too - otherwise the
+// very next print after a reset would compute a bogus huge delta against
+// stale pre-reset values.
+static uint32_t s_last_samples_total = 0;
+static uint32_t s_last_callback_count = 0;
+static uint32_t s_last_rate_print_ms = 0;
 
 void loop()
 {
@@ -927,6 +1063,34 @@ void loop()
         } else if (c == 'f') {
             s_adc_lpf_bypass = !s_adc_lpf_bypass;
             Serial.printf("-> ADC LPF %s\r\n", s_adc_lpf_bypass ? "BYPASSED (raw)" : "active");
+        } else if (c == 'r') {
+            // Resets every diagnostic counter/watermark for a clean
+            // measurement window, without needing a full reflash. Useful
+            // after switching modes (e.g. 't' then 'm') so counters like
+            // drop_total/starve_ticks_total reflect only what happens
+            // AFTER the reset, not history carried over from a different
+            // mode or an earlier test run in the same boot.
+            s_dbg_max_busy_us = 0;
+            s_dbg_overrun_count = 0;
+            s_dbg_max_adc_us = 0;
+            s_dbg_max_dsp_us = 0;
+            s_dbg_max_write_us = 0;
+            s_dbg_max_tick_gap_us = 0;
+            s_dbg_late_tick_count = 0;
+            s_dbg_adc_samples_total = 0;
+            s_dbg_adc_callback_count = 0;
+            s_dbg_adc_pool_ovf_count = 0;
+            s_dbg_adc_fifo_starve_count = 0;
+            s_dbg_adc_fifo_min_available = 0xFFFFFFFFu;
+            s_dbg_adc_fifo_max_available = 0;
+            s_dbg_adc_fifo_drop_count = 0;
+            s_dbg_dsp_tick_count = 0;
+            s_dsp_tick_start_us = esp_timer_get_time();
+            s_last_samples_total = 0;
+            s_last_callback_count = 0;
+            s_last_rate_print_ms = millis();
+            s_adc_start_us = esp_timer_get_time();   // restarts the long-window average from now
+            Serial.println("-> diagnostics reset, clean window starting now");
         }
     }
 
@@ -966,9 +1130,12 @@ void loop()
     static uint32_t last_timing_print_ms = 0;
     if (now - last_timing_print_ms >= 1000) {
         last_timing_print_ms = now;
-        Serial.printf("[timing] max_busy_us=%u (adc=%u dsp=%u write=%u) period_us=%u overruns=%u\r\n",
+        Serial.printf("[timing] mode=%s max_busy_us=%u (adc=%u dsp=%u write=%u) period_us=%u overruns=%u\r\n",
+                      s_twotone_mode ? "TWOTONE" : "MIC",
                       s_dbg_max_busy_us, s_dbg_max_adc_us, s_dbg_max_dsp_us, s_dbg_max_write_us,
                       k_sample_period_us, s_dbg_overrun_count);
+        Serial.printf("[timing]   wakeup jitter: max_gap_us=%u (nominal=%u) late_ticks_total=%u\r\n",
+                      s_dbg_max_tick_gap_us, k_sample_period_us, s_dbg_late_tick_count);
 
         // Sub-phase breakdown of dsp_us itself, from ssb_dsp's internal
         // profiling - lets us see which part of the DSP call (audio_fx,
@@ -986,27 +1153,63 @@ void loop()
         // the filter's uniform-sample-spacing assumption is being
         // violated, which would explain artifacts no amount of filter
         // debugging could fix.
-        static uint32_t last_samples_total = 0;
-        static uint32_t last_callback_count = 0;
-        static uint32_t last_ms = 0;
         uint32_t samples_now   = s_dbg_adc_samples_total;
         uint32_t callbacks_now = s_dbg_adc_callback_count;
-        uint32_t elapsed_ms    = now - last_ms;
+        uint32_t elapsed_ms    = now - s_last_rate_print_ms;
         if (elapsed_ms > 0) {
-            uint32_t actual_sps   = (uint32_t)((uint64_t)(samples_now - last_samples_total) * 1000 / elapsed_ms);
+            uint32_t actual_sps   = (uint32_t)((uint64_t)(samples_now - s_last_samples_total) * 1000 / elapsed_ms);
             uint32_t expected_cbs = (uint32_t)((uint64_t)ADC_CONT_SAMPLE_FREQ_HZ * elapsed_ms
                                                 / 1000 / ADC_CONT_FRAME_SAMPLES);
             Serial.printf("[adc] actual=%u sps (expected=%u) callbacks=%u (expected~%u) pool_ovf_total=%u\r\n",
                           actual_sps, ADC_CONT_SAMPLE_FREQ_HZ,
-                          callbacks_now - last_callback_count, expected_cbs,
+                          callbacks_now - s_last_callback_count, expected_cbs,
                           s_dbg_adc_pool_ovf_count);
-            Serial.printf("[adc]   fifo: min_available=%u (want>=%u) starve_ticks_total=%u drop_total=%u\r\n",
-                          s_dbg_adc_fifo_min_available, ADC_SAMPLES_PER_TICK,
+
+            // Long-window average - much lower noise than the 1s figure
+            // above, since averaging error shrinks with window length.
+            // This is what to trust for pinning down the TRUE achieved
+            // ADC rate vs. the requested ADC_CONT_SAMPLE_FREQ_HZ (e.g. to
+            // confirm whether an observed mismatch is a real clock
+            // divider quantization effect or just measurement noise).
+            int64_t elapsed_since_start_us = esp_timer_get_time() - s_adc_start_us;
+            if (elapsed_since_start_us > 0) {
+                double long_avg_sps = (double)samples_now * 1000000.0 / (double)elapsed_since_start_us;
+                double error_pct = (long_avg_sps - (double)ADC_CONT_SAMPLE_FREQ_HZ)
+                                    * 100.0 / (double)ADC_CONT_SAMPLE_FREQ_HZ;
+                Serial.printf("[adc]   long-window avg=%.2f sps over %.1fs (%.3f%% vs nominal %uHz)\r\n",
+                              long_avg_sps, elapsed_since_start_us / 1000000.0,
+                              error_pct, ADC_CONT_SAMPLE_FREQ_HZ);
+
+                // Same measurement for dsp_task's own tick rate (gptimer)
+                // - only ever measured the ADC side precisely before.
+                // Chronic FIFO starvation despite the ADC running fast
+                // (not slow) only makes sense if THIS clock is also
+                // running fast, by more than the ADC's own error.
+                int64_t dsp_elapsed_us = esp_timer_get_time() - s_dsp_tick_start_us;
+                if (dsp_elapsed_us > 0) {
+                    double long_avg_tps = (double)s_dbg_dsp_tick_count * 1000000.0 / (double)dsp_elapsed_us;
+                    double tick_error_pct = (long_avg_tps - (double)SAMPLE_RATE_HZ)
+                                             * 100.0 / (double)SAMPLE_RATE_HZ;
+                    // The number that actually matters for the FIFO: the
+                    // TRUE ratio of the two measured rates, vs. the
+                    // nominal ADC_SAMPLES_PER_TICK=4 the drain logic
+                    // assumes. If this deviates meaningfully from 4.000,
+                    // that - not either clock's error in isolation - is
+                    // the real cause of sustained starvation or backlog.
+                    double true_ratio = long_avg_sps / long_avg_tps;
+                    Serial.printf("[dsp]   long-window avg=%.2f ticks/s (%.3f%% vs nominal %uHz) true_ratio=%.4f (nominal=%u)\r\n",
+                                  long_avg_tps, tick_error_pct, SAMPLE_RATE_HZ,
+                                  true_ratio, ADC_SAMPLES_PER_TICK);
+                }
+            }
+            Serial.printf("[adc]   fifo: available now min=%u max=%u (want>=%u,<%u) starve_ticks_total=%u drop_total=%u\r\n",
+                          s_dbg_adc_fifo_min_available, s_dbg_adc_fifo_max_available,
+                          ADC_SAMPLES_PER_TICK, ADC_FIFO_SIZE,
                           s_dbg_adc_fifo_starve_count, s_dbg_adc_fifo_drop_count);
         }
-        last_samples_total  = samples_now;
-        last_callback_count = callbacks_now;
-        last_ms = now;
+        s_last_samples_total  = samples_now;
+        s_last_callback_count = callbacks_now;
+        s_last_rate_print_ms  = now;
     }
 
     delay(10);
