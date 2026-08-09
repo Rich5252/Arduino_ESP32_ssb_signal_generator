@@ -115,7 +115,7 @@
 
 // ---- Two-tone test mode: bypass the mic ADC with a synthesized signal.
 // Zero-hardware smoke test of the DSP chain. ----
-#define TWOTONE_TEST_MODE   0
+#define TWOTONE_TEST_MODE   1
 #define TWOTONE_F1_HZ        700.0f
 #define TWOTONE_F2_HZ       1900.0f
 #define TWOTONE_AMPLITUDE    0.45f   // keep below 0.5 so peaks don't clip when summed
@@ -125,7 +125,10 @@
 // set below in dsp_cfg.audio_fx. Leave off with TWOTONE_TEST_MODE if you
 // want to look at the raw DSP chain's spurious performance without any
 // conditioning in the signal path.
-#define AUDIO_FX_ENABLED 1
+#define AUDIO_FX_ENABLED 1  // was 0 (pending re-tuning) - now toggleable live per-stage via serial
+                             // 'e' (EQ) / 'c' (compressor) commands, see loop() - flip back to 0 only
+                             // if you want the whole subsystem compiled out entirely
+#define MASTER_GAIN_STEP_DB 1.0f  // per '+'/'-' keypress - see ssb_dsp_set_master_gain_db()
 
 // ---- MCP4725 DAC (RSET modulation output) ----
 #define MCP4725_SDA_GPIO      13
@@ -979,7 +982,7 @@ void setup()
             .presence_freq_hz = 2200.0f,
             .presence_gain_db = 4.0f,
             .presence_q = 1.0f,
-            .comp_threshold = 0.3f,
+            .comp_threshold = 0.1f,
             .comp_ratio = 3.5f,
             .comp_attack_ms = 3.0f,
             .comp_release_ms = 120.0f,
@@ -1035,6 +1038,11 @@ void setup()
              MCP4725_I2C_ADDR,
              PWM_COMPARISON_ENABLED ? "on" : "off");
     Serial.println("Send 't' for two-tone test signal, 'm' for live mic input, 'f' to toggle the ADC LPF on/off, 'r' to reset diagnostics.");
+    Serial.printf("Send 'e' to toggle EQ (currently %s), 'c' to toggle compressor (currently %s), "
+                  "'+'/'-' for master gain (currently %+.1fdB, %.1fdB/step).\r\n",
+                  ssb_dsp_get_eq_enabled(s_ssb) ? "ON" : "off",
+                  ssb_dsp_get_compressor_enabled(s_ssb) ? "ON" : "off",
+                  ssb_dsp_get_master_gain_db(s_ssb), MASTER_GAIN_STEP_DB);
 }
 
 // Owned by the [adc] 1-second rate print below; file-scope (not a local
@@ -1091,6 +1099,22 @@ void loop()
             s_last_rate_print_ms = millis();
             s_adc_start_us = esp_timer_get_time();   // restarts the long-window average from now
             Serial.println("-> diagnostics reset, clean window starting now");
+        } else if (c == 'e') {
+            bool now_on = !ssb_dsp_get_eq_enabled(s_ssb);
+            ssb_dsp_set_eq_enabled(s_ssb, now_on);
+            Serial.printf("-> EQ (HPF+presence) %s\r\n", now_on ? "ON" : "off");
+        } else if (c == 'c') {
+            bool now_on = !ssb_dsp_get_compressor_enabled(s_ssb);
+            ssb_dsp_set_compressor_enabled(s_ssb, now_on);
+            Serial.printf("-> compressor %s\r\n", now_on ? "ON" : "off");
+        } else if (c == '+') {
+            float new_gain = ssb_dsp_get_master_gain_db(s_ssb) + MASTER_GAIN_STEP_DB;
+            ssb_dsp_set_master_gain_db(s_ssb, new_gain);
+            Serial.printf("-> master gain %+.1f dB\r\n", new_gain);
+        } else if (c == '-') {
+            float new_gain = ssb_dsp_get_master_gain_db(s_ssb) - MASTER_GAIN_STEP_DB;
+            ssb_dsp_set_master_gain_db(s_ssb, new_gain);
+            Serial.printf("-> master gain %+.1f dB\r\n", new_gain);
         }
     }
 

@@ -131,6 +131,38 @@ int ssb_dsp_group_delay_samples(ssb_dsp_handle_t handle);
 void ssb_dsp_set_compressor(ssb_dsp_handle_t handle, float threshold, float ratio);
 
 /**
+ * @brief Independently enable/disable the EQ (HPF + presence peak) and
+ *        compressor stages at runtime - e.g. from a serial command, to
+ *        A/B each one's contribution without recompiling. Both default
+ *        to whatever ssb_audio_fx_config_t::enable was at init.
+ *        No-op (and the getters return false) if audio_fx wasn't enabled
+ *        at init - the underlying biquad/compressor state was never set
+ *        up, so there's nothing to toggle. IRAM_ATTR: safe to call from
+ *        the real-time path, though the intended use is occasional calls
+ *        from a command handler, not per-sample.
+ */
+void IRAM_ATTR ssb_dsp_set_eq_enabled(ssb_dsp_handle_t handle, bool enable);
+void IRAM_ATTR ssb_dsp_set_compressor_enabled(ssb_dsp_handle_t handle, bool enable);
+bool ssb_dsp_get_eq_enabled(ssb_dsp_handle_t handle);
+bool ssb_dsp_get_compressor_enabled(ssb_dsp_handle_t handle);
+
+/**
+ * @brief Master gain trim, in dB, applied after EQ/compressor (or
+ *        directly to the raw sample if audio_fx wasn't enabled at init -
+ *        this always works). Deliberately manual rather than automatic:
+ *        the compressor's gain reduction is exactly computable from its
+ *        threshold/ratio (see ssb_dsp_set_compressor - its makeup gain
+ *        is applied automatically now), but EQ's effect on perceived
+ *        level depends on the input spectrum, which isn't something
+ *        this module can know - use this to trim it out by ear/scope
+ *        instead of trusting a guessed number. IRAM_ATTR: safe to call
+ *        from the real-time path, though intended for occasional calls
+ *        (e.g. a serial '+'/'-' command), not per-sample.
+ */
+void IRAM_ATTR ssb_dsp_set_master_gain_db(ssb_dsp_handle_t handle, float gain_db);
+float ssb_dsp_get_master_gain_db(ssb_dsp_handle_t handle);
+
+/**
  * @brief Sub-phase timing breakdown of ssb_dsp_process_sample, each a
  *        running high-water mark in microseconds since ssb_dsp_init().
  *        Measured internally via esp_timer_get_time() - negligible

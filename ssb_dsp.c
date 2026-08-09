@@ -24,7 +24,25 @@ typedef struct {
     float attack_coef, release_coef;   // one-pole envelope-follower coefficients
     float threshold, inv_ratio;
     float env;
+    float makeup_gain;   // automatic, see compute_compressor_makeup_gain() - keeps level roughly
+                          // consistent whether the compressor is on or off, unlike EQ's gain
+                          // (see ssb_dsp_s::master_gain comment for why that one's manual instead)
 } compressor_t;
+
+// Standard "unity gain at 0dBFS" makeup gain: for a signal peaking at
+// full scale (0dB), the compressor's own gain reduction there is
+// threshold_db * (1 - 1/ratio) (both threshold_db and this product are
+// negative, i.e. a reduction) - this exactly cancels that, so a
+// full-scale peak comes out at roughly the same level whether the
+// compressor is engaged or not. Well-defined because threshold/ratio are
+// known constants, unlike EQ gain which depends on the input spectrum.
+static float compute_compressor_makeup_gain(float threshold, float ratio)
+{
+    if (threshold <= 0.0f || ratio <= 1.0f) return 1.0f;
+    float threshold_db = 20.0f * log10f(threshold);
+    float reduction_db = threshold_db * (1.0f - 1.0f / ratio);   // negative
+    return powf(10.0f, -reduction_db / 20.0f);                    // boost to cancel it
+}
 
 // Denormal (subnormal) floats are numbers below ~1.2e-38f in magnitude -
 // still valid IEEE-754 values, but most FPUs (including Xtensa's) fall
@@ -170,7 +188,7 @@ static inline float IRAM_ATTR compressor_process(compressor_t *c, float x)
     } else {
         gain = 1.0f;
     }
-    return x * gain;
+    return x * gain * c->makeup_gain;
 }
 
 struct ssb_dsp_s {
@@ -184,10 +202,40 @@ struct ssb_dsp_s {
     float sample_rate_hz;
     float max_freq_dev_hz;
 
-    bool audio_fx_enable;
+    // audio_fx_configured: was the EQ/compressor subsystem set up at all
+    // at ssb_dsp_init() (i.e. was ssb_audio_fx_config_t::enable true)?
+    // This gates whether the biquad/compressor state even exists - if
+    // false, eq_enable/comp_enable below are meaningless and all the
+    // toggle functions are no-ops.
+    //
+    // eq_enable/comp_enable: independently runtime-toggleable (e.g. via
+    // serial command) once configured - volatile since they're written
+    // from a different context (a command handler) than the real-time
+    // path that reads them in ssb_dsp_process_sample(), same reasoning
+    // as the volatile mode flags elsewhere in this project. Both default
+    // to audio_fx_configured's value at init (i.e. "on" if the subsystem
+    // was configured at all, until explicitly toggled).
+    bool audio_fx_configured;
+    volatile bool eq_enable;
+    volatile bool comp_enable;
     biquad_t eq_hpf;
     biquad_t eq_presence;
     compressor_t comp;
+
+    // Master gain trim - always available, independent of
+    // audio_fx_configured (works even in raw passthrough). Unlike the
+    // compressor's makeup gain, this is deliberately MANUAL rather than
+    // automatic: EQ's actual effect on perceived level depends on how
+    // much of the real program spectrum sits near presence_freq_hz,
+    // which isn't something we can compute correctly without knowing the
+    // input signal - a guessed "compensation" number would just be
+    // wrong. This is the tool for trimming that out by ear/scope
+    // instead, e.g. via serial '+'/'-' commands.
+    // master_gain_db is what get/set work in (human-friendly); linear is
+    // precomputed by the setter and is what the per-sample path actually
+    // multiplies by, keeping the hot path a single plain multiply.
+    volatile float master_gain_db;
+    volatile float master_gain_linear;
 
     // Sub-phase timing high-water marks, see ssb_dsp_get_profile().
     uint32_t max_audio_fx_us;
@@ -250,8 +298,13 @@ esp_err_t ssb_dsp_init(const ssb_dsp_config_t *cfg, ssb_dsp_handle_t *out_handle
 
     generate_hilbert_coeffs(h->hilbert_coeffs, h->num_taps);
 
-    h->audio_fx_enable = cfg->audio_fx.enable;
-    if (h->audio_fx_enable) {
+    h->master_gain_db = 0.0f;
+    h->master_gain_linear = 1.0f;
+
+    h->audio_fx_configured = cfg->audio_fx.enable;
+    h->eq_enable = cfg->audio_fx.enable;     // default both stages "on" if configured at all -
+    h->comp_enable = cfg->audio_fx.enable;   // individually toggled later via the setters below
+    if (h->audio_fx_configured) {
         float hpf_fc      = cfg->audio_fx.hpf_freq_hz > 0.0f ? cfg->audio_fx.hpf_freq_hz : 300.0f;
         float presence_fc = cfg->audio_fx.presence_freq_hz > 0.0f ? cfg->audio_fx.presence_freq_hz : 2200.0f;
         float presence_q  = cfg->audio_fx.presence_q > 0.0f ? cfg->audio_fx.presence_q : 1.0f;
@@ -271,6 +324,7 @@ esp_err_t ssb_dsp_init(const ssb_dsp_config_t *cfg, ssb_dsp_handle_t *out_handle
         h->comp.threshold = threshold;
         h->comp.inv_ratio = 1.0f / ratio;
         h->comp.env = 0.0f;
+        h->comp.makeup_gain = compute_compressor_makeup_gain(threshold, ratio);
 
         ESP_LOGI(TAG, "ssb_dsp audio_fx enabled: hpf=%.0fHz presence=%.0fHz/%+.1fdB/Q%.2f "
                  "comp=thresh%.2f/ratio%.1f:1/atk%.1fms/rel%.1fms",
@@ -286,9 +340,53 @@ esp_err_t ssb_dsp_init(const ssb_dsp_config_t *cfg, ssb_dsp_handle_t *out_handle
 
 void ssb_dsp_set_compressor(ssb_dsp_handle_t handle, float threshold, float ratio)
 {
-    if (!handle || !handle->audio_fx_enable) return;
+    if (!handle || !handle->audio_fx_configured) return;
     if (threshold > 0.0f) handle->comp.threshold = threshold;
     if (ratio > 1.0f)     handle->comp.inv_ratio = 1.0f / ratio;
+    // Recompute from whatever's now current (not just the just-passed
+    // args - either one might have been left unchanged this call).
+    float current_ratio = 1.0f / handle->comp.inv_ratio;
+    handle->comp.makeup_gain = compute_compressor_makeup_gain(handle->comp.threshold, current_ratio);
+}
+
+void IRAM_ATTR ssb_dsp_set_eq_enabled(ssb_dsp_handle_t handle, bool enable)
+{
+    if (!handle || !handle->audio_fx_configured) return;
+    handle->eq_enable = enable;
+}
+
+void IRAM_ATTR ssb_dsp_set_compressor_enabled(ssb_dsp_handle_t handle, bool enable)
+{
+    if (!handle || !handle->audio_fx_configured) return;
+    handle->comp_enable = enable;
+    // Reset the envelope follower on re-enable so it doesn't resume from
+    // a stale value that may have drifted while disabled (the follower
+    // keeps running its OWN state update only inside compressor_process,
+    // which isn't called at all while comp_enable is false, so env is
+    // simply frozen, not decaying - starting clean avoids a jump/thump).
+    if (enable) handle->comp.env = 0.0f;
+}
+
+bool ssb_dsp_get_eq_enabled(ssb_dsp_handle_t handle)
+{
+    return handle && handle->audio_fx_configured && handle->eq_enable;
+}
+
+bool ssb_dsp_get_compressor_enabled(ssb_dsp_handle_t handle)
+{
+    return handle && handle->audio_fx_configured && handle->comp_enable;
+}
+
+void IRAM_ATTR ssb_dsp_set_master_gain_db(ssb_dsp_handle_t handle, float gain_db)
+{
+    if (!handle) return;
+    handle->master_gain_db = gain_db;
+    handle->master_gain_linear = powf(10.0f, gain_db / 20.0f);
+}
+
+float ssb_dsp_get_master_gain_db(ssb_dsp_handle_t handle)
+{
+    return handle ? handle->master_gain_db : 0.0f;
 }
 
 void ssb_dsp_get_profile(ssb_dsp_handle_t handle, ssb_dsp_profile_t *out)
@@ -324,12 +422,22 @@ void IRAM_ATTR ssb_dsp_process_sample(ssb_dsp_handle_t handle,
     // sample, before anything enters the Hilbert delay line. This keeps
     // it fully decoupled from the Hilbert filter's `center`-tap group
     // delay - the Hilbert path never sees an unconditioned sample.
+    // EQ and compressor are checked independently now (eq_enable,
+    // comp_enable) so each can be A/B'd live via serial command without
+    // recompiling - see ssb_dsp_set_eq_enabled()/ssb_dsp_set_compressor_enabled().
     int64_t t0 = esp_timer_get_time();
-    if (handle->audio_fx_enable) {
-        audio_sample = compressor_process(&handle->comp, audio_sample);
-        audio_sample = biquad_process(&handle->eq_hpf, audio_sample);
-        audio_sample = biquad_process(&handle->eq_presence, audio_sample);
+    if (handle->audio_fx_configured) {
+        if (handle->comp_enable) audio_sample = compressor_process(&handle->comp, audio_sample);
+        if (handle->eq_enable) {
+            audio_sample = biquad_process(&handle->eq_hpf, audio_sample);
+            audio_sample = biquad_process(&handle->eq_presence, audio_sample);
+        }
     }
+    // Master gain - unconditional, works even with audio_fx_configured
+    // false (raw passthrough). Single multiply; master_gain_linear==1.0f
+    // (the default) costs nothing worth measuring, so this doesn't need
+    // its own guard the way EQ/compressor do.
+    audio_sample *= handle->master_gain_linear;
     int64_t t1 = esp_timer_get_time();
     uint32_t audio_fx_us = (uint32_t)(t1 - t0);
     if (audio_fx_us > handle->max_audio_fx_us) handle->max_audio_fx_us = audio_fx_us;
