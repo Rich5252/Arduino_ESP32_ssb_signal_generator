@@ -216,7 +216,7 @@
 // spurious data - flagged for the same "listen to it, don't assume"
 // treatment the old N value got.
 #define ADC_CONT_SAMPLE_FREQ_HZ   80000u   // within ESP32-S3's continuous-mode range
-#define ADC_CONT_FRAME_SAMPLES    16    // DMA chunk size only now - see AVERAGING note above.
+#define ADC_CONT_FRAME_SAMPLES    4    // DMA chunk size only now - see AVERAGING note above.
                                          // If adc_continuous_new_handle() errors on this, the
                                          // driver enforces a different frame-size constraint -
                                          // report the exact error and we'll adjust.
