@@ -115,7 +115,7 @@
 
 // ---- Two-tone test mode: bypass the mic ADC with a synthesized signal.
 // Zero-hardware smoke test of the DSP chain. ----
-#define TWOTONE_TEST_MODE   0
+#define TWOTONE_TEST_MODE   1
 #define TWOTONE_F1_HZ        700.0f
 #define TWOTONE_F2_HZ       1900.0f
 #define TWOTONE_AMPLITUDE    0.45f   // keep below 0.5 so peaks don't clip when summed
@@ -291,6 +291,15 @@ static TaskHandle_t s_dac_task;
 static QueueHandle_t s_envelope_queue;   // length 1, "latest value wins" (xQueueOverwrite)
 static volatile ssb_sideband_t s_sideband = SSB_SIDEBAND_USB;
 
+// Runtime switch between two-tone test signal and live mic input, toggled
+// from loop() via serial commands 't'/'m' (see there). Starts from
+// TWOTONE_TEST_MODE's compile-time value so existing behavior is
+// unchanged if you never send a command, but dsp_task now branches on
+// this variable rather than #if - both code paths are always compiled
+// in and the ADC always runs (see init_adc() call in setup(), no longer
+// conditional) so switching is instant with no re-init needed.
+static volatile bool s_twotone_mode = (TWOTONE_TEST_MODE != 0);
+
 // Written by dsp_task/dac_task, printed by loop() on Core 1 at low
 // priority - keeps Serial (slow) completely out of both real-time tasks.
 static volatile float s_dbg_envelope = 0.0f;
@@ -369,7 +378,9 @@ static bool IRAM_ATTR adc_conv_done_cb(adc_continuous_handle_t handle,
     return false;   // no higher-priority task needs waking from this event
 }
 
-#if TWOTONE_TEST_MODE
+// Always compiled in now (not gated on TWOTONE_TEST_MODE) since dsp_task
+// branches on the runtime s_twotone_mode flag and can switch to this at
+// any time via the 't' serial command - see s_twotone_mode.
 static float s_tone1_phase = 0.0f;
 static float s_tone2_phase = 0.0f;
 
@@ -384,7 +395,6 @@ static inline float generate_twotone_sample(void)
     if (s_tone2_phase > two_pi) s_tone2_phase -= two_pi;
     return sample;
 }
-#endif
 
 // IRAM_ATTR - keeps this task's code in internal RAM rather than flash,
 // so it's immune to cache-line stalls caused by Core 1 activity (dac_task's
@@ -408,35 +418,39 @@ static void IRAM_ATTR dsp_task(void* arg)
         int64_t t_start_us = esp_timer_get_time();
 
         float sample;
-#if TWOTONE_TEST_MODE
-        sample = generate_twotone_sample();
-#else
-        // Drains whatever raw samples adc_conv_done_cb has pushed into
-        // s_adc_raw_ring since the last tick (usually 0-4 of them, given
-        // the ISR delivers 16 at a time roughly every 4 ticks) and runs
-        // each through s_adc_lpf HERE, in task context - unlike the ISR,
-        // dsp_task has a real FPU register-save area, so float math is
-        // safe. If the ring is empty this tick (frame hasn't completed
-        // yet), s_last_filtered_adc just holds its previous value - same
-        // "slightly stale is fine" tolerance the old single-scalar
-        // approach had, and the filter's own state carries over correctly
-        // across calls either way since it's not reset between drains.
-        static float s_last_filtered_adc = 2048.0f;
-        {
-            uint32_t tail = s_adc_ring_tail;
-            uint32_t head = s_adc_ring_head;   // snapshot - ISR may still be advancing it, fine for a single consumer
-            while (tail != head) {
-                s_last_filtered_adc = ssb_biquad_process(&s_adc_lpf, (float)s_adc_raw_ring[tail]);
-                tail = (tail + 1) & ADC_RAW_RINGBUF_MASK;
+        if (s_twotone_mode) {
+            sample = generate_twotone_sample();
+        } else {
+            // Drains whatever raw samples adc_conv_done_cb has pushed into
+            // s_adc_raw_ring since the last tick (usually 0-4 of them, given
+            // the ISR delivers 16 at a time roughly every 4 ticks) and runs
+            // each through s_adc_lpf HERE, in task context - unlike the ISR,
+            // dsp_task has a real FPU register-save area, so float math is
+            // safe. If the ring is empty this tick (frame hasn't completed
+            // yet), s_last_filtered_adc just holds its previous value - same
+            // "slightly stale is fine" tolerance the old single-scalar
+            // approach had, and the filter's own state carries over correctly
+            // across calls either way since it's not reset between drains.
+            //
+            // Note this drains regardless of mode now (ADC always runs, see
+            // setup()) so the ring never overflows while in two-tone mode
+            // and mic input stays "warm" for an instant switch back.
+            static float s_last_filtered_adc = 2048.0f;
+            {
+                uint32_t tail = s_adc_ring_tail;
+                uint32_t head = s_adc_ring_head;   // snapshot - ISR may still be advancing it, fine for a single consumer
+                while (tail != head) {
+                    s_last_filtered_adc = ssb_biquad_process(&s_adc_lpf, (float)s_adc_raw_ring[tail]);
+                    tail = (tail + 1) & ADC_RAW_RINGBUF_MASK;
+                }
+                s_adc_ring_tail = tail;
             }
-            s_adc_ring_tail = tail;
+            int raw = (int)s_last_filtered_adc;
+            // Normalize 12-bit ADC (0-4095) to roughly [-1, 1] with DC removal.
+            sample = (float)raw / 2048.0f - 1.0f;
+            dc_estimate = dc_alpha * dc_estimate + (1.0f - dc_alpha) * sample;
+            sample -= dc_estimate;
         }
-        int raw = (int)s_last_filtered_adc;
-        // Normalize 12-bit ADC (0-4095) to roughly [-1, 1] with DC removal.
-        sample = (float)raw / 2048.0f - 1.0f;
-        dc_estimate = dc_alpha * dc_estimate + (1.0f - dc_alpha) * sample;
-        sample -= dc_estimate;
-#endif
         int64_t t_adc_done_us = esp_timer_get_time();
 
         float freq_dev_hz = 0.0f;
@@ -749,9 +763,10 @@ void setup()
     };
     ESP_ERROR_CHECK(ssb_dsp_init(&dsp_cfg, &s_ssb));
 
-#if !TWOTONE_TEST_MODE
+    // Always started now, regardless of s_twotone_mode's initial value -
+    // needed so the mic path is live and ready the moment a 't'/'m'
+    // serial command switches modes at runtime (see s_twotone_mode).
     init_adc();
-#endif
     init_i2c_dac();
 #if PWM_COMPARISON_ENABLED
     init_rset_mod_pwm();
@@ -791,21 +806,40 @@ void setup()
 
     Serial.printf("SSB mic test running: taps=%d fs=%uHz mode=%s ad9851=%s dac=MCP4725@0x%02X pwm_compare=%s\r\n",
              HILBERT_TAPS, SAMPLE_RATE_HZ,
-             TWOTONE_TEST_MODE ? "TWO-TONE TEST" : "mic",
+             s_twotone_mode ? "TWO-TONE TEST" : "mic",
              AD9851_ATTACHED ? "attached" : "not attached (stubbed)",
              MCP4725_I2C_ADDR,
              PWM_COMPARISON_ENABLED ? "on" : "off");
+    Serial.println("Send 't' for two-tone test signal, 'm' for live mic input.");
 }
 
 void loop()
 {
+    // Runtime source switch: 't' -> two-tone test signal, 'm' -> live mic
+    // input. dsp_task reads s_twotone_mode fresh every tick, so this
+    // takes effect on the very next sample - no glitch/restart needed.
+    // Unrecognized bytes (e.g. line endings from some serial monitors)
+    // are silently ignored rather than echoed as an error.
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == 't' && !s_twotone_mode) {
+            s_twotone_mode = true;
+            Serial.println("-> two-tone test signal");
+        } else if (c == 'm' && s_twotone_mode) {
+            s_twotone_mode = false;
+            Serial.println("-> live mic input");
+        }
+    }
+
     // Keep adc_continuous's internal pool from filling up. The
     // on_conv_done callback (see adc_conv_done_cb) already captures every
     // frame's newest sample for dsp_task's use as it arrives - this call's
     // only job is freeing up the underlying pool so it doesn't overflow
     // (on_pool_ovf), so its contents are simply discarded. Low priority,
     // not time-critical - fine to do here alongside the other loop() work.
-#if !TWOTONE_TEST_MODE
+    // Runs unconditionally now - the ADC is always active (see init_adc()
+    // in setup()) regardless of s_twotone_mode, so this pool needs
+    // draining either way.
     {
         uint8_t drain_buf[256];
         uint32_t drain_bytes = 0;
@@ -814,7 +848,6 @@ void loop()
             // discarded
         }
     }
-#endif
 
     // Diagnostics only - throttled well below the sample rate, and this
     // task is lower priority than both real-time tasks, so it never
