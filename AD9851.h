@@ -1,0 +1,82 @@
+#pragma once
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "esp_err.h"
+#include "esp_attr.h"
+#include "driver/spi_master.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief ESP-IDF hardware-SPI driver for the AD9851 DDS, matching the
+ *        protocol used by the proven Arduino Nano AD9851.h library this
+ *        was ported from (LSB-first bit order, SPI Mode 0, 4 FTW bytes
+ *        then a control byte, FQ_UD pulsed after each transfer) - NOT
+ *        reconstructed from the datasheet tables directly, since those
+ *        are genuinely ambiguous between serial/parallel byte ordering
+ *        and getting this wrong would silently produce the wrong
+ *        frequency with no obvious symptom short of a spectrum analyser.
+ *
+ * FQ_UD is wired as the SPI bus's CS line (spics_io_num) rather than a
+ * separate manually-toggled GPIO: the ESP-IDF SPI driver asserts CS LOW
+ * for the duration of a transaction and returns it HIGH immediately
+ * after - which is exactly the FQ_UD timing the AD9851 wants (low while
+ * shifting, low-to-high transition to latch). No separate FQ_UD pulse
+ * code needed.
+ *
+ * TIMING: ad9851_set_frequency() is intended to be called every audio
+ * sample (e.g. from dsp_task at 20kHz) for continuous phase modulation.
+ * A 40-bit transfer takes 40/spi_clock_hz seconds of hard SPI clock time
+ * alone - e.g. 20us at 2MHz. Check this against your real-time budget
+ * (e.g. via the existing [timing] instrumentation) once this is wired
+ * up; don't assume it fits just because the rest of the pipeline had
+ * margin before this was added.
+ */
+
+typedef struct {
+    spi_host_device_t spi_host;   ///< e.g. SPI2_HOST
+    int pin_data;                 ///< D7 - wired as SPI MOSI
+    int pin_wclk;                 ///< W_CLK - wired as SPI SCLK
+    int pin_fqud;                 ///< FQ_UD - wired as SPI CS (see above, not a plain GPIO)
+    int pin_reset;                ///< RESET - plain GPIO, toggled once at init
+    uint32_t ref_clk_hz;          ///< Crystal/reference frequency, e.g. 30000000
+    bool use_6x_multiplier;       ///< Enable the internal 6x REFCLK multiplier
+    int spi_clock_hz;             ///< SPI clock rate - see TIMING note above
+} ad9851_config_t;
+
+typedef struct ad9851_s *ad9851_handle_t;
+
+/**
+ * @brief Initialize the AD9851: sets up the SPI bus/device, pulses
+ *        RESET, and performs the standard "enter serial mode" sequence
+ *        (one W_CLK pulse + one FQ_UD pulse with DATA=0).
+ *
+ *        IMPORTANT: per the AD9851 datasheet, the 40-bit register must
+ *        be immediately overwritten with a valid word after entering
+ *        serial mode, or it may randomly engage the 6x multiplier or
+ *        factory test mode. Call ad9851_set_frequency() immediately
+ *        after this returns ESP_OK - don't skip it or reorder it.
+ */
+esp_err_t ad9851_init(const ad9851_config_t *cfg, ad9851_handle_t *out_handle);
+
+/**
+ * @brief Set the output frequency. Computes the 32-bit frequency tuning
+ *        word and sends the full 40-bit serial word (FTW + control
+ *        byte). Blocking (spi_device_polling_transmit - no queue/
+ *        semaphore involved, lowest latency for the real-time path) -
+ *        see the TIMING note above for how long this actually takes.
+ */
+void IRAM_ATTR ad9851_set_frequency(ad9851_handle_t handle, uint32_t freq_hz);
+
+/**
+ * @brief Free the SPI device and handle. Does not touch RESET, so the
+ *        AD9851 keeps outputting its last-programmed frequency.
+ */
+void ad9851_deinit(ad9851_handle_t handle);
+
+#ifdef __cplusplus
+}
+#endif

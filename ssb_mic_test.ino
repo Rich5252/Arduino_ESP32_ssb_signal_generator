@@ -132,8 +132,8 @@
 
 // ---- MCP4725 DAC (RSET modulation output) ----
 // NO LONGER CONNECTED
-#define MCP4725_SDA_GPIO      34
-#define MCP4725_SCL_GPIO      33
+#define MCP4725_SDA_GPIO      47
+#define MCP4725_SCL_GPIO      48
 #define MCP4725_I2C_PORT      I2C_NUM_0
 #define MCP4725_I2C_FREQ_HZ   400000        // fast mode - standard (100kHz) is too slow to fit the sample period
 #define MCP4725_I2C_ADDR      0x61          // 0x60 with A0 tied low, 0x61 with A0 tied high
@@ -263,7 +263,14 @@
 #define TIMING_DEBUG_ENABLED 1
 #define TIMING_DEBUG_GPIO     4   // within the board's easy-access GPIO1-13 range; not otherwise used
 
-#define SAMPLE_RATE_HZ     20000u
+#define SAMPLE_RATE_HZ     10000u  // was 9600 - didn't divide either 80000 (ADC) or 2000000
+                                    // (gptimer resolution_hz) evenly, causing a genuine ~4.8%
+                                    // ADC_SAMPLES_PER_TICK mismatch (true_ratio measured 8.387
+                                    // vs nominal 8) plus imprecise gptimer alarm timing. 10000
+                                    // divides both cleanly (80000/10000=8, 2000000/10000=200)
+                                    // for almost the same period (100us vs 104us) - restores
+                                    // the FIFO's exact-ratio assumption the catch-up logic
+                                    // depends on for smooth operation.
 #define HILBERT_TAPS       65
 #define MAX_FREQ_DEV_HZ    2800.0f
 
@@ -607,7 +614,7 @@ static void IRAM_ATTR dsp_task(void* arg)
             sample = generate_twotone_sample();
         } else {
             // Pops up to ADC_SAMPLES_PER_TICK_MAX raw samples from
-            // s_adc_fifo (normally only ADC_SAMPLES_PER_TICK=4 will be
+            // s_adc_fifo (normally only ADC_SAMPLES_PER_TICK will be
             // available and that's all that gets consumed - the higher
             // cap only engages to clear a genuine backlog, see the
             // comment by ADC_SAMPLES_PER_TICK_MAX for why that matters)
@@ -1217,10 +1224,15 @@ void loop()
                                              * 100.0 / (double)SAMPLE_RATE_HZ;
                     // The number that actually matters for the FIFO: the
                     // TRUE ratio of the two measured rates, vs. the
-                    // nominal ADC_SAMPLES_PER_TICK=4 the drain logic
-                    // assumes. If this deviates meaningfully from 4.000,
-                    // that - not either clock's error in isolation - is
-                    // the real cause of sustained starvation or backlog.
+                    // nominal ADC_SAMPLES_PER_TICK the drain logic
+                    // assumes. If this deviates meaningfully from that
+                    // nominal value, that - not either clock's error in
+                    // isolation - is the real cause of sustained
+                    // starvation or backlog (e.g. SAMPLE_RATE_HZ=9600
+                    // gave true_ratio=8.387 vs nominal 8 - a genuine
+                    // ~4.8% mismatch from 9600 not dividing 80000
+                    // evenly, well beyond the ADC clock's own ~0.8%
+                    // error alone - see SAMPLE_RATE_HZ's comment).
                     double true_ratio = long_avg_sps / long_avg_tps;
                     Serial.printf("[dsp]   long-window avg=%.2f ticks/s (%.3f%% vs nominal %uHz) true_ratio=%.4f (nominal=%u)\r\n",
                                   long_avg_tps, tick_error_pct, SAMPLE_RATE_HZ,
