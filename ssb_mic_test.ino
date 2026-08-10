@@ -111,11 +111,11 @@
 
 // ---- Set to 1 once the AD9851 board is wired up and its driver calls
 // below are filled in. Until then this runs mic->DSP->DAC standalone. ----
-#define AD9851_ATTACHED 0
+#define AD9851_ATTACHED 1
 
 // ---- Two-tone test mode: bypass the mic ADC with a synthesized signal.
 // Zero-hardware smoke test of the DSP chain. ----
-#define TWOTONE_TEST_MODE   1
+#define TWOTONE_TEST_MODE   0
 #define TWOTONE_F1_HZ        700.0f
 #define TWOTONE_F2_HZ       1900.0f
 #define TWOTONE_AMPLITUDE    0.45f   // keep below 0.5 so peaks don't clip when summed
@@ -131,8 +131,9 @@
 #define MASTER_GAIN_STEP_DB 1.0f  // per '+'/'-' keypress - see ssb_dsp_set_master_gain_db()
 
 // ---- MCP4725 DAC (RSET modulation output) ----
-#define MCP4725_SDA_GPIO      13
-#define MCP4725_SCL_GPIO      12
+// NO LONGER CONNECTED
+#define MCP4725_SDA_GPIO      34
+#define MCP4725_SCL_GPIO      33
 #define MCP4725_I2C_PORT      I2C_NUM_0
 #define MCP4725_I2C_FREQ_HZ   400000        // fast mode - standard (100kHz) is too slow to fit the sample period
 #define MCP4725_I2C_ADDR      0x61          // 0x60 with A0 tied low, 0x61 with A0 tied high
@@ -279,10 +280,10 @@
 
 #if AD9851_ATTACHED
 #include "ad9851.h"
-#define AD9851_PIN_DATA   23
-#define AD9851_PIN_WCLK   18
-#define AD9851_PIN_FQUD   19
-#define AD9851_PIN_RESET  21
+#define AD9851_PIN_DATA   10
+#define AD9851_PIN_WCLK   12
+#define AD9851_PIN_FQUD   11
+#define AD9851_PIN_RESET  9
 #define REF_CLK_HZ        30000000u
 #define CARRIER_HZ        14200000u
 static ad9851_handle_t s_ad9851;
@@ -980,7 +981,7 @@ void setup()
             .enable = AUDIO_FX_ENABLED,
             .hpf_freq_hz = 300.0f,
             .presence_freq_hz = 2200.0f,
-            .presence_gain_db = 4.0f,
+            .presence_gain_db = 2.0f,
             .presence_q = 1.0f,
             .comp_threshold = 0.1f,
             .comp_ratio = 3.5f,
