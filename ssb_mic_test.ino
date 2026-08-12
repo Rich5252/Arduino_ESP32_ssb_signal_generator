@@ -528,11 +528,46 @@ typedef enum {
                                 // JUST the PWM->analog filter->RSET path's own step response, with a
                                 // sharp, easy-to-scope-trigger edge, for measuring its group delay
                                 // directly rather than eyeballing a subtle two-tone envelope feature
+    AUDIO_SRC_FMTEST = 4,       // pure sinusoidal FREQUENCY modulation, ALSO bypassing
+                                // ssb_dsp_process_sample() entirely - envelope held at a fixed
+                                // constant, freq_dev_hz set directly to a clean single-frequency
+                                // sine wave. Isolates the AD9851/SPI/delay-line chain completely
+                                // from the Hilbert FIR/DSP math (the opposite isolation from
+                                // ENVSTEP, which isolates the envelope/PWM/filter path instead).
+                                // Expected result is a textbook FM sideband forest at
+                                // fc +/- n*FM_TEST_MOD_HZ with Bessel-function J_n(beta) amplitudes,
+                                // beta=FM_TEST_DEV_HZ/FM_TEST_MOD_HZ - any spur that DOESN'T fit
+                                // that pattern implicates the AD9851 chain itself, not the DSP math
+                                // that both this mode and ENVSTEP deliberately route around.
+    AUDIO_SRC_AMTEST = 5,       // mirror image of FMTEST: pure sinusoidal AMPLITUDE modulation,
+                                // freq_dev_hz held at exactly 0 (phase/carrier completely fixed,
+                                // no FM at all). Isolates the RSET/PWM/analog-filter/transistor
+                                // path with a clean, mathematically known AM signal - ideal linear
+                                // AM should produce ONLY a single sideband pair at fc+/-AM_TEST_MOD_HZ.
+                                // Any additional sidebands/harmonics beyond that pair implicates
+                                // nonlinearity specifically in the RSET path (transistor, PWM
+                                // quantization, filter); any FM-looking sidebands appearing despite
+                                // freq_dev_hz never being nonzero would mean genuine AM-to-PM
+                                // crosstalk somewhere physical, a distinct and worth-knowing finding.
 } audio_source_t;
 static volatile audio_source_t s_audio_source = (TWOTONE_TEST_MODE != 0) ? AUDIO_SRC_TWOTONE : AUDIO_SRC_MIC;
 
 #define ENVSTEP_HZ   4.0f   // square wave rate - slow enough for easy scope triggering/viewing,
                              // fast enough not to be tedious to observe
+#define FM_TEST_MOD_HZ  1200.0f  // matches the 700/1900Hz two-tone pair's beat frequency, for
+                                  // direct comparability - spurs at n*1200Hz offsets would mean
+                                  // something in AD9851 chain itself, not the DSP/Hilbert path
+#define FM_TEST_DEV_HZ  3000.0f  // peak deviation - comparable order to real two-tone peak
+                                  // deviations seen in testing (up to ~4800-4900Hz observed).
+                                  // Gives modulation index beta=3000/1200=2.5 - a reasonably rich
+                                  // sideband spectrum, good for comparing against the predicted
+                                  // Bessel-function pattern
+#define AM_TEST_MOD_HZ  1200.0f  // same rate as FM_TEST_MOD_HZ, for direct comparability between
+                                  // the two isolation tests
+#define AM_TEST_DEPTH   0.5f     // envelope swings the FULL available [0,1] range (0.5 +/- 0.5) -
+                                  // 100% depth AM, deliberately stressing the RSET path's linearity
+                                  // across its whole normalized range, same as real two-tone peaks
+                                  // routinely reach in practice
 
 // Takes plain int, not audio_source_t, deliberately: Arduino auto-
 // generates function prototypes and inserts them at the very top of the
@@ -548,6 +583,8 @@ static inline const char *audio_source_name(int src)
         case AUDIO_SRC_TWOTONE:    return "TWO-TONE TEST";
         case AUDIO_SRC_SINGLETONE: return "SINGLE-TONE TEST";
         case AUDIO_SRC_ENVSTEP:    return "ENVELOPE STEP TEST";
+        case AUDIO_SRC_FMTEST:     return "FM TEST (AD9851 isolation)";
+        case AUDIO_SRC_AMTEST:     return "AM TEST (RSET isolation)";
         default:                   return "mic";
     }
 }
@@ -585,6 +622,15 @@ static volatile bool s_diag_muted = false;
 #define ENV_PWM_STEP 0.02f   // 2% duty per keypress
 static volatile float s_env_pwm_offset = 0.2f;   // was a hardcoded constant
 static volatile float s_env_pwm_scale  = 0.9f;   // was a hardcoded constant
+
+// Master gain (set via ssb_dsp_set_master_gain_db, '+'/'-') only applies
+// inside ssb_dsp_process_sample() - which AMTEST/ENVSTEP deliberately
+// bypass, so it previously had zero effect on their envelope level. This
+// cached LINEAR value lets those modes apply the same gain control
+// without recomputing powf(10, dB/20) every tick (10kHz) - updated only
+// when gain actually changes (see the '+'/'-' handlers and the initial
+// default setting in setup()), not read from ssb_dsp every sample.
+static volatile float s_master_gain_linear_cache = 1.0f;
 
 // Written by dsp_task/dac_task, printed by loop() on Core 1 at low
 // priority - keeps Serial (slow) completely out of both real-time tasks.
@@ -785,6 +831,10 @@ static void IRAM_ATTR dsp_task(void* arg)
             sample = generate_singletone_sample();
         } else if (s_audio_source == AUDIO_SRC_ENVSTEP) {
             sample = 0.0f;   // unused - ssb_dsp_process_sample() is bypassed entirely for this mode, see below
+        } else if (s_audio_source == AUDIO_SRC_FMTEST) {
+            sample = 0.0f;   // unused - ssb_dsp_process_sample() is bypassed entirely for this mode too, see below
+        } else if (s_audio_source == AUDIO_SRC_AMTEST) {
+            sample = 0.0f;   // unused - ssb_dsp_process_sample() is bypassed entirely for this mode too, see below
         } else {
             // Pops up to ADC_SAMPLES_PER_TICK_MAX raw samples from
             // s_adc_fifo (normally only ADC_SAMPLES_PER_TICK will be
@@ -867,11 +917,62 @@ static void IRAM_ATTR dsp_task(void* arg)
             // for measuring its group delay directly on a scope, rather
             // than trying to read it off a subtle two-tone envelope
             // feature. freq_dev_hz stays 0 - carrier held constant,
-            // no phase modulation while this mode is active.
+            // no phase modulation while this mode is active. Amplitude
+            // scaled by master gain (s_master_gain_linear_cache) so '+'/
+            // '-' has an effect here too, same as it does on real signal
+            // paths - this mode bypasses ssb_dsp itself, where master
+            // gain normally applies, so without this it would be inert.
             static float s_envstep_phase = 0.0f;
-            envelope = (s_envstep_phase < 0.5f) ? 0.0f : 1.0f;
+            envelope = (s_envstep_phase < 0.5f) ? 0.0f : s_master_gain_linear_cache;
             s_envstep_phase += ENVSTEP_HZ / (float)SAMPLE_RATE_HZ;
             if (s_envstep_phase >= 1.0f) s_envstep_phase -= 1.0f;
+        } else if (s_audio_source == AUDIO_SRC_FMTEST) {
+            // Direct sinusoidal frequency modulation, ALSO bypassing
+            // ssb_dsp_process_sample() entirely - the mirror-image
+            // isolation test to ENVSTEP: this exercises JUST the
+            // AD9851/SPI/delay-line chain with a clean, mathematically
+            // known FM signal, with no Hilbert FIR/atan2/sqrt involved
+            // at all. envelope held fixed (constant drive, no AM) so
+            // only the phase/frequency path is under test. Expected
+            // result is a textbook FM sideband forest at
+            // fc +/- n*FM_TEST_MOD_HZ - see the enum comment for the
+            // diagnostic logic.
+            static float s_fmtest_phase = 0.0f;
+            const float two_pi = 2.0f * (float)M_PI;
+            freq_dev_hz = FM_TEST_DEV_HZ * sinf(s_fmtest_phase);
+            s_fmtest_phase += two_pi * FM_TEST_MOD_HZ / (float)SAMPLE_RATE_HZ;
+            if (s_fmtest_phase > two_pi) s_fmtest_phase -= two_pi;
+            envelope = 1.0f;   // fixed, full-scale - no AM content, phase path only
+        } else if (s_audio_source == AUDIO_SRC_AMTEST) {
+            // Direct sinusoidal amplitude modulation, ALSO bypassing
+            // ssb_dsp_process_sample() entirely - mirror image of
+            // FMTEST: exercises JUST the RSET/PWM/analog-filter/
+            // transistor path with a clean, mathematically known AM
+            // signal. freq_dev_hz stays exactly 0 - phase/carrier held
+            // completely fixed, no FM at all. Ideal linear AM should
+            // produce only a single sideband pair at
+            // fc +/- AM_TEST_MOD_HZ - see the enum comment for the
+            // diagnostic logic. Envelope still goes through the SAME
+            // s_env_pwm_offset/s_env_pwm_scale mapping as real operation
+            // below, so results are directly comparable to real testing.
+            // Mean (carrier amplitude, i.e. AM_TEST_DEPTH itself) stays
+            // FIXED regardless of gain - only the SWING around that mean
+            // (modulation depth) scales with master gain. Without this
+            // split, gain would move both together, muddying "is this
+            // testing depth or overall level" - now '+'/'-' maps cleanly
+            // onto depth alone, and 'u'/'j' (PWM offset) remains the
+            // control for carrier amplitude, matching how those two
+            // knobs are conceptually separate in the real signal chain.
+            // Above 0dB the swing can still push peaks past 1.0, which
+            // the PWM clamp downstream then flattens - a deliberate way
+            // to probe the RSET path's saturation behavior, not a bug.
+            static float s_amtest_phase = 0.0f;
+            const float two_pi = 2.0f * (float)M_PI;
+            float swing = AM_TEST_DEPTH * s_master_gain_linear_cache;
+            envelope = AM_TEST_DEPTH + swing * sinf(s_amtest_phase);
+            s_amtest_phase += two_pi * AM_TEST_MOD_HZ / (float)SAMPLE_RATE_HZ;
+            if (s_amtest_phase > two_pi) s_amtest_phase -= two_pi;
+            freq_dev_hz = 0.0f;   // carrier held completely fixed - AM content only
         } else {
             ssb_dsp_process_sample(s_ssb, sample, s_sideband, &freq_dev_hz, &envelope);
         }
@@ -1254,6 +1355,7 @@ void setup()
     ssb_dsp_set_eq_enabled(s_ssb, false);
     ssb_dsp_set_compressor_enabled(s_ssb, false);
     ssb_dsp_set_master_gain_db(s_ssb, -2.0f);
+    s_master_gain_linear_cache = powf(10.0f, -2.0f / 20.0f);   // keep in sync with the line above
 
     // Always started now, regardless of s_audio_source's initial value -
     // needed so the mic path is live and ready the moment a 't'/'s'/'m'
@@ -1302,7 +1404,7 @@ void setup()
              AD9851_ATTACHED ? "attached" : "not attached (stubbed)",
              MCP4725_I2C_ADDR,
              PWM_COMPARISON_ENABLED ? "on" : "off");
-    Serial.println("Send 't' for two-tone test signal, 's' for single-tone test signal, 'm' for live mic input, 'p' for envelope step test, 'f' to toggle the ADC LPF on/off, 'r' to reset diagnostics, 'v' to mute periodic diagnostics.");
+    Serial.println("Send 't' for two-tone test signal, 's' for single-tone test signal, 'm' for live mic input, 'p' for envelope step test, 'y' for FM isolation test, 'h' for AM isolation test, 'f' to toggle the ADC LPF on/off, 'r' to reset diagnostics, 'v' to mute periodic diagnostics.");
     Serial.printf("Send 'e' to toggle EQ (currently %s), 'c' to toggle compressor (currently %s), "
                   "'+'/'-' for master gain (currently %+.1fdB, %.1fdB/step).\r\n",
                   ssb_dsp_get_eq_enabled(s_ssb) ? "ON" : "off",
@@ -1353,6 +1455,18 @@ void loop()
             s_audio_source = AUDIO_SRC_ENVSTEP;
             Serial.printf("-> envelope step test (%.1fHz square wave, carrier fixed - "
                           "measure the RSET node's rise/settling time against this edge)\r\n", ENVSTEP_HZ);
+        } else if (c == 'y' && s_audio_source != AUDIO_SRC_FMTEST) {
+            s_audio_source = AUDIO_SRC_FMTEST;
+            Serial.printf("-> FM isolation test (%.0fHz sine mod, %.0fHz peak deviation, beta=%.2f - "
+                          "expect FM sidebands at fc+/-n*%.0fHz, no envelope content - "
+                          "isolates AD9851/SPI chain from Hilbert/DSP math)\r\n",
+                          FM_TEST_MOD_HZ, FM_TEST_DEV_HZ, FM_TEST_DEV_HZ/FM_TEST_MOD_HZ, FM_TEST_MOD_HZ);
+        } else if (c == 'h' && s_audio_source != AUDIO_SRC_AMTEST) {
+            s_audio_source = AUDIO_SRC_AMTEST;
+            Serial.printf("-> AM isolation test (%.0fHz sine mod, %.0f%% depth, carrier fixed - "
+                          "expect ONLY fc+/-%.0fHz sideband pair, no FM content - "
+                          "isolates RSET/PWM/filter path from AD9851/DSP)\r\n",
+                          AM_TEST_MOD_HZ, AM_TEST_DEPTH * 200.0f, AM_TEST_MOD_HZ);
 #if AD9851_ATTACHED
         } else if (c == ']') {
             if (s_relative_delay_samples < (float)(PHASE_DELAY_MAX_SAMPLES - 2))
@@ -1444,10 +1558,12 @@ void loop()
         } else if (c == '+') {
             float new_gain = ssb_dsp_get_master_gain_db(s_ssb) + MASTER_GAIN_STEP_DB;
             ssb_dsp_set_master_gain_db(s_ssb, new_gain);
+            s_master_gain_linear_cache = powf(10.0f, new_gain / 20.0f);
             Serial.printf("-> master gain %+.1f dB\r\n", new_gain);
         } else if (c == '-') {
             float new_gain = ssb_dsp_get_master_gain_db(s_ssb) - MASTER_GAIN_STEP_DB;
             ssb_dsp_set_master_gain_db(s_ssb, new_gain);
+            s_master_gain_linear_cache = powf(10.0f, new_gain / 20.0f);
             Serial.printf("-> master gain %+.1f dB\r\n", new_gain);
 #if AD9851_ATTACHED
         } else if (c == 'o') {
