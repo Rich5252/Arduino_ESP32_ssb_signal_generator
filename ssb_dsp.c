@@ -71,6 +71,13 @@ static inline float IRAM_ATTR flush_denorm(float x)
 // Set SSB_DSP_FAST_TRIG to 0 to fall back to plain atan2f/sqrtf, e.g. for
 // an A/B comparison once real hardware + a spectrum analyzer are in the
 // loop. Default 1 (fast path).
+//
+// RULED OUT as the cause of the ~+100Hz two-tone frequency offset seen
+// on real hardware (single 1000Hz tone landed exactly on frequency;
+// 700/1900Hz two-tone measured at 800/1999Hz) - a direct A/B test with
+// this set to 0 (real atan2f/sqrtf) showed no change to the offset.
+// Reverted to 1 so CPU budget stays as designed while the next
+// hypothesis (max_freq_dev_hz clamp asymmetry) is tested in isolation.
 #ifndef SSB_DSP_FAST_TRIG
 #define SSB_DSP_FAST_TRIG 1
 #endif
@@ -202,6 +209,13 @@ struct ssb_dsp_s {
     float sample_rate_hz;
     float max_freq_dev_hz;
 
+    // See ssb_dsp_get_freq_dev_stats() - running high-water mark of the
+    // TRUE (pre-clamp) peak deviation, and how many samples the clamp
+    // has actually had to engage on, since init or the last
+    // ssb_dsp_reset_freq_dev_stats() call.
+    float max_unclamped_freq_dev_hz;
+    uint32_t freq_dev_clip_count;
+
     // audio_fx_configured: was the EQ/compressor subsystem set up at all
     // at ssb_dsp_init() (i.e. was ssb_audio_fx_config_t::enable true)?
     // This gates whether the biquad/compressor state even exists - if
@@ -283,6 +297,8 @@ esp_err_t ssb_dsp_init(const ssb_dsp_config_t *cfg, ssb_dsp_handle_t *out_handle
     h->center = (cfg->num_taps - 1) / 2;
     h->sample_rate_hz = (float)cfg->sample_rate_hz;
     h->max_freq_dev_hz = cfg->max_freq_dev_hz > 0.0f ? cfg->max_freq_dev_hz : 3000.0f;
+    h->max_unclamped_freq_dev_hz = 0.0f;
+    h->freq_dev_clip_count = 0;
     h->have_prev_phase = false;
     h->prev_phase = 0.0f;
     h->delay_head = 0;
@@ -387,6 +403,21 @@ void IRAM_ATTR ssb_dsp_set_master_gain_db(ssb_dsp_handle_t handle, float gain_db
 float ssb_dsp_get_master_gain_db(ssb_dsp_handle_t handle)
 {
     return handle ? handle->master_gain_db : 0.0f;
+}
+
+void ssb_dsp_get_freq_dev_stats(ssb_dsp_handle_t handle, ssb_dsp_freq_dev_stats_t *out)
+{
+    if (!out) return;
+    if (!handle) { out->max_unclamped_freq_dev_hz = 0.0f; out->clip_count = 0; return; }
+    out->max_unclamped_freq_dev_hz = handle->max_unclamped_freq_dev_hz;
+    out->clip_count = handle->freq_dev_clip_count;
+}
+
+void ssb_dsp_reset_freq_dev_stats(ssb_dsp_handle_t handle)
+{
+    if (!handle) return;
+    handle->max_unclamped_freq_dev_hz = 0.0f;
+    handle->freq_dev_clip_count = 0;
 }
 
 void ssb_dsp_get_profile(ssb_dsp_handle_t handle, ssb_dsp_profile_t *out)
@@ -522,11 +553,28 @@ void IRAM_ATTR ssb_dsp_process_sample(ssb_dsp_handle_t handle,
 
     float freq_dev = dphi * handle->sample_rate_hz / (2.0f * M_PI);
 
+    // Tracked BEFORE clamping - the true peak the signal actually wants
+    // to reach, and how often the clamp actually has to intervene. This
+    // is what lets max_freq_dev_hz be set from real evidence (via
+    // ssb_dsp_get_freq_dev_stats()) instead of another round of guessing
+    // a constant and re-measuring on real hardware - confirmed on real
+    // hardware that too-tight a clamp doesn't just fail to protect
+    // against wild spikes, it can also bias a two-tone signal's average
+    // output frequency (asymmetric clipping of otherwise-legitimate
+    // content) and directly hurt sideband suppression.
+    float abs_freq_dev = fabsf(freq_dev);
+    if (abs_freq_dev > handle->max_unclamped_freq_dev_hz) handle->max_unclamped_freq_dev_hz = abs_freq_dev;
+
     // Clamp: prevents phase noise near zero-crossings of the envelope from
     // producing large spurious instantaneous-frequency spikes (this is the
     // same "restrict the phase changes" step QCX-SSB applies).
-    if (freq_dev > handle->max_freq_dev_hz)  freq_dev = handle->max_freq_dev_hz;
-    if (freq_dev < -handle->max_freq_dev_hz) freq_dev = -handle->max_freq_dev_hz;
+    if (freq_dev > handle->max_freq_dev_hz) {
+        freq_dev = handle->max_freq_dev_hz;
+        handle->freq_dev_clip_count++;
+    } else if (freq_dev < -handle->max_freq_dev_hz) {
+        freq_dev = -handle->max_freq_dev_hz;
+        handle->freq_dev_clip_count++;
+    }
 
     if (sideband == SSB_SIDEBAND_LSB) {
         freq_dev = -freq_dev;

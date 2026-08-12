@@ -163,6 +163,28 @@ void IRAM_ATTR ssb_dsp_set_master_gain_db(ssb_dsp_handle_t handle, float gain_db
 float ssb_dsp_get_master_gain_db(ssb_dsp_handle_t handle);
 
 /**
+ * @brief Evidence for setting max_freq_dev_hz from real data instead of
+ *        guessing a constant and re-measuring on real hardware. Confirmed
+ *        on real hardware that too-tight a clamp doesn't just fail to
+ *        protect against wild instantaneous-frequency spikes near
+ *        envelope zero-crossings (its intended job) - it can also bias a
+ *        two-tone signal's average output frequency via asymmetric
+ *        clipping of otherwise-legitimate content, and directly hurt
+ *        sideband suppression. max_unclamped_freq_dev_hz is the running
+ *        high-water mark of the TRUE (pre-clamp) peak deviation the
+ *        signal actually reaches; clip_count is how many samples the
+ *        clamp has actually had to intervene on. Both since init or the
+ *        last ssb_dsp_reset_freq_dev_stats() call.
+ */
+typedef struct {
+    float max_unclamped_freq_dev_hz;
+    uint32_t clip_count;
+} ssb_dsp_freq_dev_stats_t;
+
+void ssb_dsp_get_freq_dev_stats(ssb_dsp_handle_t handle, ssb_dsp_freq_dev_stats_t *out);
+void ssb_dsp_reset_freq_dev_stats(ssb_dsp_handle_t handle);
+
+/**
  * @brief Sub-phase timing breakdown of ssb_dsp_process_sample, each a
  *        running high-water mark in microseconds since ssb_dsp_init().
  *        Measured internally via esp_timer_get_time() - negligible

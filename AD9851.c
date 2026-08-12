@@ -30,7 +30,16 @@ struct ad9851_s {
     // setClock() reciprocal technique (there used for precomputed FT4/FT8 tone
     // steps; here for a continuously-varying frequency instead of a fixed set).
     uint64_t ftw_reciprocal;
+
+    // Written from a different context (e.g. a serial command handler)
+    // than the real-time path that reads it in ad9851_set_frequency() -
+    // volatile for the same reason as the other cross-context flags
+    // elsewhere in this project.
+    volatile bool power_down;
 };
+
+#define AD9851_CTRL_ENABLE_MULTIPLIER 0x01   // matches the Nano library's AD9851_ENABLE_MULTIPLIER
+#define AD9851_CTRL_POWER_DOWN        0x04   // matches the Nano library's AD9851_POWER_DOWN
 
 #define AD9851_FTW_RECIP_SHIFT 56   // generous headroom - see ad9851_init() for the
                                      // precision reasoning; not chosen to be minimal
@@ -62,6 +71,7 @@ esp_err_t ad9851_init(const ad9851_config_t *cfg, ad9851_handle_t *out_handle)
     h->ref_clk_hz = cfg->ref_clk_hz;
     h->use_6x_multiplier = cfg->use_6x_multiplier;
     h->pin_reset = cfg->pin_reset;
+    h->power_down = false;
 
     // Precompute the Hz-to-FTW reciprocal once here (a one-time divide is
     // fine - it's ad9851_set_frequency(), called up to 20000x/sec, that
@@ -201,10 +211,13 @@ void IRAM_ATTR ad9851_set_frequency(ad9851_handle_t handle, uint32_t freq_hz)
     buf[1] = (uint8_t)((ftw >> 8) & 0xFF);    // Nano library's
     buf[2] = (uint8_t)((ftw >> 16) & 0xFF);   // for (b=0;b<4;b++, ftw>>=8)
     buf[3] = (uint8_t)((ftw >> 24) & 0xFF);   //   transfer(ftw & 0xFF)
-    buf[4] = handle->use_6x_multiplier ? 0x01 : 0x00;  // control byte: bit0 = 6x
-                                                         // multiplier enable, phase=0,
-                                                         // not powered down (matches
-                                                         // AD9851_ENABLE_MULTIPLIER)
+    buf[4] = handle->power_down
+             ? AD9851_CTRL_POWER_DOWN
+             : (handle->use_6x_multiplier ? AD9851_CTRL_ENABLE_MULTIPLIER : 0x00);
+    // control byte: power-down bit takes priority and is sent alone
+    // (matches the Nano library's exact behavior - AD9851_POWER_DOWN is
+    // sent by itself, not OR'd with the multiplier bit); otherwise bit0 =
+    // 6x multiplier enable, phase=0, not powered down.
 
     // Bit ORDER reversal (LSB-first, see reverse_bits8's comment) and bit
     // VALUE inversion (DATA passes through its own inverting BS170, see
@@ -233,4 +246,19 @@ void ad9851_deinit(ad9851_handle_t handle)
     if (!handle) return;
     spi_bus_remove_device(handle->spi);
     free(handle);
+}
+
+void IRAM_ATTR ad9851_set_output_enabled(ad9851_handle_t handle, bool enable)
+{
+    if (!handle) return;
+    handle->power_down = !enable;
+    // Takes effect on the NEXT ad9851_set_frequency() call - no transfer
+    // sent from here, keeping this call cheap regardless of context.
+    // dsp_task already calls ad9851_set_frequency() every sample, so the
+    // change reaches the chip within one sample period either way.
+}
+
+bool ad9851_get_output_enabled(ad9851_handle_t handle)
+{
+    return handle && !handle->power_down;
 }

@@ -72,6 +72,21 @@ esp_err_t ad9851_init(const ad9851_config_t *cfg, ad9851_handle_t *out_handle);
 void IRAM_ATTR ad9851_set_frequency(ad9851_handle_t handle, uint32_t freq_hz);
 
 /**
+ * @brief Enable/disable RF output via the AD9851's own power-down
+ *        control bit (same one the Nano library uses - AD9851_POWER_DOWN,
+ *        0x04) rather than stopping SPI writes or toggling RESET: this
+ *        is a clean, proper power-down, not just "stop updating and
+ *        leave the last frequency running." Takes effect on the next
+ *        ad9851_set_frequency() call - no separate transfer needed, no
+ *        extra latency added to the real-time path. Defaults to enabled
+ *        after ad9851_init(). IRAM_ATTR: safe to call from the real-time
+ *        path, though intended for occasional calls (e.g. a serial
+ *        command), not per-sample.
+ */
+void IRAM_ATTR ad9851_set_output_enabled(ad9851_handle_t handle, bool enable);
+bool ad9851_get_output_enabled(ad9851_handle_t handle);
+
+/**
  * @brief Free the SPI device and handle. Does not touch RESET, so the
  *        AD9851 keeps outputting its last-programmed frequency.
  */

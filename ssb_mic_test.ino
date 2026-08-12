@@ -115,10 +115,13 @@
 
 // ---- Two-tone test mode: bypass the mic ADC with a synthesized signal.
 // Zero-hardware smoke test of the DSP chain. ----
-#define TWOTONE_TEST_MODE   0
+#define TWOTONE_TEST_MODE   1  // testing default - two-tone on at boot
 #define TWOTONE_F1_HZ        700.0f
 #define TWOTONE_F2_HZ       1900.0f
 #define TWOTONE_AMPLITUDE    0.45f   // keep below 0.5 so peaks don't clip when summed
+#define SINGLETONE_HZ        1000.0f  // a clean, unambiguous default - see generate_singletone_sample()
+#define SINGLETONE_AMPLITUDE 0.7f     // single tone alone - more headroom available than the
+                                      // two-tone sum needs, comparable to a moderately hot mic level
 
 // ---- Pre-Hilbert audio conditioning (HPF + presence EQ + compressor) ----
 // See ssb_dsp.h's ssb_audio_fx_config_t for the individual parameters,
@@ -131,7 +134,12 @@
 #define MASTER_GAIN_STEP_DB 1.0f  // per '+'/'-' keypress - see ssb_dsp_set_master_gain_db()
 
 // ---- MCP4725 DAC (RSET modulation output) ----
-// NO LONGER CONNECTED
+// NO LONGER CONNECTED (DAC hardware removed) - GPIO47/48 are the
+// highest general-purpose pins on the S3: not strapping, not flash/
+// PSRAM (even on Octal variants), not USB-JTAG, not shared with UART0/
+// Serial. Note: if your exact module part number ends in "V" (e.g.
+// N8R8V), these two run at 1.8V logic instead of 3.3V - check before
+// this DAC (or anything else) actually gets wired back to them.
 #define MCP4725_SDA_GPIO      47
 #define MCP4725_SCL_GPIO      48
 #define MCP4725_I2C_PORT      I2C_NUM_0
@@ -271,8 +279,29 @@
                                     // for almost the same period (100us vs 104us) - restores
                                     // the FIFO's exact-ratio assumption the catch-up logic
                                     // depends on for smooth operation.
-#define HILBERT_TAPS       65
-#define MAX_FREQ_DEV_HZ    2800.0f
+#define HILBERT_TAPS       65   // was briefly tested at 129 to check whether Hilbert filter
+                                 // approximation accuracy was the source of the IMD floor that
+                                 // tracks 1:1 with signal level below -6dB - real hardware A/B
+                                 // showed no significant difference, ruling that hypothesis out
+                                 // cleanly. Reverted to 65 since 129 bought nothing but extra FIR
+                                 // cost. The floor's more likely explanation is now the sub-sample
+                                 // timing residual - see s_relative_delay_samples's fractional
+                                 // delay line, added specifically to test that instead. Must stay
+                                 // ODD if changed again.
+#define MAX_FREQ_DEV_HZ    8000.0f  // TEMPORARILY raised from 2800.0f for diagnostic A/B
+                                     // testing - real hardware showed a consistent ~+100Hz
+                                     // offset on BOTH tones of a 700/1900Hz two-tone test
+                                     // (landed at 800/1999Hz) while a single 1000Hz tone was
+                                     // exactly on frequency; fast_atan2/fast_sqrt already ruled
+                                     // out via direct A/B (SSB_DSP_FAST_TRIG=0 test, no change).
+                                     // This tests whether the (symmetric) clamp is engaging
+                                     // asymmetrically against an asymmetric underlying two-tone
+                                     // deviation signal near the beat envelope's nulls - a
+                                     // single tone never approaches the old 2800Hz ceiling, so
+                                     // this wouldn't have been visible there either way. Revert
+                                     // to 2800.0f once this test is done, whichever way it goes -
+                                     // 8000Hz is deliberately generous for testing, not a
+                                     // considered permanent value.
 
 // Target max DAC update rate. The envelope only carries content up to
 // ~3.5-4kHz, so ~10kHz comfortably clears Nyquist. Deliberately throttling
@@ -292,9 +321,64 @@
 #define AD9851_PIN_FQUD   11
 #define AD9851_PIN_RESET  9
 #define REF_CLK_HZ        30000000u
-#define CARRIER_HZ        14200000u
+#define CARRIER_HZ        14200160u  // +160Hz calibration offset - this AD9851 module's actual
+                                      // REF_CLK isn't precisely 30MHz (expected given it's an
+                                      // uncalibrated XO, not a precision reference); this value
+                                      // makes the real transmitted output land on 14200000 exactly,
+                                      // confirmed against the user's calibrated receiver
 static ad9851_handle_t s_ad9851;
 static volatile uint32_t s_carrier_hz = CARRIER_HZ;
+
+// Phase/envelope relative-timing compensation. Originally assumed the
+// envelope path (PWM -> analog Sallen-Key filter -> RSET, ~140us
+// measured group delay via the 'p' envelope step test) always lagged
+// the phase path (AD9851 SPI write, ~instant once the write completes),
+// so only positive delay (holding freq_dev_hz back to let envelope
+// catch up) was implemented. Real hardware testing found the opposite
+// in some conditions - positive delay made two-tone IMDs WORSE, not
+// better, suggesting the software reorder done earlier (PWM write moved
+// ahead of the AD9851 write) may have already over-corrected, leaving
+// envelope arriving slightly EARLY rather than late. Bipolar now:
+// positive s_relative_delay_samples holds freq_dev_hz back (as before);
+// negative holds the ENVELOPE back instead, letting the real optimum be
+// found empirically in either direction rather than assumed. Sign
+// convention: positive = phase delayed relative to envelope, negative =
+// envelope delayed relative to phase.
+//
+// FRACTIONAL: real hardware testing found integer delay=0 beats both
+// delay=1 (100us) and negative delay, meaning whatever residual timing
+// error remains has to be under half a sample (~50us) - smaller than
+// this delay line could ever resolve while restricted to whole-sample
+// steps. Doubling HILBERT_TAPS (65->129) ruled out Hilbert filter
+// approximation accuracy as the cause of the level-tracking IMD floor
+// seen at low drive, which points back at this sub-sample timing
+// residual as the more likely remaining explanation. Now linearly
+// interpolated between adjacent ring entries - see interp_ring() - so
+// delay can be set to e.g. 0.3 samples, not just 0 or 1.
+#define PHASE_DELAY_MAX_SAMPLES 8   // ring buffer capacity (both rings) - generous headroom
+                                     // over the ~1-2 samples actually expected to be needed
+#define DELAY_STEP_SAMPLES 0.05f    // 5us per '['/']' keypress at 10kHz - tightened from an
+                                     // initial 0.25 (25us) once real hardware testing found a
+                                     // sweet spot near -0.25 samples, to resolve it more precisely
+                                     // than that coarser step could
+static float s_freq_dev_ring[PHASE_DELAY_MAX_SAMPLES] = {0};
+static float s_envelope_ring[PHASE_DELAY_MAX_SAMPLES] = {0};
+static uint32_t s_delay_ring_idx = 0;   // shared index - both rings always written/read together
+static volatile float s_relative_delay_samples = 0.0f;   // now fractional - see comment above
+
+// Linear interpolation between adjacent ring entries. 'back' is how many
+// samples behind base_idx to read (0 = the just-written current sample,
+// fractional values interpolate between the two nearest whole-sample
+// entries). Caller is responsible for keeping 'back' within
+// PHASE_DELAY_MAX_SAMPLES-2 so idx1 never wraps into not-yet-written data.
+static inline float IRAM_ATTR interp_ring(const float *ring, uint32_t base_idx, float back)
+{
+    int32_t i0 = (int32_t)back;   // floor - back is always >= 0 by construction at call sites
+    float frac = back - (float)i0;
+    uint32_t idx0 = (base_idx + PHASE_DELAY_MAX_SAMPLES - (uint32_t)i0) % PHASE_DELAY_MAX_SAMPLES;
+    uint32_t idx1 = (base_idx + PHASE_DELAY_MAX_SAMPLES - (uint32_t)i0 - 1) % PHASE_DELAY_MAX_SAMPLES;
+    return ring[idx0] * (1.0f - frac) + ring[idx1] * frac;
+}
 #endif
 
 static ssb_dsp_handle_t s_ssb;
@@ -424,14 +508,49 @@ static TaskHandle_t s_dac_task;
 static QueueHandle_t s_envelope_queue;   // length 1, "latest value wins" (xQueueOverwrite)
 static volatile ssb_sideband_t s_sideband = SSB_SIDEBAND_USB;
 
-// Runtime switch between two-tone test signal and live mic input, toggled
-// from loop() via serial commands 't'/'m' (see there). Starts from
-// TWOTONE_TEST_MODE's compile-time value so existing behavior is
-// unchanged if you never send a command, but dsp_task now branches on
-// this variable rather than #if - both code paths are always compiled
+// Runtime switch between test signals and live mic input, toggled from
+// loop() via serial commands 't' (two-tone)/'s' (single-tone)/'m' (mic) -
+// see there. Starts from TWOTONE_TEST_MODE's compile-time value so
+// existing behavior is unchanged if you never send a command. dsp_task
+// branches on this rather than #if - all code paths are always compiled
 // in and the ADC always runs (see init_adc() call in setup(), no longer
-// conditional) so switching is instant with no re-init needed.
-static volatile bool s_twotone_mode = (TWOTONE_TEST_MODE != 0);
+// conditional) so switching between any of the three is instant with no
+// re-init needed.
+typedef enum {
+    AUDIO_SRC_MIC = 0,
+    AUDIO_SRC_TWOTONE = 1,
+    AUDIO_SRC_SINGLETONE = 2,   // clean single tone - isolates the DSP/RF chain from mic-side
+                                // confounds (preamp hum, mic nonlinearity, room noise) when
+                                // characterizing basic phase-modulation cleanliness, which two-tone's
+                                // intermodulation products make harder to read at a glance
+    AUDIO_SRC_ENVSTEP = 3,      // slow envelope square wave, bypassing ssb_dsp_process_sample()
+                                // entirely (no mic, no Hilbert FIR, freq_dev_hz held at 0) - isolates
+                                // JUST the PWM->analog filter->RSET path's own step response, with a
+                                // sharp, easy-to-scope-trigger edge, for measuring its group delay
+                                // directly rather than eyeballing a subtle two-tone envelope feature
+} audio_source_t;
+static volatile audio_source_t s_audio_source = (TWOTONE_TEST_MODE != 0) ? AUDIO_SRC_TWOTONE : AUDIO_SRC_MIC;
+
+#define ENVSTEP_HZ   4.0f   // square wave rate - slow enough for easy scope triggering/viewing,
+                             // fast enough not to be tedious to observe
+
+// Takes plain int, not audio_source_t, deliberately: Arduino auto-
+// generates function prototypes and inserts them at the very top of the
+// translation unit, before any of the .ino's own typedefs are visible -
+// a custom enum type in the signature breaks that auto-generated
+// prototype ("was not declared in this scope"). int is a builtin type,
+// always visible, so this sidesteps the problem entirely. The switch
+// cases below still compare against the enum constants - fine, they're
+// just int-valued.
+static inline const char *audio_source_name(int src)
+{
+    switch (src) {
+        case AUDIO_SRC_TWOTONE:    return "TWO-TONE TEST";
+        case AUDIO_SRC_SINGLETONE: return "SINGLE-TONE TEST";
+        case AUDIO_SRC_ENVSTEP:    return "ENVELOPE STEP TEST";
+        default:                   return "mic";
+    }
+}
 
 // Live A/B toggle for the ADC LPF, via serial 'f' - see loop(). Lets you
 // compare filtered-vs-raw on the same physical signal without a rebuild,
@@ -441,10 +560,44 @@ static volatile bool s_twotone_mode = (TWOTONE_TEST_MODE != 0);
 // empirically rather than assuming, now that filtering runs a third way).
 static volatile bool s_adc_lpf_bypass = false;
 
+// Silences the once-per-second [timing]/[adc]/[dsp] block, via serial
+// 'v' - see loop(). Doesn't affect the underlying counters/watermarks at
+// all (they keep accumulating correctly regardless, see the comment on
+// the print gate itself) - purely about giving command confirmation
+// prints (e.g. '['/']' phase-delay changes) a clean, uncluttered
+// terminal to actually be visible in, since a wall of scrolling
+// diagnostics every second makes a single confirmation line easy to
+// miss - confirmed to be a genuine practical problem, not just a
+// theoretical one.
+static volatile bool s_diag_muted = false;
+
+// Envelope-to-PWM-duty range mapping - separate knob from master gain.
+// Master gain (ssb_dsp_set_master_gain_db) scales the WHOLE signal chain
+// (phase deviation and envelope together, inside ssb_dsp); this only
+// remaps envelope's own [0,1] output into a duty-cycle range before it
+// drives the BS170 gate via PWM. Controls where the envelope's quiet-to-
+// loud excursion actually sits relative to the Vgs sweet spot already
+// characterized on real hardware (~2.3V +/-0.75V) - a mismatch here is a
+// plausible independent contributor to the observed nonlinearity,
+// separate from overall drive level. Runtime-tunable via 'u'/'j'
+// (offset) and 'i'/'k' (scale/span) so it can be swept empirically
+// rather than needing a reflash per trial.
+#define ENV_PWM_STEP 0.02f   // 2% duty per keypress
+static volatile float s_env_pwm_offset = 0.2f;   // was a hardcoded constant
+static volatile float s_env_pwm_scale  = 0.9f;   // was a hardcoded constant
+
 // Written by dsp_task/dac_task, printed by loop() on Core 1 at low
 // priority - keeps Serial (slow) completely out of both real-time tasks.
 static volatile float s_dbg_envelope = 0.0f;
 static volatile float s_dbg_freq_dev = 0.0f;
+#if AD9851_ATTACHED
+static volatile float s_dbg_delayed_freq_dev = 0.0f;   // post-delay-line value, actually used
+static volatile uint32_t s_dbg_tx_freq = 0;             // the exact integer Hz value sent to
+                                                          // ad9851_set_frequency() - ground truth
+                                                          // for what the chip is actually asked
+                                                          // to produce, independent of any of the
+                                                          // upstream DSP/delay-line reasoning
+#endif
 static volatile uint16_t s_dbg_dac_code = 0;
 
 // Worst-case timing diagnostics for dsp_task. Read/printed from loop()
@@ -558,8 +711,8 @@ static bool IRAM_ATTR adc_pool_ovf_cb(adc_continuous_handle_t handle,
 }
 
 // Always compiled in now (not gated on TWOTONE_TEST_MODE) since dsp_task
-// branches on the runtime s_twotone_mode flag and can switch to this at
-// any time via the 't' serial command - see s_twotone_mode.
+// branches on the runtime s_audio_source selector and can switch to this
+// at any time via the 't' serial command - see s_audio_source.
 static float s_tone1_phase = 0.0f;
 static float s_tone2_phase = 0.0f;
 
@@ -572,6 +725,22 @@ static inline float generate_twotone_sample(void)
     s_tone2_phase += two_pi * TWOTONE_F2_HZ / (float)SAMPLE_RATE_HZ;
     if (s_tone1_phase > two_pi) s_tone1_phase -= two_pi;
     if (s_tone2_phase > two_pi) s_tone2_phase -= two_pi;
+    return sample;
+}
+
+// Single, clean tone - isolates the DSP/RF chain (Hilbert, phase/freq
+// modulation, AD9851 output) from mic-side confounds like preamp hum or
+// room noise when characterizing basic sideband suppression/splatter -
+// easier to read on a spectrum analyser than two-tone's own IMD products
+// when THAT'S not what you're trying to measure. Switch to via 's'.
+static float s_singletone_phase = 0.0f;
+
+static inline float generate_singletone_sample(void)
+{
+    const float two_pi = 2.0f * (float)M_PI;
+    float sample = SINGLETONE_AMPLITUDE * sinf(s_singletone_phase);
+    s_singletone_phase += two_pi * SINGLETONE_HZ / (float)SAMPLE_RATE_HZ;
+    if (s_singletone_phase > two_pi) s_singletone_phase -= two_pi;
     return sample;
 }
 
@@ -610,8 +779,12 @@ static void IRAM_ATTR dsp_task(void* arg)
         }
 
         float sample;
-        if (s_twotone_mode) {
+        if (s_audio_source == AUDIO_SRC_TWOTONE) {
             sample = generate_twotone_sample();
+        } else if (s_audio_source == AUDIO_SRC_SINGLETONE) {
+            sample = generate_singletone_sample();
+        } else if (s_audio_source == AUDIO_SRC_ENVSTEP) {
+            sample = 0.0f;   // unused - ssb_dsp_process_sample() is bypassed entirely for this mode, see below
         } else {
             // Pops up to ADC_SAMPLES_PER_TICK_MAX raw samples from
             // s_adc_fifo (normally only ADC_SAMPLES_PER_TICK will be
@@ -687,23 +860,109 @@ static void IRAM_ATTR dsp_task(void* arg)
 
         float freq_dev_hz = 0.0f;
         float envelope = 0.0f;
-        ssb_dsp_process_sample(s_ssb, sample, s_sideband, &freq_dev_hz, &envelope);
+        if (s_audio_source == AUDIO_SRC_ENVSTEP) {
+            // Direct square wave, bypassing ssb_dsp_process_sample()
+            // entirely - no Hilbert FIR, no atan2/sqrt, no mic - isolates
+            // JUST the PWM->analog filter->RSET path's own step response
+            // for measuring its group delay directly on a scope, rather
+            // than trying to read it off a subtle two-tone envelope
+            // feature. freq_dev_hz stays 0 - carrier held constant,
+            // no phase modulation while this mode is active.
+            static float s_envstep_phase = 0.0f;
+            envelope = (s_envstep_phase < 0.5f) ? 0.0f : 1.0f;
+            s_envstep_phase += ENVSTEP_HZ / (float)SAMPLE_RATE_HZ;
+            if (s_envstep_phase >= 1.0f) s_envstep_phase -= 1.0f;
+        } else {
+            ssb_dsp_process_sample(s_ssb, sample, s_sideband, &freq_dev_hz, &envelope);
+        }
         int64_t t_dsp_done_us = esp_timer_get_time();
 
-#if AD9851_ATTACHED
-        uint32_t tx_freq = s_carrier_hz + (int32_t)freq_dev_hz;
-        ad9851_set_frequency(s_ad9851, tx_freq);
-#endif
-
         // envelope is roughly [0,1] for typical mic levels but not
-        // rigorously bounded - clamp before handing off.
-        envelope = envelope * 0.9 + 0.2;
+        // rigorously bounded - clamp before handing off. Offset/scale
+        // are now runtime-tunable (see s_env_pwm_offset/s_env_pwm_scale) -
+        // this is the PWM duty range, a separate knob from master gain.
+        envelope = envelope * s_env_pwm_scale + s_env_pwm_offset;
         if (envelope < 0.0f) envelope = 0.0f;
         if (envelope > 1.0f) envelope = 1.0f;
 
+        // PWM write goes FIRST now, before the AD9851 SPI transfer -
+        // deliberately, not incidentally. ledc_set_duty()+ledc_update_duty()
+        // is a near-instant register write, while ad9851_set_frequency()
+        // takes a measured ~20-54us (the SPI clock time itself, see the
+        // [timing] write_us figures). Doing the AD9851 write first (the
+        // original order) meant the envelope's own register write didn't
+        // happen until that whole SPI transfer had finished - adding
+        // tens of microseconds of PURELY SOFTWARE-caused lag on top of
+        // whatever PWM's own update-boundary timing and the analog
+        // reconstruction filter's group delay already add downstream.
+        // This reorder removes one real, measurable contributor to that
+        // gap for free - it doesn't eliminate PWM's own inherent delay
+        // or the analog filter's group delay, both of which still exist
+        // after this register write completes.
+        //
+        // Both rings are always written/read together here (shared
+        // index), BEFORE either output is driven - s_relative_delay_samples
+        // (runtime-tunable via '['/']', signed) decides whether the
+        // freq_dev or the envelope side actually gets held back; the
+        // other one reads its own just-written (undelayed) value. See
+        // the declaration comment for why this needs to be bipolar -
+        // real hardware testing found positive delay (phase held back)
+        // made things worse in some conditions, the opposite of what was
+        // originally assumed. Fractional via interp_ring() - real
+        // hardware testing found the residual timing error is under one
+        // whole sample (~100us), which whole-sample-only delay couldn't
+        // resolve.
+        float delayed_envelope = envelope;
+        float delayed_freq_dev_hz = freq_dev_hz;
+#if AD9851_ATTACHED
+        {
+            s_freq_dev_ring[s_delay_ring_idx] = freq_dev_hz;
+            s_envelope_ring[s_delay_ring_idx] = envelope;
+
+            float delay = s_relative_delay_samples;
+            if (delay >= (float)(PHASE_DELAY_MAX_SAMPLES - 2))  delay = (float)(PHASE_DELAY_MAX_SAMPLES - 2);
+            if (delay <= -(float)(PHASE_DELAY_MAX_SAMPLES - 2)) delay = -(float)(PHASE_DELAY_MAX_SAMPLES - 2);
+            float freq_back = (delay > 0.0f) ? delay : 0.0f;    // positive: hold phase back
+            float env_back  = (delay < 0.0f) ? -delay : 0.0f;   // negative: hold envelope back
+
+            delayed_freq_dev_hz = interp_ring(s_freq_dev_ring, s_delay_ring_idx, freq_back);
+            delayed_envelope    = interp_ring(s_envelope_ring, s_delay_ring_idx, env_back);
+
+            s_delay_ring_idx = (s_delay_ring_idx + 1) % PHASE_DELAY_MAX_SAMPLES;
+        }
+#endif
+
+#if PWM_COMPARISON_ENABLED
+        {
+            uint32_t max_duty = (1u << RSET_MOD_LEDC_RES) - 1u;
+            uint32_t duty = (uint32_t)(delayed_envelope * (float)max_duty);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_CH, duty);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_CH);
+        }
+#endif
+
+#if AD9851_ATTACHED
+        uint32_t tx_freq = s_carrier_hz + (int32_t)delayed_freq_dev_hz;
+        ad9851_set_frequency(s_ad9851, tx_freq);
+
+        // Unlike s_dbg_freq_dev (which is the PRE-delay value from
+        // ssb_dsp_process_sample and has always been blind to whatever
+        // the delay line does), these are what's ACTUALLY sent to the
+        // chip - the only way to directly verify from firmware whether
+        // changing s_relative_delay_samples ever alters the computed
+        // frequency itself (it shouldn't - a pure sample delay can't
+        // change frequency content - vs. just when a given value gets
+        // sent).
+        s_dbg_delayed_freq_dev = delayed_freq_dev_hz;
+        s_dbg_tx_freq = tx_freq;
+#endif
+
         // Non-blocking, always succeeds - overwrites whatever was there.
         // dac_task will pick up the latest value whenever it next runs;
-        // this call never waits on the I2C bus.
+        // this call never waits on the I2C bus. Kept after both real
+        // outputs above - this path only drives the (currently
+        // disconnected) MCP4725, not RSET, so its own latency doesn't
+        // affect the timing analysis above at all.
         //
         // Throttled to DAC_TARGET_UPDATE_RATE_HZ: xQueueOverwrite wakes
         // dac_task's blocked receiver on every call, so calling it every
@@ -717,18 +976,6 @@ static void IRAM_ATTR dsp_task(void* arg)
             dac_skip_count = 0;
             xQueueOverwrite(s_envelope_queue, &envelope);
         }
-
-#if PWM_COMPARISON_ENABLED
-        // Same envelope value, driven out via LEDC - this write is a
-        // near-instant register write (unlike the DAC's I2C transaction),
-        // so it's safe to do directly here in dsp_task without decoupling.
-        {
-            uint32_t max_duty = (1u << RSET_MOD_LEDC_RES) - 1u;
-            uint32_t duty = (uint32_t)(envelope * (float)max_duty);
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_CH, duty);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_CH);
-        }
-#endif
 
         s_dbg_envelope = envelope;
         s_dbg_freq_dev = freq_dev_hz;
@@ -998,9 +1245,19 @@ void setup()
     };
     ESP_ERROR_CHECK(ssb_dsp_init(&dsp_cfg, &s_ssb));
 
-    // Always started now, regardless of s_twotone_mode's initial value -
-    // needed so the mic path is live and ready the moment a 't'/'m'
-    // serial command switches modes at runtime (see s_twotone_mode).
+    // Testing session defaults - set explicitly here rather than baked
+    // into ssb_dsp's own init defaults, which stay general-purpose
+    // (both stages default to audio_fx.enable's value, gain to unity).
+    // Both audio_fx stages off and a -2dB starting gain, per the current
+    // test protocol - isolates the phase/envelope timing question from
+    // EQ/compressor's own contribution to distortion.
+    ssb_dsp_set_eq_enabled(s_ssb, false);
+    ssb_dsp_set_compressor_enabled(s_ssb, false);
+    ssb_dsp_set_master_gain_db(s_ssb, -2.0f);
+
+    // Always started now, regardless of s_audio_source's initial value -
+    // needed so the mic path is live and ready the moment a 't'/'s'/'m'
+    // serial command switches source at runtime (see s_audio_source).
     init_adc();
     init_i2c_dac();
 #if PWM_COMPARISON_ENABLED
@@ -1041,16 +1298,29 @@ void setup()
 
     Serial.printf("SSB mic test running: taps=%d fs=%uHz mode=%s ad9851=%s dac=MCP4725@0x%02X pwm_compare=%s\r\n",
              HILBERT_TAPS, SAMPLE_RATE_HZ,
-             s_twotone_mode ? "TWO-TONE TEST" : "mic",
+             audio_source_name(s_audio_source),
              AD9851_ATTACHED ? "attached" : "not attached (stubbed)",
              MCP4725_I2C_ADDR,
              PWM_COMPARISON_ENABLED ? "on" : "off");
-    Serial.println("Send 't' for two-tone test signal, 'm' for live mic input, 'f' to toggle the ADC LPF on/off, 'r' to reset diagnostics.");
+    Serial.println("Send 't' for two-tone test signal, 's' for single-tone test signal, 'm' for live mic input, 'p' for envelope step test, 'f' to toggle the ADC LPF on/off, 'r' to reset diagnostics, 'v' to mute periodic diagnostics.");
     Serial.printf("Send 'e' to toggle EQ (currently %s), 'c' to toggle compressor (currently %s), "
                   "'+'/'-' for master gain (currently %+.1fdB, %.1fdB/step).\r\n",
                   ssb_dsp_get_eq_enabled(s_ssb) ? "ON" : "off",
                   ssb_dsp_get_compressor_enabled(s_ssb) ? "ON" : "off",
                   ssb_dsp_get_master_gain_db(s_ssb), MASTER_GAIN_STEP_DB);
+#if AD9851_ATTACHED
+    Serial.printf("Send 'o' to toggle AD9851 RF output on/off (currently %s), "
+                  "'['/']' for relative phase/envelope delay (currently %+.2f samples, ~%+.0fus, "
+                  "%.2f/step - positive delays phase, negative delays envelope).\r\n",
+                  ad9851_get_output_enabled(s_ad9851) ? "ON" : "off",
+                  s_relative_delay_samples, s_relative_delay_samples * 1000000.0f / SAMPLE_RATE_HZ,
+                  DELAY_STEP_SAMPLES);
+#endif
+    Serial.printf("Send 'u'/'j' for PWM duty range offset, 'i'/'k' for span "
+                  "(currently %.0f%%-%.0f%%, offset=%.2f scale=%.2f, %.0f%%/step).\r\n",
+                  s_env_pwm_offset * 100.0f,
+                  (s_env_pwm_offset + s_env_pwm_scale > 1.0f ? 1.0f : s_env_pwm_offset + s_env_pwm_scale) * 100.0f,
+                  s_env_pwm_offset, s_env_pwm_scale, ENV_PWM_STEP * 100.0f);
 }
 
 // Owned by the [adc] 1-second rate print below; file-scope (not a local
@@ -1063,22 +1333,77 @@ static uint32_t s_last_rate_print_ms = 0;
 
 void loop()
 {
-    // Runtime source switch: 't' -> two-tone test signal, 'm' -> live mic
-    // input. dsp_task reads s_twotone_mode fresh every tick, so this
+    // Runtime source switch: 't' -> two-tone, 's' -> single-tone, 'm' ->
+    // live mic. dsp_task reads s_audio_source fresh every tick, so this
     // takes effect on the very next sample - no glitch/restart needed.
     // Unrecognized bytes (e.g. line endings from some serial monitors)
     // are silently ignored rather than echoed as an error.
     while (Serial.available()) {
         char c = Serial.read();
-        if (c == 't' && !s_twotone_mode) {
-            s_twotone_mode = true;
+        if (c == 't' && s_audio_source != AUDIO_SRC_TWOTONE) {
+            s_audio_source = AUDIO_SRC_TWOTONE;
             Serial.println("-> two-tone test signal");
-        } else if (c == 'm' && s_twotone_mode) {
-            s_twotone_mode = false;
+        } else if (c == 's' && s_audio_source != AUDIO_SRC_SINGLETONE) {
+            s_audio_source = AUDIO_SRC_SINGLETONE;
+            Serial.printf("-> single-tone test signal (%.0fHz)\r\n", SINGLETONE_HZ);
+        } else if (c == 'm' && s_audio_source != AUDIO_SRC_MIC) {
+            s_audio_source = AUDIO_SRC_MIC;
             Serial.println("-> live mic input");
+        } else if (c == 'p' && s_audio_source != AUDIO_SRC_ENVSTEP) {
+            s_audio_source = AUDIO_SRC_ENVSTEP;
+            Serial.printf("-> envelope step test (%.1fHz square wave, carrier fixed - "
+                          "measure the RSET node's rise/settling time against this edge)\r\n", ENVSTEP_HZ);
+#if AD9851_ATTACHED
+        } else if (c == ']') {
+            if (s_relative_delay_samples < (float)(PHASE_DELAY_MAX_SAMPLES - 2))
+                s_relative_delay_samples += DELAY_STEP_SAMPLES;
+            Serial.printf("-> relative delay %+.2f samples (~%+.0fus) - %s\r\n",
+                          s_relative_delay_samples, s_relative_delay_samples * 1000000.0f / SAMPLE_RATE_HZ,
+                          s_relative_delay_samples > 0.0f ? "phase held back" :
+                          s_relative_delay_samples < 0.0f ? "envelope held back" : "aligned");
+        } else if (c == '[') {
+            if (s_relative_delay_samples > -(float)(PHASE_DELAY_MAX_SAMPLES - 2))
+                s_relative_delay_samples -= DELAY_STEP_SAMPLES;
+            Serial.printf("-> relative delay %+.2f samples (~%+.0fus) - %s\r\n",
+                          s_relative_delay_samples, s_relative_delay_samples * 1000000.0f / SAMPLE_RATE_HZ,
+                          s_relative_delay_samples > 0.0f ? "phase held back" :
+                          s_relative_delay_samples < 0.0f ? "envelope held back" : "aligned");
+#endif
+        } else if (c == 'u') {
+            if (s_env_pwm_offset < 1.0f) s_env_pwm_offset += ENV_PWM_STEP;
+            Serial.printf("-> PWM duty range %.0f%%-%.0f%% (offset=%.2f, scale=%.2f)\r\n",
+                          s_env_pwm_offset * 100.0f,
+                          (s_env_pwm_offset + s_env_pwm_scale > 1.0f ? 1.0f : s_env_pwm_offset + s_env_pwm_scale) * 100.0f,
+                          s_env_pwm_offset, s_env_pwm_scale);
+        } else if (c == 'j') {
+            if (s_env_pwm_offset > 0.0f) s_env_pwm_offset -= ENV_PWM_STEP;
+            Serial.printf("-> PWM duty range %.0f%%-%.0f%% (offset=%.2f, scale=%.2f)\r\n",
+                          s_env_pwm_offset * 100.0f,
+                          (s_env_pwm_offset + s_env_pwm_scale > 1.0f ? 1.0f : s_env_pwm_offset + s_env_pwm_scale) * 100.0f,
+                          s_env_pwm_offset, s_env_pwm_scale);
+        } else if (c == 'i') {
+            if (s_env_pwm_scale < 1.0f) s_env_pwm_scale += ENV_PWM_STEP;
+            Serial.printf("-> PWM duty range %.0f%%-%.0f%% (offset=%.2f, scale=%.2f)\r\n",
+                          s_env_pwm_offset * 100.0f,
+                          (s_env_pwm_offset + s_env_pwm_scale > 1.0f ? 1.0f : s_env_pwm_offset + s_env_pwm_scale) * 100.0f,
+                          s_env_pwm_offset, s_env_pwm_scale);
+        } else if (c == 'k') {
+            if (s_env_pwm_scale > 0.0f) s_env_pwm_scale -= ENV_PWM_STEP;
+            Serial.printf("-> PWM duty range %.0f%%-%.0f%% (offset=%.2f, scale=%.2f)\r\n",
+                          s_env_pwm_offset * 100.0f,
+                          (s_env_pwm_offset + s_env_pwm_scale > 1.0f ? 1.0f : s_env_pwm_offset + s_env_pwm_scale) * 100.0f,
+                          s_env_pwm_offset, s_env_pwm_scale);
         } else if (c == 'f') {
             s_adc_lpf_bypass = !s_adc_lpf_bypass;
             Serial.printf("-> ADC LPF %s\r\n", s_adc_lpf_bypass ? "BYPASSED (raw)" : "active");
+        } else if (c == 'v') {
+            s_diag_muted = !s_diag_muted;
+            // Deliberately printed regardless of the new mute state -
+            // this confirmation itself needs to always be visible, or
+            // muting silently would just create a different confusing
+            // problem ("did that command even register?").
+            Serial.printf("-> periodic [timing]/[adc]/[dsp] diagnostics %s\r\n",
+                          s_diag_muted ? "MUTED (command confirmations only)" : "resumed");
         } else if (c == 'r') {
             // Resets every diagnostic counter/watermark for a clean
             // measurement window, without needing a full reflash. Useful
@@ -1106,6 +1431,7 @@ void loop()
             s_last_callback_count = 0;
             s_last_rate_print_ms = millis();
             s_adc_start_us = esp_timer_get_time();   // restarts the long-window average from now
+            ssb_dsp_reset_freq_dev_stats(s_ssb);
             Serial.println("-> diagnostics reset, clean window starting now");
         } else if (c == 'e') {
             bool now_on = !ssb_dsp_get_eq_enabled(s_ssb);
@@ -1123,6 +1449,12 @@ void loop()
             float new_gain = ssb_dsp_get_master_gain_db(s_ssb) - MASTER_GAIN_STEP_DB;
             ssb_dsp_set_master_gain_db(s_ssb, new_gain);
             Serial.printf("-> master gain %+.1f dB\r\n", new_gain);
+#if AD9851_ATTACHED
+        } else if (c == 'o') {
+            bool now_on = !ad9851_get_output_enabled(s_ad9851);
+            ad9851_set_output_enabled(s_ad9851, now_on);
+            Serial.printf("-> AD9851 RF output %s\r\n", now_on ? "ON" : "off (powered down)");
+#endif
         }
     }
 
@@ -1133,7 +1465,7 @@ void loop()
     // (on_pool_ovf), so its contents are simply discarded. Low priority,
     // not time-critical - fine to do here alongside the other loop() work.
     // Runs unconditionally now - the ADC is always active (see init_adc()
-    // in setup()) regardless of s_twotone_mode, so this pool needs
+    // in setup()) regardless of s_audio_source, so this pool needs
     // draining either way.
     {
         uint8_t drain_buf[256];
@@ -1149,10 +1481,16 @@ void loop()
     // competes with either for CPU time or bus access.
     static uint32_t last_print_ms = 0;
     uint32_t now = millis();
-    if (now - last_print_ms >= 45) {
+    if (!s_diag_muted && now - last_print_ms >= 45) {
         last_print_ms = now;
+#if AD9851_ATTACHED
+        Serial.printf("envelope=,%.3f  ,freq_dev=,%.1f,Hz  dac_code=,%u  ,delayed=,%.1f,Hz  tx_freq=,%u,Hz\r\n",
+                      s_dbg_envelope, s_dbg_freq_dev, s_dbg_dac_code,
+                      s_dbg_delayed_freq_dev, s_dbg_tx_freq);
+#else
         Serial.printf("envelope=,%.3f  ,freq_dev=,%.1f,Hz  dac_code=,%u\r\n",
                       s_dbg_envelope, s_dbg_freq_dev, s_dbg_dac_code);
+#endif
     }
 
     // Worst-case dsp_task timing, once a second - watch max_busy_us stay
@@ -1160,10 +1498,11 @@ void loop()
     // climb, dsp_task risks starving IDLE0 and tripping the task
     // watchdog - see the k_sample_period_us comment above.
     static uint32_t last_timing_print_ms = 0;
-    if (now - last_timing_print_ms >= 1000) {
+    if (!s_diag_muted && now - last_timing_print_ms >= 1000) {
         last_timing_print_ms = now;
         Serial.printf("[timing] mode=%s max_busy_us=%u (adc=%u dsp=%u write=%u) period_us=%u overruns=%u\r\n",
-                      s_twotone_mode ? "TWOTONE" : "MIC",
+                      s_audio_source == AUDIO_SRC_TWOTONE ? "TWOTONE" :
+                      s_audio_source == AUDIO_SRC_SINGLETONE ? "SINGLETONE" : "MIC",
                       s_dbg_max_busy_us, s_dbg_max_adc_us, s_dbg_max_dsp_us, s_dbg_max_write_us,
                       k_sample_period_us, s_dbg_overrun_count);
         Serial.printf("[timing]   wakeup jitter: max_gap_us=%u (nominal=%u) late_ticks_total=%u\r\n",
@@ -1177,6 +1516,21 @@ void loop()
         ssb_dsp_get_profile(s_ssb, &prof);
         Serial.printf("[timing]   dsp breakdown: audio_fx=%u fir=%u atan2=%u sqrt=%u\r\n",
                       prof.max_audio_fx_us, prof.max_fir_us, prof.max_atan2_us, prof.max_sqrt_us);
+
+        // Evidence for setting MAX_FREQ_DEV_HZ from real data instead of
+        // guessing again - max_unclamped is the TRUE peak deviation the
+        // signal actually reaches (before any clamping), clip_count is
+        // how many samples the clamp has actually had to intervene on.
+        // Confirmed on real hardware that too tight a clamp both biases
+        // two-tone output frequency AND hurts sideband suppression - the
+        // right value sits somewhere above max_unclamped's real peak
+        // with some margin, not an arbitrary guess either direction.
+        {
+            ssb_dsp_freq_dev_stats_t fd_stats;
+            ssb_dsp_get_freq_dev_stats(s_ssb, &fd_stats);
+            Serial.printf("[dsp]   freq_dev: max_unclamped=%.0fHz (limit=%.0fHz) clip_count=%u\r\n",
+                          fd_stats.max_unclamped_freq_dev_hz, MAX_FREQ_DEV_HZ, fd_stats.clip_count);
+        }
 
         // ADC continuity check: actual samples/callbacks seen in this
         // ~1s window vs. what ADC_CONT_SAMPLE_FREQ_HZ implies, plus any
