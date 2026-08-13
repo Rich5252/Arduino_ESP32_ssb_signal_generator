@@ -1,0 +1,156 @@
+#pragma once
+
+#include <stdint.h>
+#include <stdbool.h>
+
+
+// Runtime switch between test signals and live mic input, toggled from
+// loop() via serial commands 't' (two-tone)/'s' (single-tone)/'m' (mic) -
+// see there. Starts from TWOTONE_TEST_MODE's compile-time value so
+// existing behavior is unchanged if you never send a command. dsp_task
+// branches on this rather than #if - all code paths are always compiled
+// in and the ADC always runs (see init_adc() call in setup(), no longer
+// conditional) so switching between any of the three is instant with no
+// re-init needed.
+typedef enum {
+    AUDIO_SRC_MIC = 0,
+    AUDIO_SRC_TWOTONE = 1,
+    AUDIO_SRC_SINGLETONE = 2,   // clean single tone - isolates the DSP/RF chain from mic-side
+                                // confounds (preamp hum, mic nonlinearity, room noise) when
+                                // characterizing basic phase-modulation cleanliness, which two-tone's
+                                // intermodulation products make harder to read at a glance
+    AUDIO_SRC_ENVSTEP = 3,      // slow envelope square wave, bypassing ssb_dsp_process_sample()
+                                // entirely (no mic, no Hilbert FIR, freq_dev_hz held at 0) - isolates
+                                // JUST the PWM->analog filter->RSET path's own step response, with a
+                                // sharp, easy-to-scope-trigger edge, for measuring its group delay
+                                // directly rather than eyeballing a subtle two-tone envelope feature
+    AUDIO_SRC_FMTEST = 4,       // pure sinusoidal FREQUENCY modulation, ALSO bypassing
+                                // ssb_dsp_process_sample() entirely - envelope held at a fixed
+                                // constant, freq_dev_hz set directly to a clean single-frequency
+                                // sine wave. Isolates the AD9851/SPI/delay-line chain completely
+                                // from the Hilbert FIR/DSP math (the opposite isolation from
+                                // ENVSTEP, which isolates the envelope/PWM/filter path instead).
+                                // Expected result is a textbook FM sideband forest at
+                                // fc +/- n*FM_TEST_MOD_HZ with Bessel-function J_n(beta) amplitudes,
+                                // beta=FM_TEST_DEV_HZ/FM_TEST_MOD_HZ - any spur that DOESN'T fit
+                                // that pattern implicates the AD9851 chain itself, not the DSP math
+                                // that both this mode and ENVSTEP deliberately route around.
+    AUDIO_SRC_AMTEST = 5,       // mirror image of FMTEST: pure sinusoidal AMPLITUDE modulation,
+                                // freq_dev_hz held at exactly 0 (phase/carrier completely fixed,
+                                // no FM at all). Isolates the RSET/PWM/analog-filter/transistor
+                                // path with a clean, mathematically known AM signal - ideal linear
+                                // AM should produce ONLY a single sideband pair at fc+/-AM_TEST_MOD_HZ.
+                                // Any additional sidebands/harmonics beyond that pair implicates
+                                // nonlinearity specifically in the RSET path (transistor, PWM
+                                // quantization, filter); any FM-looking sidebands appearing despite
+                                // freq_dev_hz never being nonzero would mean genuine AM-to-PM
+                                // crosstalk somewhere physical, a distinct and worth-knowing finding.
+} audio_source_t;
+
+
+// each settings list has all the levers pre-defined for a particular test
+typedef struct
+{
+    const char *name;
+
+    audio_source_t audio_source;
+
+    float relative_delay_samples;
+
+    float env_pwm_offset;
+    float env_pwm_scale;
+
+    bool env_gdeq_enable;
+    bool adc_lpf_bypass;
+
+    bool eq_enable;
+    bool compressor_enable;
+
+    float master_gain_db;
+
+    bool ad9851_output_enable;
+
+} PersistentSettings;
+
+
+// -----------------------------------------------------------------------------
+// Pre-defined settings
+// -----------------------------------------------------------------------------
+
+static const PersistentSettings settingsPresets[5] =
+{
+    // Preset 0 - Normal microphone operation
+    {
+        "Micr",
+        AUDIO_SRC_MIC,     // audio_source
+        1.9f,               // relative_delay_samples
+        0.32f,               // env_pwm_offset
+        0.8f,               // env_pwm_scale
+        true,               // env_gdeq_enable
+        true,              // adc_lpf_bypass
+        true,               // eq_enable
+        true,               // compressor_enable
+        -2.0f,               // master_gain_db
+        true                // ad9851_output_enable
+    },
+
+    // Preset 1 - Two-tone test
+    {
+        "TwoTone",
+        AUDIO_SRC_TWOTONE,
+        1.9f,               // relative_delay_samples
+        0.32f,               // env_pwm_offset
+        0.8f,               // env_pwm_scale
+        true,               // env_gdeq_enable
+        true,              // adc_lpf_bypass
+        false,               // eq_enable
+        false,               // compressor_enable
+        -2.0f,               // master_gain_db
+        true                // ad9851_output_enable
+    },
+
+    // Preset 2 - Single-tone test
+    {
+        "SineTone",
+        AUDIO_SRC_SINGLETONE,
+        2.65f,               // relative_delay_samples
+        0.1f,               // env_pwm_offset
+        0.8f,               // env_pwm_scale
+        true,               // env_gdeq_enable
+        false,              // adc_lpf_bypass
+        true,               // eq_enable
+        true,               // compressor_enable
+        0.0f,               // master_gain_db
+        true                // ad9851_output_enable
+    },
+
+    // Preset 3 - Envelope / PWM test
+    {
+        "Step",
+        AUDIO_SRC_ENVSTEP,
+        2.65f,
+        0.10f,
+        0.80f,
+        true,
+        false,
+        false,
+        false,
+        0.0f,
+        true
+    },
+
+    // Preset 4 - Diagnostic / raw ADC
+    {
+        "Micr 2",
+        AUDIO_SRC_MIC,
+        2.65f,               // relative_delay_samples
+        0.1f,               // env_pwm_offset
+        0.8f,               // env_pwm_scale
+        true,               // env_gdeq_enable
+        false,              // adc_lpf_bypass
+        true,               // eq_enable
+        true,               // compressor_enable
+        0.0f,               // master_gain_db
+        true                // ad9851_output_enable
+    }
+};
