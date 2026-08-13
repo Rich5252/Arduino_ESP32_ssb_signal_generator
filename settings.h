@@ -96,28 +96,28 @@ static const PersistentSettings settingsPresets[5] =
 
     // Preset 1 - Two-tone test
     {
-        "TwoToneGDcomp",
+        "TwoToneButwGD",
         AUDIO_SRC_TWOTONE,
         1.85f,               // relative_delay_samples
         0.08f,               // env_pwm_offset
         0.84f,               // env_pwm_scale
-        true,               // env_gdeq_enable
-        true,              // adc_lpf_bypass
+        true,                // env_gdeq_enable
+        true,                // adc_lpf_bypass
         false,               // eq_enable
         false,               // compressor_enable
-        1.0f,               // master_gain_db
+        +1.0f,               // master_gain_db
         true                // ad9851_output_enable
     },
 
     // Preset 2 - Single-tone test
     {
-        "TwoToneBesselNoGD",
+        "TwoToneButwNoGD",
         AUDIO_SRC_TWOTONE,
         -0.6f,               // relative_delay_samples
         0.04f,               // env_pwm_offset
         0.82f,               // env_pwm_scale
-        false,               // env_gdeq_enable
-        true,              // adc_lpf_bypass
+        false,                // env_gdeq_enable
+        true,                // adc_lpf_bypass
         false,               // eq_enable
         false,               // compressor_enable
         +1.0f,               // master_gain_db
@@ -125,19 +125,17 @@ static const PersistentSettings settingsPresets[5] =
     },
 
     // Preset 3 - Envelope / PWM test
-    {
-        "Step",
-        AUDIO_SRC_ENVSTEP,
-        2.65f,
-        0.10f,
-        0.80f,
-        true,
-        false,
-        false,
-        false,
-        0.0f,
-        true
-    },
+        { "BesselNoGD", AUDIO_SRC_TWOTONE, -0.60f, 0.00f, 0.90f, false, true, false, false, 2.0f, true },
+        
+                        // relative_delay_samples
+                       // env_pwm_offset
+                       // env_pwm_scale
+                        // env_gdeq_enable
+                        // adc_lpf_bypass
+                       // eq_enable
+                       // compressor_enable
+                       // master_gain_db
+                        // ad9851_output_enable
 
     // Preset 4 - Diagnostic / raw ADC
     {

@@ -39,7 +39,7 @@ Default: offset 0.20, scale 0.90 → duty range 20%–100% (actually caps at ~92
 
 | Key | Effect |
 |---|---|
-| `g` | Toggle two cascaded first-order digital all-pass sections on the envelope path, fitted to flatten the *original* (non-Bessel) 2-pole Sallen-Key filter's group-delay dispersion across 100–4300Hz (numerically fit against a real LTspice sweep of that circuit — see `ENV_GDEQ_A1`/`ENV_GDEQ_A2` in the .ino for the full derivation). Goal: get that filter's better stopband rejection without its dispersion-driven IMD penalty, instead of the Bessel filter's compromise. **Not yet validated on real hardware.** |
+| `g` | Toggle two cascaded first-order digital all-pass sections on the envelope path, fitted to flatten the *original* (non-Bessel) 2-pole Sallen-Key filter's group-delay dispersion across 100–4300Hz (numerically fit against a real LTspice sweep of that circuit — see `ENV_GDEQ_A1`/`ENV_GDEQ_A2` in `envelope_gdeq.h` for the full derivation). Goal: get that filter's better stopband rejection without its dispersion-driven IMD penalty, instead of the Bessel filter's compromise. **Not yet validated on real hardware.** |
 
 Off by default. Enabling it pushes the envelope path's overall delay up by ~265µs (it can only add delay, not remove it) — re-tune `[`/`]` from scratch afterward; theoretical starting point is roughly **+2.65 samples**, a different regime from the Bessel filter's -0.20 to -0.25 samples.
 
@@ -73,8 +73,9 @@ Master gain scales the *whole* chain (phase + envelope together, inside `ssb_dsp
 | Key | Effect |
 |---|---|
 | `0`-`4` | Load a preset from `settings.h` — sets every lever above (audio source, relative delay, PWM offset/scale, gdeq, ADC LPF bypass, EQ, compressor, master gain, RF output) in one command. Boot banner lists the current names. |
+| `P` | Print the current value of every one of those same levers as a single comma-separated line, wrapped in `{ ... },` and in exactly `PersistentSettings`'s field order — copy/paste it straight into the `settingsPresets[]` array in `settings.h` as a new preset. Rename the placeholder `"Live"` name (and add a numbered comment above it, matching the existing presets' style) after pasting. |
 
-Preset 0 `Micr`, 1 `TwoTone`, 2 `SineTone`, 3 `Step`, 4 `Micr 2`, as currently defined — edit the `settingsPresets` array in `settings.h` to change them (there's a compile-time check tying the array size to the `'0'`-`'4'` range, so resizing it without updating `loop()`/`setup()` fails the build instead of silently misbehaving). All five currently have the group-delay equalizer (`g`) on, with relative delay pre-tuned per preset (1.9 samples for `Micr`/`TwoTone`, 2.65 for the others) — real hardware validation of `g` looks to be underway already, building on the +2.65-samples starting point.
+Preset 0 `Micr`, 1 `TwoTone`, 2 `SineTone`, 3 `Step`, 4 `Micr 2`, as currently defined — edit the `settingsPresets` array in `settings.h` to change them, or dial in levers live and use `P` to generate the line instead of hand-typing values (there's a compile-time check tying the array size to the `'0'`-`'4'` range, so resizing it without updating `loop()`/`setup()`/`serial_commands.cpp`'s preset-select block fails the build instead of silently misbehaving — that range also caps how many presets `P`-generated lines can be added up to before it needs widening). All five currently have the group-delay equalizer (`g`) on, with relative delay pre-tuned per preset (1.9 samples for `Micr`/`TwoTone`, 2.65 for the others) — real hardware validation of `g` looks to be underway already, building on the +2.65-samples starting point.
 
 ## Current testing defaults (compiled in, before any preset is loaded)
 
