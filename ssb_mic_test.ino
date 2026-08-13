@@ -1478,6 +1478,13 @@ void setup()
                   "fitted against the original Sallen-Key filter's real LTspice response, "
                   "not yet validated on hardware; re-tune '['/']' from scratch after enabling.\r\n",
                   s_env_gdeq_enable ? "ON" : "off");
+    // Presets (settings.h) load every lever above in one command - handy
+    // once a preset is dialed in, no need to remember/retype the whole
+    // sequence of individual knob commands every boot.
+    Serial.print("Send '0'-'4' to load a preset: ");
+    for (int i = 0; i < 5; i++) {
+        Serial.printf("%d=%s%s", i, settingsPresets[i].name, i < 4 ? ", " : "\r\n");
+    }
 }
 
 // Owned by the [adc] 1-second rate print below; file-scope (not a local
@@ -1647,10 +1654,27 @@ void loop()
                 settingsPresets[preset];
 
             s_audio_source = p.audio_source;
+#if AD9851_ATTACHED
+            // s_relative_delay_samples only exists under AD9851_ATTACHED
+            // (see its declaration) - guarded the same way here, so this
+            // still compiles standalone (mic->DSP->DAC, no AD9851 board
+            // yet) per the AD9851_ATTACHED toggle documented at the top
+            // of this file, not just in the currently-built configuration.
             s_relative_delay_samples = p.relative_delay_samples;
+#endif
             s_env_pwm_offset = p.env_pwm_offset;
             s_env_pwm_scale = p.env_pwm_scale;
+            // Same reset-on-enable reasoning as the 'g' handler: only
+            // reset state on an off->on transition, not on every preset
+            // load (all 5 presets currently have gdeq on, so switching
+            // between them should keep the filter running continuously,
+            // not jump every time).
+            bool gdeq_was_on = s_env_gdeq_enable;
             s_env_gdeq_enable = p.env_gdeq_enable;
+            if (s_env_gdeq_enable && !gdeq_was_on) {
+                ssb_allpass1_reset(&s_env_gdeq_1);
+                ssb_allpass1_reset(&s_env_gdeq_2);
+            }
             s_adc_lpf_bypass = p.adc_lpf_bypass;
 
             ssb_dsp_set_eq_enabled(
@@ -1678,9 +1702,7 @@ void loop()
             );
 #endif
 
-            Serial.printf("-> preset %d: %s\r\n",
-                preset,
-                settingsPresets[preset].name);
+            Serial.printf("-> preset %d: %s\r\n", preset, p.name);
         }
         
     }

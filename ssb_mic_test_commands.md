@@ -68,7 +68,15 @@ Master gain scales the *whole* chain (phase + envelope together, inside `ssb_dsp
 | `v` | Mute/unmute the once-per-second `[timing]`/`[adc]`/`[dsp]` diagnostic block — mute this before adjusting other settings if you want to actually see the confirmation lines |
 | `r` | Reset all diagnostic counters/watermarks for a clean measurement window (doesn't touch any of the settings above, only the stats) |
 
-## Current testing defaults (compiled in)
+## Presets
+
+| Key | Effect |
+|---|---|
+| `0`-`4` | Load a preset from `settings.h` — sets every lever above (audio source, relative delay, PWM offset/scale, gdeq, ADC LPF bypass, EQ, compressor, master gain, RF output) in one command. Boot banner lists the current names. |
+
+Preset 0 `Micr`, 1 `TwoTone`, 2 `SineTone`, 3 `Step`, 4 `Micr 2`, as currently defined — edit the `settingsPresets` array in `settings.h` to change them (there's a compile-time check tying the array size to the `'0'`-`'4'` range, so resizing it without updating `loop()`/`setup()` fails the build instead of silently misbehaving). All five currently have the group-delay equalizer (`g`) on, with relative delay pre-tuned per preset (1.9 samples for `Micr`/`TwoTone`, 2.65 for the others) — real hardware validation of `g` looks to be underway already, building on the +2.65-samples starting point.
+
+## Current testing defaults (compiled in, before any preset is loaded)
 
 - Two-tone mode on at boot
 - EQ and compressor both off

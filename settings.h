@@ -96,31 +96,31 @@ static const PersistentSettings settingsPresets[5] =
 
     // Preset 1 - Two-tone test
     {
-        "TwoTone",
+        "TwoToneGDcomp",
         AUDIO_SRC_TWOTONE,
-        1.9f,               // relative_delay_samples
-        0.32f,               // env_pwm_offset
-        0.8f,               // env_pwm_scale
+        1.85f,               // relative_delay_samples
+        0.08f,               // env_pwm_offset
+        0.84f,               // env_pwm_scale
         true,               // env_gdeq_enable
         true,              // adc_lpf_bypass
         false,               // eq_enable
         false,               // compressor_enable
-        -2.0f,               // master_gain_db
+        1.0f,               // master_gain_db
         true                // ad9851_output_enable
     },
 
     // Preset 2 - Single-tone test
     {
-        "SineTone",
-        AUDIO_SRC_SINGLETONE,
-        2.65f,               // relative_delay_samples
-        0.1f,               // env_pwm_offset
-        0.8f,               // env_pwm_scale
-        true,               // env_gdeq_enable
-        false,              // adc_lpf_bypass
-        true,               // eq_enable
-        true,               // compressor_enable
-        0.0f,               // master_gain_db
+        "TwoToneBesselNoGD",
+        AUDIO_SRC_TWOTONE,
+        -0.6f,               // relative_delay_samples
+        0.04f,               // env_pwm_offset
+        0.82f,               // env_pwm_scale
+        false,               // env_gdeq_enable
+        true,              // adc_lpf_bypass
+        false,               // eq_enable
+        false,               // compressor_enable
+        +1.0f,               // master_gain_db
         true                // ad9851_output_enable
     },
 
@@ -154,3 +154,13 @@ static const PersistentSettings settingsPresets[5] =
         true                // ad9851_output_enable
     }
 };
+
+// If this array's size ever changes, ssb_mic_test.ino's serial handler
+// (the `c >= '0' && c <= '4'` preset-select block in loop(), and the
+// boot-banner preset listing in setup()) needs its range updated to
+// match - this catches a silent mismatch at compile time instead of
+// leaking a stale range (missing the new last preset, or indexing past
+// the array's end) into a build that otherwise looks fine.
+static_assert(sizeof(settingsPresets) / sizeof(settingsPresets[0]) == 5,
+              "settingsPresets size changed - update the '0'-'4' range "
+              "in ssb_mic_test.ino's loop()/setup()");
