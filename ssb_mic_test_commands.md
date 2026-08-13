@@ -10,6 +10,8 @@ Send any of these single characters over the serial monitor (921600 baud). Each 
 | `s` | Single clean tone (1000Hz) — isolates DSP/RF chain from mic-side artifacts |
 | `m` | Live mic input |
 | `p` | Envelope step test — 4Hz square wave direct to PWM, carrier held fixed. For measuring the analog reconstruction filter's step response with a scope, independent of everything else in the chain |
+| `y` | FM isolation test — pure sinusoidal frequency modulation (1200Hz mod, 3000Hz peak deviation), envelope held fixed, bypasses `ssb_dsp_process_sample()` entirely. Isolates the AD9851/SPI/delay-line chain from the Hilbert/DSP math |
+| `h` | AM isolation test — pure sinusoidal amplitude modulation (1200Hz mod, 100% depth), `freq_dev_hz` locked at 0, also bypasses `ssb_dsp_process_sample()`. Isolates the RSET/PWM/analog-filter/transistor path |
 
 ## Phase/envelope relative timing
 
@@ -32,6 +34,14 @@ Separate from master gain — this only remaps envelope's own output into a duty
 | `k` | Narrow duty range span by 2% |
 
 Default: offset 0.20, scale 0.90 → duty range 20%–100% (actually caps at ~92% due to the scale).
+
+## Envelope group-delay equalizer
+
+| Key | Effect |
+|---|---|
+| `g` | Toggle two cascaded first-order digital all-pass sections on the envelope path, fitted to flatten the *original* (non-Bessel) 2-pole Sallen-Key filter's group-delay dispersion across 100–4300Hz (numerically fit against a real LTspice sweep of that circuit — see `ENV_GDEQ_A1`/`ENV_GDEQ_A2` in the .ino for the full derivation). Goal: get that filter's better stopband rejection without its dispersion-driven IMD penalty, instead of the Bessel filter's compromise. **Not yet validated on real hardware.** |
+
+Off by default. Enabling it pushes the envelope path's overall delay up by ~265µs (it can only add delay, not remove it) — re-tune `[`/`]` from scratch afterward; theoretical starting point is roughly **+2.65 samples**, a different regime from the Bessel filter's -0.20 to -0.25 samples.
 
 ## Audio processing
 
@@ -64,10 +74,12 @@ Master gain scales the *whole* chain (phase + envelope together, inside `ssb_dsp
 - EQ and compressor both off
 - Master gain: -2dB
 - Relative delay: 0 samples
+- Envelope group-delay equalizer: off
 - `MAX_FREQ_DEV_HZ`: 8000Hz (temporarily raised from the original 2800Hz for diagnostic testing — revert before considering this production-ready)
 
 ## Quick workflow reminders
 
 - Send `v` first if you're about to do fine-tuning — otherwise confirmations get buried in the 1-second diagnostic spam.
 - Levels take a moment to settle on the spectrum analyzer after any change — wait before reading.
-- `[timing]` line's `mode=` field always tells you which signal source is actually active, so you can't accidentally misread results against the wrong source.
+- `[timing]` line's `mode=` field tells you which signal source is actually active (goes through the same name mapping used for `t`/`s`/`p`/`y`/`h`'s own confirmation lines, so `ENVSTEP`/`FM TEST`/`AM TEST` show up correctly there too, not just `TWOTONE`/`SINGLETONE`/`mic`), and `gdeq=` tells you whether the group-delay equalizer was on during that measurement window.
+- Recommended workflow for validating `g`: `p` (envelope step) with `g` off vs on, scope the RSET step edge directly — flatter group delay should show as a cleaner edge. Then `h` (AM isolation) with `g` off vs on, to check whether it has any effect on the still-unexplained AM-to-PM sideband asymmetry (-2.4kHz nulls out, +2.4kHz stuck at -40dB). Re-tune `[`/`]` (starting near +2.65 samples) before judging real two-tone/IMD results with `g` on.

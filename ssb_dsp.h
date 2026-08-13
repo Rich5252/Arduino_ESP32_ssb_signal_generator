@@ -204,6 +204,66 @@ typedef struct {
 
 void ssb_dsp_get_profile(ssb_dsp_handle_t handle, ssb_dsp_profile_t *out);
 
+/**
+ * @brief Generic first-order digital all-pass section - unity gain at
+ *        every frequency, pure phase/group-delay shaping. NOT specific to
+ *        SSB modulation - exposed as a reusable primitive for equalizing
+ *        an external ANALOG filter's group-delay dispersion (e.g. the
+ *        envelope path's PWM -> RC reconstruction filter -> RSET stage),
+ *        by cascading two or more sections whose coefficients are fitted
+ *        numerically against that specific filter's measured (e.g.
+ *        LTspice AC sweep) response. See the caller (e.g.
+ *        ssb_mic_test.ino's ENV_GDEQ_A1/A2) for a worked example and the
+ *        fitting method.
+ *
+ *        Transfer function: H(z) = (a + z^-1) / (1 + a*z^-1), |a| < 1 for
+ *        stability. Group delay in samples:
+ *          tau(w) = (1 - a^2) / (1 + 2*a*cos(w) + a^2)
+ *        - flat at exactly 1 sample when a=0 (pure unit delay); rises
+ *        with frequency for a>0, falls with frequency for a<0. A single
+ *        section can only ever produce a MONOTONIC delay-vs-frequency
+ *        curve - cascading two sections of opposite-sign a is what lets
+ *        the combined curve have a local min/max in the middle of the
+ *        band, needed to cancel a non-monotonic analog filter response
+ *        (e.g. a Sallen-Key whose group delay peaks somewhere in-band
+ *        and falls off on both sides of that peak).
+ *
+ *        IMPORTANT: because an all-pass filter can only ADD delay, never
+ *        subtract it, using this to flatten a delay curve pushes the
+ *        signal's OVERALL (mean) delay up, not just its dispersion. Any
+ *        other signal path this one needs to stay time-aligned with
+ *        (e.g. the phase/frequency path feeding the same PA) will need
+ *        its own relative-delay compensation retuned to match - a
+ *        one-time re-tune, not a per-sample concern.
+ */
+typedef struct {
+    float a;           ///< All-pass coefficient, |a| < 1.
+    float x1, y1;       ///< Direct-Form-I state: previous input/output.
+} ssb_allpass1_t;
+
+/**
+ * @brief Set the coefficient and zero the filter's state. Cheap - fine to
+ *        call from task context whenever coefficients change (e.g. once
+ *        at init), not intended to be called from the per-sample path.
+ */
+void ssb_allpass1_init(ssb_allpass1_t *f, float a);
+
+/**
+ * @brief Zero the filter's state without touching its coefficient - e.g.
+ *        when re-enabling after being bypassed, to avoid feeding a stale
+ *        x1/y1 pair into the next sample (same reasoning as
+ *        ssb_dsp_set_compressor_enabled()'s env reset on re-enable).
+ */
+void ssb_allpass1_reset(ssb_allpass1_t *f);
+
+/**
+ * @brief Process one sample. One-multiply Direct-Form-I realization:
+ *        y = x1 + a*(x - y1); x1 = x; y1 = y. IRAM_ATTR/denormal-flushed
+ *        the same way as the rest of this file's per-sample path - safe
+ *        to call every tick from a real-time task (not ISR-safe: float).
+ */
+float IRAM_ATTR ssb_allpass1_process(ssb_allpass1_t *f, float x);
+
 #ifdef __cplusplus
 }
 #endif

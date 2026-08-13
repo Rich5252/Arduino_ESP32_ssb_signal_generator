@@ -179,6 +179,34 @@ static void biquad_set_peaking(biquad_t *bq, float fc, float fs, float q, float 
     bq->x1 = bq->x2 = bq->y1 = bq->y2 = 0.0f;
 }
 
+// ---- Generic first-order all-pass (group-delay equalizer primitive) ----
+// See ssb_dsp.h's ssb_allpass1_t doc comment for the transfer function
+// and group-delay formula this implements. One-multiply Direct Form I:
+// y = x1 + a*(x - y1); x1 = x; y1 = y - algebraically identical to
+// y = a*x + x1 - a*y1 (the textbook two-multiply form) but one multiply
+// cheaper, same trick used for the RBJ biquads' normalized coefficients
+// elsewhere in this file being worth the one-time division at init.
+void ssb_allpass1_init(ssb_allpass1_t *f, float a)
+{
+    f->a = a;
+    f->x1 = 0.0f;
+    f->y1 = 0.0f;
+}
+
+void ssb_allpass1_reset(ssb_allpass1_t *f)
+{
+    f->x1 = 0.0f;
+    f->y1 = 0.0f;
+}
+
+float IRAM_ATTR ssb_allpass1_process(ssb_allpass1_t *f, float x)
+{
+    float y = f->x1 + f->a * (x - f->y1);
+    f->x1 = flush_denorm(x);
+    f->y1 = flush_denorm(y);
+    return f->y1;
+}
+
 // Feed-forward soft limiter above threshold, fixed ratio. No log/exp/pow
 // per sample - attack/release coefficients (which DO need one expf each)
 // are computed once at init/reconfigure, never per sample.

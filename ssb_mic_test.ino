@@ -623,6 +623,75 @@ static volatile bool s_diag_muted = false;
 static volatile float s_env_pwm_offset = 0.2f;   // was a hardcoded constant
 static volatile float s_env_pwm_scale  = 0.9f;   // was a hardcoded constant
 
+// ---- Envelope-path group-delay equalizer ----
+// Two cascaded first-order digital all-pass sections (ssb_allpass1_t, see
+// ssb_dsp.h) that flatten the ORIGINAL (non-Bessel) 2-pole Sallen-Key RSET
+// reconstruction filter's group-delay dispersion across the voice/two-tone
+// band - the point being to let that filter's better stopband rejection
+// (vs. the Bessel redesign adopted earlier specifically to fix dispersion,
+// see project history) be used WITHOUT paying the harmonic-dispersion IMD
+// penalty that motivated switching to Bessel in the first place. If this
+// works out on real hardware, it replaces the Bessel filter's tradeoff
+// with "good rejection AND flat phase simultaneously" instead of picking one.
+//
+// Coefficients fitted numerically against SallenKey_LP_filter_BC337.txt -
+// a real LTspice AC sweep of the ACTUAL circuit including the BC337 buffer
+// stage's own loading/parasitics, not an idealized 2-pole formula (an
+// idealized model can't capture the transistor stage's contribution to the
+// real dispersion, which is why this needed the sim file rather than just
+// recomputing from R/C values). Method: extracted group delay from the
+// sweep's phase column via tau(f) = -(1/2pi) dphi/df (cubic-spline
+// derivative, cross-checked against raw finite differences on the sweep's
+// own points - agreement within ~0.02us in-band, ~0.2us worst-case near
+// 3.2kHz), then numerically fit (a1, a2) minimizing the peak-to-peak
+// spread of (analog + digital) combined group delay over 100-4300Hz (the
+// two-tone fundamentals, the 1200Hz beat and its harmonics up to the 4th,
+// and the +4300Hz 5th-order IMD product - see project history for why that
+// product specifically matters). Result:
+//   - Analog filter alone: 29.8us peak-to-peak over that band (the real
+//     sim's dispersion is worse than the 13.2us/23.3us figures from
+//     earlier idealized-model estimates - this supersedes those now that
+//     real sim data is in hand).
+//   - Single all-pass section, best case: 19.2us - barely better than
+//     nothing, because the analog delay curve is NON-MONOTONIC (rises
+//     from 66us at 100Hz to a ~77.6us peak near 2150Hz, then falls to
+//     48us at 4300Hz) and one section can only ever produce a monotonic
+//     delay curve (see ssb_allpass1_t's doc comment).
+//   - Two sections, opposite-sign coefficients: 0.85us peak-to-peak - a
+//     ~35x improvement over the analog filter alone, and better than the
+//     Bessel filter's own measured 2.7us spread.
+// NOT YET VALIDATED ON REAL HARDWARE - this is a numerically-fitted
+// prediction against a simulated filter response, the same status the
+// Bessel filter's LTspice design had before real hardware confirmed it.
+//
+// IMPORTANT SIDE EFFECT: an all-pass filter can only ADD delay, never
+// subtract it - flattening this curve pushes the envelope path's OVERALL
+// delay up by ~265us on average (2.65 samples @ 10kHz), not just its
+// dispersion. The existing phase/envelope relative-delay line
+// (s_relative_delay_samples, '['/']') will need to be RE-TUNED FROM
+// SCRATCH once this is enabled: the theoretical starting point is
+// roughly +2.65 samples (positive = hold phase back, matching the sign
+// convention documented at s_relative_delay_samples's declaration), a
+// completely different regime from the old best-known -0.20 to -0.25
+// samples found for the Bessel filter - not a small tweak from that value.
+//
+// Applied unconditionally to `envelope` regardless of audio source (see
+// dsp_task) - including ENVSTEP and AMTEST - so those isolation tests
+// exercise the same combined (digital+analog) response real operation
+// will see: ENVSTEP with this on/off is a direct scope A/B of whether
+// flattening group delay actually cleans up the step edge, and AMTEST
+// with this on/off is a direct check of whether it has any effect on the
+// still-unexplained AM-to-PM crosstalk asymmetry (-2.4kHz nulls,
+// +2.4kHz stuck at -40dB) - worth checking since that's the current
+// top-priority open item regardless of what it turns out to show.
+// Toggle via 'g', off by default so existing tuning isn't disturbed
+// until deliberately opted into.
+#define ENV_GDEQ_A1   0.194594f
+#define ENV_GDEQ_A2  -0.136698f
+static ssb_allpass1_t s_env_gdeq_1;
+static ssb_allpass1_t s_env_gdeq_2;
+static volatile bool s_env_gdeq_enable = false;
+
 // Master gain (set via ssb_dsp_set_master_gain_db, '+'/'-') only applies
 // inside ssb_dsp_process_sample() - which AMTEST/ENVSTEP deliberately
 // bypass, so it previously had zero effect on their envelope level. This
@@ -977,6 +1046,20 @@ static void IRAM_ATTR dsp_task(void* arg)
             ssb_dsp_process_sample(s_ssb, sample, s_sideband, &freq_dev_hz, &envelope);
         }
         int64_t t_dsp_done_us = esp_timer_get_time();
+
+        // Envelope-path group-delay equalizer (see ENV_GDEQ_A1/A2's
+        // declaration comment for the coefficients/rationale). Applied
+        // here, unconditionally across every audio source that reaches
+        // this point (mic/two-tone/single-tone via ssb_dsp_process_sample
+        // above, or ENVSTEP/AMTEST's own direct envelope assignment) -
+        // one insertion point covers all of them identically, including
+        // the isolation test modes, deliberately (see the comment at the
+        // declaration for why that's useful rather than a shortcut).
+        // Off by default (s_env_gdeq_enable) - toggle via 'g'.
+        if (s_env_gdeq_enable) {
+            envelope = ssb_allpass1_process(&s_env_gdeq_1, envelope);
+            envelope = ssb_allpass1_process(&s_env_gdeq_2, envelope);
+        }
 
         // envelope is roughly [0,1] for typical mic levels but not
         // rigorously bounded - clamp before handing off. Offset/scale
@@ -1357,6 +1440,13 @@ void setup()
     ssb_dsp_set_master_gain_db(s_ssb, -2.0f);
     s_master_gain_linear_cache = powf(10.0f, -2.0f / 20.0f);   // keep in sync with the line above
 
+    // Envelope group-delay equalizer coefficients - see ENV_GDEQ_A1/A2's
+    // declaration comment. Initialized (states zeroed) regardless of
+    // s_env_gdeq_enable's default, so enabling it later via 'g' doesn't
+    // need a separate init path, only ssb_allpass1_reset() (see there).
+    ssb_allpass1_init(&s_env_gdeq_1, ENV_GDEQ_A1);
+    ssb_allpass1_init(&s_env_gdeq_2, ENV_GDEQ_A2);
+
     // Always started now, regardless of s_audio_source's initial value -
     // needed so the mic path is live and ready the moment a 't'/'s'/'m'
     // serial command switches source at runtime (see s_audio_source).
@@ -1423,6 +1513,10 @@ void setup()
                   s_env_pwm_offset * 100.0f,
                   (s_env_pwm_offset + s_env_pwm_scale > 1.0f ? 1.0f : s_env_pwm_offset + s_env_pwm_scale) * 100.0f,
                   s_env_pwm_offset, s_env_pwm_scale, ENV_PWM_STEP * 100.0f);
+    Serial.printf("Send 'g' to toggle the envelope group-delay equalizer (currently %s) - "
+                  "fitted against the original Sallen-Key filter's real LTspice response, "
+                  "not yet validated on hardware; re-tune '['/']' from scratch after enabling.\r\n",
+                  s_env_gdeq_enable ? "ON" : "off");
 }
 
 // Owned by the [adc] 1-second rate print below; file-scope (not a local
@@ -1507,6 +1601,20 @@ void loop()
                           s_env_pwm_offset * 100.0f,
                           (s_env_pwm_offset + s_env_pwm_scale > 1.0f ? 1.0f : s_env_pwm_offset + s_env_pwm_scale) * 100.0f,
                           s_env_pwm_offset, s_env_pwm_scale);
+        } else if (c == 'g') {
+            bool now_on = !s_env_gdeq_enable;
+            s_env_gdeq_enable = now_on;
+            if (now_on) {
+                // Avoid feeding stale x1/y1 from however long it's been
+                // since this was last on (or since boot) into the first
+                // sample after re-enabling - same reasoning as
+                // ssb_dsp_set_compressor_enabled()'s env reset.
+                ssb_allpass1_reset(&s_env_gdeq_1);
+                ssb_allpass1_reset(&s_env_gdeq_2);
+            }
+            Serial.printf("-> envelope group-delay equalizer %s%s\r\n", now_on ? "ON" : "off",
+                          now_on ? " - re-tune relative delay ('['/']') from scratch, "
+                                   "theoretical starting point ~+2.65 samples (see declaration comment)" : "");
         } else if (c == 'f') {
             s_adc_lpf_bypass = !s_adc_lpf_bypass;
             Serial.printf("-> ADC LPF %s\r\n", s_adc_lpf_bypass ? "BYPASSED (raw)" : "active");
@@ -1616,9 +1724,18 @@ void loop()
     static uint32_t last_timing_print_ms = 0;
     if (!s_diag_muted && now - last_timing_print_ms >= 1000) {
         last_timing_print_ms = now;
-        Serial.printf("[timing] mode=%s max_busy_us=%u (adc=%u dsp=%u write=%u) period_us=%u overruns=%u\r\n",
-                      s_audio_source == AUDIO_SRC_TWOTONE ? "TWOTONE" :
-                      s_audio_source == AUDIO_SRC_SINGLETONE ? "SINGLETONE" : "MIC",
+        // mode= now goes through audio_source_name() (previously an
+        // inline TWOTONE/SINGLETONE/else-"MIC" ternary that silently
+        // mislabeled ENVSTEP/FMTEST/AMTEST as "MIC" too) - noticed while
+        // adding gdeq= here, since ENVSTEP/AMTEST-with-gdeq-toggled is
+        // specifically the workflow this diagnostic line needs to
+        // correctly identify for (see ENV_GDEQ_A1/A2's declaration
+        // comment). commands.md's claim that this field "always tells
+        // you which signal source is actually active" wasn't quite true
+        // before this fix.
+        Serial.printf("[timing] mode=%s gdeq=%s max_busy_us=%u (adc=%u dsp=%u write=%u) period_us=%u overruns=%u\r\n",
+                      audio_source_name(s_audio_source),
+                      s_env_gdeq_enable ? "ON" : "off",
                       s_dbg_max_busy_us, s_dbg_max_adc_us, s_dbg_max_dsp_us, s_dbg_max_write_us,
                       k_sample_period_us, s_dbg_overrun_count);
         Serial.printf("[timing]   wakeup jitter: max_gap_us=%u (nominal=%u) late_ticks_total=%u\r\n",
