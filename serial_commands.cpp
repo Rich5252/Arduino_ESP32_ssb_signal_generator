@@ -215,7 +215,7 @@ void handle_serial_commands(void)
                 ssb_dsp_get_master_gain_db(dsp_state_get_ssb()),
                 rf_enabled ? "true" : "false");
         }
-        else if (c >= '0' && c <= '4') {
+        else if (c >= '0' && c <= '9') {
             int preset = c - '0';
             const PersistentSettings& p = settingsPresets[preset];
 

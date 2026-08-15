@@ -77,7 +77,7 @@ typedef struct
 // Pre-defined settings
 // -----------------------------------------------------------------------------
 
-static const PersistentSettings settingsPresets[5] =
+static const PersistentSettings settingsPresets[10] =
 {
     // Preset 0 - Normal microphone operation
     {
@@ -138,19 +138,19 @@ static const PersistentSettings settingsPresets[5] =
                         // ad9851_output_enable
 
     // Preset 4 - Diagnostic / raw ADC
-    {
-        "Micr 2",
-        AUDIO_SRC_MIC,
-        2.65f,               // relative_delay_samples
-        0.1f,               // env_pwm_offset
-        0.8f,               // env_pwm_scale
-        true,               // env_gdeq_enable
-        false,              // adc_lpf_bypass
-        true,               // eq_enable
-        true,               // compressor_enable
-        0.0f,               // master_gain_db
-        true                // ad9851_output_enable
-    }
+        { "AM-ButwGd", AUDIO_SRC_AMTEST, 1.85f, 0.08f, 0.84f, true, true, false, false, 1.0f, true },
+
+    // Preset 5 -
+    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 1.85f, 0.36f, 0.48f, true, true, false, false, 1.0f, true },
+
+        // Preset 6 -
+    { "TwoToneButwGD Env 1.6-2.9 DelayTuned", AUDIO_SRC_TWOTONE, 1.65f, 0.36f, 0.48f, true, true, false, false, 1.0f, true },
+        // Preset 7 -
+    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 1.85f, 0.40f, 0.46f, true, true, false, false, 1.0f, true },
+        // Preset 8 -
+    { "FM Env 2.2", AUDIO_SRC_FMTEST, 1.85f, 0.12f, 0.48f, true, true, false, false, 0.0f, true },
+        // Preset 9 -
+    { "AM Env = 1.6 - 2.9", AUDIO_SRC_AMTEST, 1.90f, 0.28f, 0.70f, true, true, true, true, -4.0f, true }
 };
 
 // If this array's size ever changes, ssb_mic_test.ino's serial handler
@@ -159,6 +159,6 @@ static const PersistentSettings settingsPresets[5] =
 // match - this catches a silent mismatch at compile time instead of
 // leaking a stale range (missing the new last preset, or indexing past
 // the array's end) into a build that otherwise looks fine.
-static_assert(sizeof(settingsPresets) / sizeof(settingsPresets[0]) == 5,
-              "settingsPresets size changed - update the '0'-'4' range "
+static_assert(sizeof(settingsPresets) / sizeof(settingsPresets[0]) == 10,
+              "settingsPresets size changed - update the '0'-'9' range "
               "in ssb_mic_test.ino's loop()/setup()");
