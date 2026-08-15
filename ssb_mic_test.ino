@@ -101,9 +101,9 @@
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
 
- // Shared compile-time configuration - must come before any other project
- // header (gates #if blocks in several of them, e.g. PWM_COMPARISON_ENABLED
- // must be known before envelope_output.cpp includes "driver/ledc.h").
+// Shared compile-time configuration - must come before any other project
+// header (gates #if blocks in several of them, e.g. PWM_COMPARISON_ENABLED
+// must be known before envelope_output.cpp includes "driver/ledc.h").
 #include "config.h"
 
 // Pre-defined settings tables (audio_source_t, PersistentSettings, presets)
@@ -129,7 +129,7 @@
 
 static TaskHandle_t s_dsp_task;
 
-static bool IRAM_ATTR on_timer_alarm(gptimer_handle_t timer, const gptimer_alarm_event_data_t* edata, void* user_ctx)
+static bool IRAM_ATTR on_timer_alarm(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
     BaseType_t high_task_woken = pdFALSE;
     vTaskNotifyGiveFromISR(s_dsp_task, &high_task_woken);
@@ -173,20 +173,15 @@ static void IRAM_ATTR dsp_task(void* arg)
         float sample;
         if (src == AUDIO_SRC_TWOTONE) {
             sample = generate_twotone_sample();
-        }
-        else if (src == AUDIO_SRC_SINGLETONE) {
+        } else if (src == AUDIO_SRC_SINGLETONE) {
             sample = generate_singletone_sample();
-        }
-        else if (src == AUDIO_SRC_ENVSTEP) {
+        } else if (src == AUDIO_SRC_ENVSTEP) {
             sample = 0.0f;   // unused - ssb_dsp_process_sample() is bypassed entirely for this mode, see below
-        }
-        else if (src == AUDIO_SRC_FMTEST) {
+        } else if (src == AUDIO_SRC_FMTEST) {
             sample = 0.0f;   // unused - ssb_dsp_process_sample() is bypassed entirely for this mode too, see below
-        }
-        else if (src == AUDIO_SRC_AMTEST) {
+        } else if (src == AUDIO_SRC_AMTEST) {
             sample = 0.0f;   // unused - ssb_dsp_process_sample() is bypassed entirely for this mode too, see below
-        }
-        else {
+        } else {
             // Pops the next batch of raw samples from the ADC FIFO,
             // filters them (or passes through raw if bypassed), and
             // returns the latest value in ADC-code units - see
@@ -205,14 +200,11 @@ static void IRAM_ATTR dsp_task(void* arg)
         float master_gain_linear = dsp_state_get_master_gain_linear();
         if (src == AUDIO_SRC_ENVSTEP) {
             envelope = test_signals_generate_envstep(master_gain_linear);
-        }
-        else if (src == AUDIO_SRC_FMTEST) {
+        } else if (src == AUDIO_SRC_FMTEST) {
             test_signals_generate_fmtest(&freq_dev_hz, &envelope);
-        }
-        else if (src == AUDIO_SRC_AMTEST) {
+        } else if (src == AUDIO_SRC_AMTEST) {
             test_signals_generate_amtest(master_gain_linear, &envelope, &freq_dev_hz);
-        }
-        else {
+        } else {
             ssb_dsp_process_sample(dsp_state_get_ssb(), sample, dsp_state_get_sideband(), &freq_dev_hz, &envelope);
         }
         int64_t t_dsp_done_us = esp_timer_get_time();
@@ -299,10 +291,10 @@ static void IRAM_ATTR dsp_task(void* arg)
         // permanently rather than only turning it on when chasing a
         // specific problem.
         int64_t t_write_done_us = esp_timer_get_time();
-        uint32_t adc_us = (uint32_t)(t_adc_done_us - t_start_us);
-        uint32_t dsp_us = (uint32_t)(t_dsp_done_us - t_adc_done_us);
+        uint32_t adc_us   = (uint32_t)(t_adc_done_us   - t_start_us);
+        uint32_t dsp_us   = (uint32_t)(t_dsp_done_us   - t_adc_done_us);
         uint32_t write_us = (uint32_t)(t_write_done_us - t_dsp_done_us);
-        uint32_t busy_us = (uint32_t)(t_write_done_us - t_start_us);
+        uint32_t busy_us  = (uint32_t)(t_write_done_us - t_start_us);
         diagnostics_record_phase_timings(adc_us, dsp_us, write_us, busy_us);
 
 #if TIMING_DEBUG_ENABLED
@@ -341,13 +333,13 @@ void setup()
 {
     Serial.begin(921600);
     delay(1000);  // give USB CDC time to enumerate before we print - 200ms
-    // wasn't enough on this board, confirmed empirically
+                  // wasn't enough on this board, confirmed empirically
 
-// Direct confirmation of actual CPU clock - cheap, definitive, and
-// worth checking given max_busy_us has been running ~3x higher than
-// expected. 240 = full speed; if this prints 80 or 160, the board is
-// NOT at max clock (check Arduino IDE: Tools > CPU Frequency) and
-// that alone would explain a roughly-3x-too-slow measurement.
+    // Direct confirmation of actual CPU clock - cheap, definitive, and
+    // worth checking given max_busy_us has been running ~3x higher than
+    // expected. 240 = full speed; if this prints 80 or 160, the board is
+    // NOT at max clock (check Arduino IDE: Tools > CPU Frequency) and
+    // that alone would explain a roughly-3x-too-slow measurement.
     Serial.printf("CPU ticks/us = %u (240 = full speed 240MHz)\r\n", esp_rom_get_cpu_ticks_per_us());
 
 #if TIMING_DEBUG_ENABLED
@@ -404,47 +396,56 @@ void setup()
 
     // dsp_task on Core 0, high priority - the phase-critical path.
     xTaskCreatePinnedToCore(dsp_task, "ssb_dsp_task", 4096, NULL,
-        configMAX_PRIORITIES - 2, &s_dsp_task, 0);
+                             configMAX_PRIORITIES - 2, &s_dsp_task, 0);
 
     init_sample_timer();
     diagnostics_init();
 
     Serial.printf("SSB mic test running: taps=%d fs=%uHz mode=%s ad9851=%s dac=MCP4725@0x%02X pwm_compare=%s\r\n",
-        HILBERT_TAPS, SAMPLE_RATE_HZ,
-        audio_source_name(dsp_state_get_audio_source()),
-        AD9851_ATTACHED ? "attached" : "not attached (stubbed)",
-        MCP4725_I2C_ADDR,
-        PWM_COMPARISON_ENABLED ? "on" : "off");
+             HILBERT_TAPS, SAMPLE_RATE_HZ,
+             audio_source_name(dsp_state_get_audio_source()),
+             AD9851_ATTACHED ? "attached" : "not attached (stubbed)",
+             MCP4725_I2C_ADDR,
+             PWM_COMPARISON_ENABLED ? "on" : "off");
     Serial.println("Send 't' for two-tone test signal, 's' for single-tone test signal, 'm' for live mic input, 'p' for envelope step test, 'y' for FM isolation test, 'h' for AM isolation test, 'f' to toggle the ADC LPF on/off, 'r' to reset diagnostics, 'v' to mute periodic diagnostics.");
+    Serial.printf("Send 'T' to step the two-tone pair through a spread of bands (currently f1=%.0fHz f2=%.0fHz) - "
+                  "for mapping envelope/phase delay mismatch vs. frequency without a recompile per band.\r\n",
+                  test_signals_get_twotone_f1_hz(), test_signals_get_twotone_f2_hz());
     Serial.printf("Send 'e' to toggle EQ (currently %s), 'c' to toggle compressor (currently %s), "
-        "'+'/'-' for master gain (currently %+.1fdB, %.1fdB/step).\r\n",
-        ssb_dsp_get_eq_enabled(dsp_state_get_ssb()) ? "ON" : "off",
-        ssb_dsp_get_compressor_enabled(dsp_state_get_ssb()) ? "ON" : "off",
-        ssb_dsp_get_master_gain_db(dsp_state_get_ssb()), MASTER_GAIN_STEP_DB);
+                  "'+'/'-' for master gain (currently %+.1fdB, %.1fdB/step).\r\n",
+                  ssb_dsp_get_eq_enabled(dsp_state_get_ssb()) ? "ON" : "off",
+                  ssb_dsp_get_compressor_enabled(dsp_state_get_ssb()) ? "ON" : "off",
+                  ssb_dsp_get_master_gain_db(dsp_state_get_ssb()), MASTER_GAIN_STEP_DB);
 #if AD9851_ATTACHED
     Serial.printf("Send 'o' to toggle AD9851 RF output on/off (currently %s), "
-        "'['/']' for relative phase/envelope delay (currently %+.2f samples, ~%+.0fus, "
-        "%.2f/step - positive delays phase, negative delays envelope).\r\n",
-        carrier_output_get_rf_enabled() ? "ON" : "off",
-        relative_delay_get_samples(), relative_delay_get_samples() * 1000000.0f / SAMPLE_RATE_HZ,
-        DELAY_STEP_SAMPLES);
+                  "'['/']' for relative phase/envelope delay (currently %+.2f samples, ~%+.0fus, "
+                  "%.2f/step - positive delays phase, negative delays envelope).\r\n",
+                  carrier_output_get_rf_enabled() ? "ON" : "off",
+                  relative_delay_get_samples(), relative_delay_get_samples() * 1000000.0f / SAMPLE_RATE_HZ,
+                  DELAY_STEP_SAMPLES);
 #endif
     Serial.printf("Send 'u'/'j' for PWM duty range offset, 'i'/'k' for span "
-        "(currently %.0f%%-%.0f%%, offset=%.2f scale=%.2f, %.0f%%/step).\r\n",
-        envelope_output_get_pwm_offset() * 100.0f,
-        (envelope_output_get_pwm_offset() + envelope_output_get_pwm_scale() > 1.0f
-            ? 1.0f : envelope_output_get_pwm_offset() + envelope_output_get_pwm_scale()) * 100.0f,
-        envelope_output_get_pwm_offset(), envelope_output_get_pwm_scale(), ENV_PWM_STEP * 100.0f);
+                  "(currently %.0f%%-%.0f%%, offset=%.2f scale=%.2f, %.0f%%/step).\r\n",
+                  envelope_output_get_pwm_offset() * 100.0f,
+                  (envelope_output_get_pwm_offset() + envelope_output_get_pwm_scale() > 1.0f
+                       ? 1.0f : envelope_output_get_pwm_offset() + envelope_output_get_pwm_scale()) * 100.0f,
+                  envelope_output_get_pwm_offset(), envelope_output_get_pwm_scale(), ENV_PWM_STEP * 100.0f);
     Serial.printf("Send 'g' to toggle the envelope group-delay equalizer (currently %s) - "
-        "fitted against the original Sallen-Key filter's real LTspice response, "
-        "not yet validated on hardware; re-tune '['/']' from scratch after enabling.\r\n",
-        envelope_gdeq_get_enabled() ? "ON" : "off");
+                  "fitted against the original Sallen-Key filter's real LTspice response, "
+                  "not yet validated on hardware; re-tune '['/']' from scratch after enabling.\r\n",
+                  envelope_gdeq_get_enabled() ? "ON" : "off");
     // Presets (settings.h) load every lever above in one command - handy
     // once a preset is dialed in, no need to remember/retype the whole
-    // sequence of individual knob commands every boot.
-    Serial.print("Send '0'-'4' to load a preset: ");
-    for (int i = 0; i < 5; i++) {
-        Serial.printf("%d=%s%s", i, settingsPresets[i].name, i < 4 ? ", " : "\r\n");
+    // sequence of individual knob commands every boot. Loop bound taken
+    // from the array itself (not hardcoded) so this banner can't silently
+    // drift out of sync with settingsPresets again the way it did when
+    // the array grew from 5 to 10 entries without this loop being
+    // updated - see settings.h's static_assert for the compile-time half
+    // of that same guard.
+    const int preset_count = sizeof(settingsPresets) / sizeof(settingsPresets[0]);
+    Serial.printf("Send '0'-'%d' to load a preset: ", preset_count - 1);
+    for (int i = 0; i < preset_count; i++) {
+        Serial.printf("%d=%s%s", i, settingsPresets[i].name, i < preset_count - 1 ? ", " : "\r\n");
     }
     Serial.println("Send 'P' to print the current settings as a single pasteable preset line for settings.h.");
 }
