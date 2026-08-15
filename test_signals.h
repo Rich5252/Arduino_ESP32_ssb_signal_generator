@@ -20,6 +20,24 @@
 float IRAM_ATTR generate_twotone_sample(void);
 float IRAM_ATTR generate_singletone_sample(void);
 
+// Runtime-adjustable two-tone frequency pair, for sweeping the pair across
+// different parts of the audio band without a recompile/reflash per band -
+// see TWOTONE_BAND_PRESETS in test_signals.cpp and the 'T' serial command.
+// Starts on the 700/1900Hz entry (matching TWOTONE_F1_HZ/F2_HZ in
+// config.h), so 't' behaves exactly as before if 'T' is never sent.
+float test_signals_get_twotone_f1_hz(void);
+float test_signals_get_twotone_f2_hz(void);
+
+// Advances to the next entry in TWOTONE_BAND_PRESETS (wrapping around),
+// applies it to generate_twotone_sample()'s frequencies, and returns its
+// display name for the caller (serial_commands.cpp's 'T' handler) to
+// print. Intended workflow: 'T' to pick a band, '['/']' to re-tune
+// relative delay for that band, capture a spectrum, repeat - building up
+// an empirical delay-vs-frequency curve across the band without any lab
+// equipment beyond the RF spectrum analyzer already in use (see the
+// group-delay-equalizer refit discussion this was added for).
+const char* test_signals_next_twotone_band(void);
+
 // Envelope step test ('p') - slow square wave direct to the envelope
 // output, carrier held fixed, bypassing ssb_dsp_process_sample()
 // entirely. master_gain_linear is dsp_state_get_master_gain_linear() -

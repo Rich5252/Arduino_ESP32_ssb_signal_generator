@@ -12,13 +12,52 @@
 static float s_tone1_phase = 0.0f;
 static float s_tone2_phase = 0.0f;
 
+// Runtime-adjustable pair (see test_signals.h) - starts at the
+// config.h defaults so behavior is unchanged until 'T' is sent. volatile
+// for the same reason relative_delay.cpp's s_relative_delay_samples is:
+// written occasionally from the serial-command context, read every
+// sample from generate_twotone_sample()'s hot path.
+static volatile float s_tone1_hz = TWOTONE_F1_HZ;
+static volatile float s_tone2_hz = TWOTONE_F2_HZ;
+
+typedef struct { const char *name; float f1_hz; float f2_hz; } twotone_band_t;
+
+// Spread across roughly the same ~100-4300Hz band envelope_gdeq was
+// originally fit against (see envelope_gdeq.h) - a single tone-pair only
+// tells you whether delay is right AT that pair's spacing; only a sweep
+// across several bands reveals the SHAPE of a frequency-dependent
+// envelope/phase delay mismatch, which a bulk relative-delay shift alone
+// can never fully correct (it can only slide the curve, not reshape it -
+// see the group-delay-equalizer refit discussion this was added for).
+// Index 1 (700/1900Hz) is the default, matching TWOTONE_F1_HZ/F2_HZ.
+static const twotone_band_t TWOTONE_BAND_PRESETS[] = {
+    { "300/500 (low)",        300.0f,  500.0f },
+    { "700/1900 (default)",   TWOTONE_F1_HZ, TWOTONE_F2_HZ },
+    { "1500/1700 (mid)",      1500.0f, 1700.0f },
+    { "2500/2700 (mid-high)", 2500.0f, 2700.0f },
+    { "3500/3700 (high)",     3500.0f, 3700.0f },
+};
+#define TWOTONE_BAND_COUNT (sizeof(TWOTONE_BAND_PRESETS) / sizeof(TWOTONE_BAND_PRESETS[0]))
+static int s_band_index = 1;   // starts on the 700/1900Hz entry above
+
+float test_signals_get_twotone_f1_hz(void) { return s_tone1_hz; }
+float test_signals_get_twotone_f2_hz(void) { return s_tone2_hz; }
+
+const char* test_signals_next_twotone_band(void)
+{
+    s_band_index = (s_band_index + 1) % TWOTONE_BAND_COUNT;
+    s_tone1_hz = TWOTONE_BAND_PRESETS[s_band_index].f1_hz;
+    s_tone2_hz = TWOTONE_BAND_PRESETS[s_band_index].f2_hz;
+    return TWOTONE_BAND_PRESETS[s_band_index].name;
+}
+
 float IRAM_ATTR generate_twotone_sample(void)
 {
     const float two_pi = 2.0f * (float)M_PI;
     float sample = TWOTONE_AMPLITUDE * sinf(s_tone1_phase) +
                    TWOTONE_AMPLITUDE * sinf(s_tone2_phase);
-    s_tone1_phase += two_pi * TWOTONE_F1_HZ / (float)SAMPLE_RATE_HZ;
-    s_tone2_phase += two_pi * TWOTONE_F2_HZ / (float)SAMPLE_RATE_HZ;
+    s_tone1_phase += two_pi * s_tone1_hz / (float)SAMPLE_RATE_HZ;
+    s_tone2_phase += two_pi * s_tone2_hz / (float)SAMPLE_RATE_HZ;
     if (s_tone1_phase > two_pi) s_tone1_phase -= two_pi;
     if (s_tone2_phase > two_pi) s_tone2_phase -= two_pi;
     return sample;
