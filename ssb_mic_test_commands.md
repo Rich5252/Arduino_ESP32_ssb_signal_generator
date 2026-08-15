@@ -44,6 +44,14 @@ Default: offset 0.20, scale 0.90 → duty range 20%–100% (actually caps at ~92
 
 Off by default. Enabling it pushes the envelope path's overall delay up by ~265µs (it can only add delay, not remove it) — re-tune `[`/`]` from scratch afterward; theoretical starting point is roughly **+2.65 samples**, a different regime from the Bessel filter's -0.20 to -0.25 samples.
 
+## Envelope pre-distortion
+
+| Key | Effect |
+|---|---|
+| `D` | Toggle a measured-curve lookup table (`envelope_predistort.h`) that corrects the *static* (memoryless) nonlinearity of the whole envelope→RF-amplitude chain — PWM/RC filter, BS170 gate transfer curve, and the AD9851's own RSET-to-DAC-current relationship, all as one measured end-to-end curve. A different problem from `g`'s: this is amplitude vs. commanded level (present even with a constant carrier), not delay vs. frequency. **REPLACES** the `u`/`j`/`i`/`k` linear offset/scale mapping while on — those knobs have no effect until `D` is toggled off again. **Not yet validated beyond the measurement itself.** |
+
+Off by default. Table derived from a real hardware sweep (single-tone + master-gain steps, PWM ranging at full 0–100% span) — see `envelope_predistort.h` for the full derivation and the curve's shape (dead below ~32% duty, steep turn-on through ~36–55%, compressing to saturation at 100%).
+
 ## Audio processing
 
 | Key | Effect |

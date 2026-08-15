@@ -7,6 +7,7 @@
 #include "dsp_state.h"
 #include "adc_capture.h"
 #include "envelope_gdeq.h"
+#include "envelope_predistort.h"
 #include "envelope_output.h"
 #include "diagnostics.h"
 #include "settings.h"
@@ -132,6 +133,13 @@ void handle_serial_commands(void)
             Serial.printf("-> envelope group-delay equalizer %s%s\r\n", now_on ? "ON" : "off",
                           now_on ? " - re-tune relative delay ('['/']') from scratch, "
                                    "theoretical starting point ~+2.65 samples (see envelope_gdeq.h)" : "");
+        } else if (c == 'D') {
+            bool now_on = !envelope_predistort_get_enabled();
+            envelope_predistort_set_enabled(now_on);
+            Serial.printf("-> envelope pre-distortion %s%s\r\n", now_on ? "ON" : "off",
+                          now_on ? " - REPLACES the 'u'/'j'/'i'/'k' linear offset/scale mapping "
+                                   "while on (see envelope_predistort.h); those knobs have no "
+                                   "effect until this is toggled off again" : "");
         } else if (c == 'f') {
             bool bypass = !adc_capture_get_lpf_bypass();
             adc_capture_set_lpf_bypass(bypass);
@@ -184,9 +192,19 @@ void handle_serial_commands(void)
             // as a new preset entry. Rename "Live" (and add a numbered
             // comment above it, matching the existing presets' style)
             // after pasting - and remember settings.h's static_assert
-            // ties the array size to the '0'-'4' range in this file, so
-            // adding a 6th preset needs that range widened too (see the
+            // ties the array size to the '0'-'9' range in this file, so
+            // adding an 11th preset needs that range widened too (see the
             // static_assert's own comment in settings.h).
+            //
+            // Deliberately does NOT include envelope pre-distortion
+            // ('D', envelope_predistort.h) - not yet part of
+            // PersistentSettings, so it's reported as a separate line
+            // below instead of folded into the pasteable one. Worth
+            // knowing before pasting this into a preset: if 'D' is ON
+            // right now, the env_pwm_offset/env_pwm_scale values in the
+            // line below reflect the mapping that's currently INACTIVE
+            // (pre-distortion is overriding them) - they'll only take
+            // effect again once 'D' is toggled off.
 #if AD9851_ATTACHED
             float rel_delay = relative_delay_get_samples();
             bool rf_enabled = carrier_output_get_rf_enabled();

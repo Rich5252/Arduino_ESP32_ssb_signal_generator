@@ -115,6 +115,7 @@
 #include "adc_capture.h"
 #include "test_signals.h"
 #include "envelope_gdeq.h"
+#include "envelope_predistort.h"
 #if AD9851_ATTACHED
 #include "relative_delay.h"
 #include "carrier_output.h"
@@ -221,11 +222,22 @@ static void IRAM_ATTR dsp_task(void* arg)
         envelope = envelope_gdeq_process(envelope);
 
         // envelope is roughly [0,1] for typical mic levels but not
-        // rigorously bounded - clamp before handing off. Offset/scale are
-        // runtime-tunable (see envelope_output.h's 'u'/'j'/'i'/'k'
-        // handlers) - this is the PWM duty range, a separate knob from
-        // master gain.
-        envelope = envelope * envelope_output_get_pwm_scale() + envelope_output_get_pwm_offset();
+        // rigorously bounded - clamp before handing off either way.
+        //
+        // Two mutually exclusive ways to turn that [0,1] value into a PWM
+        // duty: the original linear offset/scale mapping (runtime-tunable
+        // via envelope_output.h's 'u'/'j'/'i'/'k' handlers - this is the
+        // PWM duty range, a separate knob from master gain), or, if
+        // enabled via 'D', envelope_predistort.h's measured lookup table -
+        // see there for why this REPLACES the linear mapping rather than
+        // stacking with it (the table's own domain already spans desired-
+        // envelope-to-duty end to end). Off by default, same convention
+        // as 'g'.
+        if (envelope_predistort_get_enabled()) {
+            envelope = envelope_predistort_process(envelope);
+        } else {
+            envelope = envelope * envelope_output_get_pwm_scale() + envelope_output_get_pwm_offset();
+        }
         if (envelope < 0.0f) envelope = 0.0f;
         if (envelope > 1.0f) envelope = 1.0f;
 
@@ -434,6 +446,10 @@ void setup()
                   "fitted against the original Sallen-Key filter's real LTspice response, "
                   "not yet validated on hardware; re-tune '['/']' from scratch after enabling.\r\n",
                   envelope_gdeq_get_enabled() ? "ON" : "off");
+    Serial.printf("Send 'D' to toggle envelope pre-distortion (currently %s) - measured-curve lookup "
+                  "table that REPLACES the 'u'/'j'/'i'/'k' linear offset/scale mapping while on, "
+                  "not yet validated beyond the measurement itself.\r\n",
+                  envelope_predistort_get_enabled() ? "ON" : "off");
     // Presets (settings.h) load every lever above in one command - handy
     // once a preset is dialed in, no need to remember/retype the whole
     // sequence of individual knob commands every boot. Loop bound taken
