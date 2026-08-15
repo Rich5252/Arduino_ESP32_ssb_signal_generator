@@ -141,10 +141,11 @@ static const PersistentSettings settingsPresets[10] =
         { "AM-ButwGd", AUDIO_SRC_AMTEST, 1.85f, 0.08f, 0.84f, true, true, false, false, 1.0f, true },
 
     // Preset 5 -
-    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 1.85f, 0.36f, 0.48f, true, true, false, false, 1.0f, true },
-
+    //{ "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 1.85f, 0.36f, 0.48f, true, true, false, false, 1.0f, true },
+    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 1.85f, 0.38f, 0.46f, true, true, false, false, 1.0f, true },
         // Preset 6 -
-    { "TwoToneButwGD Env 1.6-2.9 DelayTuned", AUDIO_SRC_TWOTONE, 1.65f, 0.36f, 0.48f, true, true, false, false, 1.0f, true },
+    //{ "TwoToneButwGD Env 1.6-2.9 DelayTuned", AUDIO_SRC_TWOTONE, 1.55f, 0.36f, 0.48f, true, true, false, false, 1.0f, true },
+    { "TwoToneButwGD Env 1.6-2.9 DelayTuned", AUDIO_SRC_TWOTONE, 1.55f, 0.38f, 0.46f, true, true, false, false, 1.0f, true },
         // Preset 7 -
     { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 1.85f, 0.40f, 0.46f, true, true, false, false, 1.0f, true },
         // Preset 8 -

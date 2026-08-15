@@ -14,17 +14,18 @@
 #include <stdint.h>
 #include "esp_attr.h"
 
-// Two-tone (700/1900Hz default) and single-tone (1000Hz default) sample
-// generators - selected via 't'/'s', consumed by ssb_dsp_process_sample()
-// exactly like a mic sample would be.
+ // Two-tone (700/1900Hz default) and single-tone (1000Hz default) sample
+ // generators - selected via 't'/'s', consumed by ssb_dsp_process_sample()
+ // exactly like a mic sample would be.
 float IRAM_ATTR generate_twotone_sample(void);
 float IRAM_ATTR generate_singletone_sample(void);
 
 // Runtime-adjustable two-tone frequency pair, for sweeping the pair across
 // different parts of the audio band without a recompile/reflash per band -
 // see TWOTONE_BAND_PRESETS in test_signals.cpp and the 'T' serial command.
-// Starts on the 700/1900Hz entry (matching TWOTONE_F1_HZ/F2_HZ in
-// config.h), so 't' behaves exactly as before if 'T' is never sent.
+// Starts at TWOTONE_F1_HZ/F2_HZ (config.h, 700/1900Hz) regardless of
+// where that pair sits in TWOTONE_BAND_PRESETS, so 't' behaves exactly
+// as before if 'T' is never sent.
 float test_signals_get_twotone_f1_hz(void);
 float test_signals_get_twotone_f2_hz(void);
 
@@ -50,11 +51,11 @@ float IRAM_ATTR test_signals_generate_envstep(float master_gain_linear);
 // FM isolation test ('y') - pure sinusoidal frequency modulation, envelope
 // held at a fixed full-scale constant, also bypassing
 // ssb_dsp_process_sample() entirely.
-void IRAM_ATTR test_signals_generate_fmtest(float *out_freq_dev_hz, float *out_envelope);
+void IRAM_ATTR test_signals_generate_fmtest(float* out_freq_dev_hz, float* out_envelope);
 
 // AM isolation test ('h') - pure sinusoidal amplitude modulation,
 // freq_dev_hz held at exactly 0, also bypassing ssb_dsp_process_sample()
 // entirely. master_gain_linear scales the SWING only (see the .cpp for
 // why the mean/carrier-amplitude term deliberately does not scale with
 // gain).
-void IRAM_ATTR test_signals_generate_amtest(float master_gain_linear, float *out_envelope, float *out_freq_dev_hz);
+void IRAM_ATTR test_signals_generate_amtest(float master_gain_linear, float* out_envelope, float* out_freq_dev_hz);

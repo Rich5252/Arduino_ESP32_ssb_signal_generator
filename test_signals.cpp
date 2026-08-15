@@ -6,9 +6,9 @@
 #include "test_signals.h"
 #include "config.h"
 
-// Always compiled in now (not gated on TWOTONE_TEST_MODE) since dsp_task
-// branches on the runtime audio-source selector and can switch to this at
-// any time via the 't' serial command.
+ // Always compiled in now (not gated on TWOTONE_TEST_MODE) since dsp_task
+ // branches on the runtime audio-source selector and can switch to this at
+ // any time via the 't' serial command.
 static float s_tone1_phase = 0.0f;
 static float s_tone2_phase = 0.0f;
 
@@ -20,7 +20,7 @@ static float s_tone2_phase = 0.0f;
 static volatile float s_tone1_hz = TWOTONE_F1_HZ;
 static volatile float s_tone2_hz = TWOTONE_F2_HZ;
 
-typedef struct { const char *name; float f1_hz; float f2_hz; } twotone_band_t;
+typedef struct { const char* name; float f1_hz; float f2_hz; } twotone_band_t;
 
 // Spread across roughly the same ~100-4300Hz band envelope_gdeq was
 // originally fit against (see envelope_gdeq.h) - a single tone-pair only
@@ -29,16 +29,29 @@ typedef struct { const char *name; float f1_hz; float f2_hz; } twotone_band_t;
 // envelope/phase delay mismatch, which a bulk relative-delay shift alone
 // can never fully correct (it can only slide the curve, not reshape it -
 // see the group-delay-equalizer refit discussion this was added for).
-// Index 1 (700/1900Hz) is the default, matching TWOTONE_F1_HZ/F2_HZ.
+// Kept at a consistent 200Hz spacing throughout (except the last entry,
+// see below) so each band probes a clean, comparable single point on the
+// delay-vs-frequency curve - a wider-spaced pair averages alignment
+// across its whole span instead of reading one point, which is exactly
+// why the very first sweep (using the old 700/1900Hz default, 1200Hz
+// spacing) came back as a clear outlier (2.00 samples) against the other
+// four bands' tight 1.50-1.55 sample cluster. That wide pair is kept as
+// the LAST entry for reference/comparison rather than mixed into the main
+// ordered-by-frequency sweep. Cycling order is low to high center
+// frequency: 400/800/1600/2600/3600Hz, then the wide legacy pair.
 static const twotone_band_t TWOTONE_BAND_PRESETS[] = {
-    { "300/500 (low)",        300.0f,  500.0f },
-    { "700/1900 (default)",   TWOTONE_F1_HZ, TWOTONE_F2_HZ },
-    { "1500/1700 (mid)",      1500.0f, 1700.0f },
-    { "2500/2700 (mid-high)", 2500.0f, 2700.0f },
-    { "3500/3700 (high)",     3500.0f, 3700.0f },
+    { "300/500 (low)",           300.0f,  500.0f },
+    { "700/900",                 700.0f,  900.0f },
+    { "1500/1700 (mid)",        1500.0f, 1700.0f },
+    { "2500/2700 (mid-high)",   2500.0f, 2700.0f },
+    { "3500/3700 (high)",       3500.0f, 3700.0f },
+    { "700/1900 (wide, legacy default)", TWOTONE_F1_HZ, TWOTONE_F2_HZ },
 };
 #define TWOTONE_BAND_COUNT (sizeof(TWOTONE_BAND_PRESETS) / sizeof(TWOTONE_BAND_PRESETS[0]))
-static int s_band_index = 1;   // starts on the 700/1900Hz entry above
+// Starts on the last (wide legacy) entry so the first 'T' press after boot
+// wraps around to index 0 (300/500Hz, the low end) - i.e. the first press
+// begins the ordered sweep rather than re-landing on the boot default.
+static int s_band_index = TWOTONE_BAND_COUNT - 1;
 
 float test_signals_get_twotone_f1_hz(void) { return s_tone1_hz; }
 float test_signals_get_twotone_f2_hz(void) { return s_tone2_hz; }
@@ -55,7 +68,7 @@ float IRAM_ATTR generate_twotone_sample(void)
 {
     const float two_pi = 2.0f * (float)M_PI;
     float sample = TWOTONE_AMPLITUDE * sinf(s_tone1_phase) +
-                   TWOTONE_AMPLITUDE * sinf(s_tone2_phase);
+        TWOTONE_AMPLITUDE * sinf(s_tone2_phase);
     s_tone1_phase += two_pi * s_tone1_hz / (float)SAMPLE_RATE_HZ;
     s_tone2_phase += two_pi * s_tone2_hz / (float)SAMPLE_RATE_HZ;
     if (s_tone1_phase > two_pi) s_tone1_phase -= two_pi;
@@ -97,7 +110,7 @@ float IRAM_ATTR test_signals_generate_envstep(float master_gain_linear)
     return envelope;
 }
 
-void IRAM_ATTR test_signals_generate_fmtest(float *out_freq_dev_hz, float *out_envelope)
+void IRAM_ATTR test_signals_generate_fmtest(float* out_freq_dev_hz, float* out_envelope)
 {
     // Direct sinusoidal frequency modulation, ALSO bypassing
     // ssb_dsp_process_sample() entirely - the mirror-image isolation test
@@ -116,7 +129,7 @@ void IRAM_ATTR test_signals_generate_fmtest(float *out_freq_dev_hz, float *out_e
     *out_envelope = 1.0f;   // fixed, full-scale - no AM content, phase path only
 }
 
-void IRAM_ATTR test_signals_generate_amtest(float master_gain_linear, float *out_envelope, float *out_freq_dev_hz)
+void IRAM_ATTR test_signals_generate_amtest(float master_gain_linear, float* out_envelope, float* out_freq_dev_hz)
 {
     // Direct sinusoidal amplitude modulation, ALSO bypassing
     // ssb_dsp_process_sample() entirely - mirror image of FMTEST:
