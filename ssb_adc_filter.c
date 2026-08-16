@@ -145,6 +145,79 @@ float ssb_biquad_process(ssb_biquad_t *f, float in)
     return out;
 }
 
+// ---- 4th-order variant: two cascaded 2nd-order stages ----
+
+void ssb_biquad4_reset(ssb_biquad4_t *f)
+{
+    ssb_biquad_reset(&f->stage1);
+    ssb_biquad_reset(&f->stage2);
+}
+
+float ssb_biquad4_process(ssb_biquad4_t *f, float in)
+{
+    return ssb_biquad_process(&f->stage2, ssb_biquad_process(&f->stage1, in));
+}
+
+void ssb_biquad4_lpf_init(ssb_biquad4_t *f, float fc_hz, float fs_hz)
+{
+    // Standard N=4 Butterworth per-stage Q values: Q_k = 1/(2*cos(theta_k)),
+    // theta_k = (2k-1)*pi/(2N) for k=1,2 - see header comment for why
+    // cascading these two at the SAME fc_hz is exact, not an approximation.
+    biquad_lpf_design(&f->stage1, fc_hz, fs_hz, 0.5411961f);
+    biquad_lpf_design(&f->stage2, fc_hz, fs_hz, 1.3065630f);
+}
+
+// Composite |H| in dB (sum of two stages' individual dB responses -
+// correct because biquad_mag_db() already returns 20*log10(|H|), and
+// dB adds under cascading the same way linear magnitudes multiply).
+static float biquad4_mag_db(const ssb_biquad4_t *f, float f_hz, float fs_hz)
+{
+    return biquad_mag_db(&f->stage1, f_hz, fs_hz) + biquad_mag_db(&f->stage2, f_hz, fs_hz);
+}
+
+void ssb_biquad4_chebyshev_lpf_init(ssb_biquad4_t *f, float fc_hz, float fs_hz, float ripple_db)
+{
+    const float N = 4.0f;
+    float epsilon = sqrtf(powf(10.0f, ripple_db / 10.0f) - 1.0f);
+    float v       = (1.0f / N) * asinhf(1.0f / epsilon);
+
+    // Pole-pair angles for k=1,2 (N=4): theta_k = (2k-1)*pi/(2N).
+    float theta1 = (float)M_PI / 8.0f;         // k=1
+    float theta2 = 3.0f * (float)M_PI / 8.0f;  // k=2
+
+    // Each pole pair -> its own (omega0, Q), normalized to the ripple-edge
+    // Omega_p=1 prototype (real/imag parts of the pole on the Chebyshev
+    // ellipse: alpha=sinh(v)*sin(theta), beta=cosh(v)*cos(theta)).
+    float alpha1 = sinhf(v) * sinf(theta1), beta1 = coshf(v) * cosf(theta1);
+    float alpha2 = sinhf(v) * sinf(theta2), beta2 = coshf(v) * cosf(theta2);
+    float omega0_1 = sqrtf(alpha1 * alpha1 + beta1 * beta1);
+    float omega0_2 = sqrtf(alpha2 * alpha2 + beta2 * beta2);
+    float Q1 = omega0_1 / (2.0f * alpha1);
+    float Q2 = omega0_2 / (2.0f * alpha2);
+
+    // Bisect a single shared frequency-scale factor S so the CASCADED
+    // response's true -3dB point lands at fc_hz - each stage's own center
+    // frequency is fc_hz*S*omega0_k (keeping the two stages' relative
+    // spacing fixed, exactly as the prototype's pole geometry dictates,
+    // while sliding the whole pair to hit the target). Same reasoning and
+    // iteration count as ssb_biquad_chebyshev_lpf_init()'s single-stage
+    // bisection - see that function's comment.
+    float lo = 0.3f, hi = 1.2f;
+    for (int i = 0; i < 40; i++) {
+        float mid = 0.5f * (lo + hi);
+        biquad_lpf_design(&f->stage1, fc_hz * mid * omega0_1, fs_hz, Q1);
+        biquad_lpf_design(&f->stage2, fc_hz * mid * omega0_2, fs_hz, Q2);
+        float mag_db = biquad4_mag_db(f, fc_hz, fs_hz);
+        if (mag_db > -3.0103f) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    // *f already holds the last trial design from inside the loop (same
+    // "close enough after 40 bisections" reasoning as the 2nd-order case).
+}
+
 // ---- Fixed-point (Q15) variant - integer only, safe to call from ISR ----
 
 static inline int32_t round_to_q15(float x)

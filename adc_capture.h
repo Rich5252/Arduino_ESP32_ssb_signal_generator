@@ -109,35 +109,48 @@
 // this is cheap additional margin on top.
 #define ADC_CONT_BUF_BYTES        16384  // ~4096 samples, ~50ms headroom @ 80kHz
 
-// 2nd-order LPF applied per raw sample in adc_conv_done_cb's downstream
-// consumer, replacing the old N=16 boxcar average - see the AVERAGING
-// comment above. Sits at the top of the voice band on purpose (same
-// reasoning the old 5kHz boxcar corner used): filtering broadband ADC
-// noise without eating wanted audio. Real tuning knob now - not yet
+// 4th-order LPF (two cascaded biquads, ssb_biquad4_t - see
+// ssb_adc_filter.h) applied per raw sample in adc_conv_done_cb's
+// downstream consumer, replacing the old N=16 boxcar average - see the
+// AVERAGING comment above. Sits at the top of the voice band on purpose
+// (same reasoning the old 5kHz boxcar corner used): filtering broadband
+// ADC noise without eating wanted audio. Real tuning knob now - not yet
 // verified by ear or spectrum analyser with the AD9851 in the loop.
+//
+// Order matters here specifically because adc_capture_read_next_sample()
+// decimates 80kHz down to SAMPLE_RATE_HZ (16kHz) by simply keeping every
+// 5th filtered sample - so anything from 8kHz (the post-decimation
+// Nyquist) up to 40kHz (the ADC's own Nyquist) that survives this filter
+// aliases straight back into the audio band. Started as a single 2nd-order
+// biquad; upgraded to 4th-order (cascade of two) once real hardware
+// testing showed the 2nd-order version helped and there was an obvious
+// next question ("worth more order?") - 4th order roughly DOUBLES the dB
+// rejection at every frequency above cutoff for negligible extra CPU (one
+// more biquad's worth of multiply-adds per raw ADC sample, in task
+// context where the [timing] budget has margin to spare) - e.g. at 8kHz,
+// Butterworth goes from -17.6dB (2nd order) to -35.1dB (4th order).
 //
 // Two filter families now share this same fc_hz - toggled live via serial
 // 'f' (see adc_lpf_mode_t below):
-//   - Butterworth (ssb_biquad_lpf_init): maximally flat passband, -3dB
+//   - Butterworth (ssb_biquad4_lpf_init): maximally flat passband, -3dB
 //     exactly at ADC_LPF_CUTOFF_HZ.
-//   - Chebyshev Type I (ssb_biquad_chebyshev_lpf_init), ripple
+//   - Chebyshev Type I (ssb_biquad4_chebyshev_lpf_init), ripple
 //     ADC_LPF_CHEBYSHEV_RIPPLE_DB below: genuinely "same 3dB bandwidth,
-//     faster rolloff" - ssb_biquad_chebyshev_lpf_init() internally solves
-//     (once, at init time - see ssb_adc_filter.c) for the ripple-edge
-//     parameter that puts its TRUE -3dB point at exactly ADC_LPF_CUTOFF_HZ
-//     too, same as the Butterworth filter, rather than the textbook
-//     Chebyshev convention of feeding the ripple-edge frequency directly
-//     (verified numerically to be the wrong choice here - it shifts -3dB
-//     up to ~3725Hz and is actually WEAKER than Butterworth through most
-//     of the near stopband, the opposite of "faster rolloff"). With -3dB
-//     points matched, the Chebyshev filter is monotonically MORE
-//     attenuated than Butterworth above 3000Hz - up to ~3.8dB more by
-//     10-20kHz, both converging to the same ultimate -12dB/octave slope
-//     far out (filter ORDER, not family, sets that).
+//     faster rolloff" - internally solves (once, at init time - see
+//     ssb_adc_filter.c) for the frequency scaling that puts its TRUE -3dB
+//     point at exactly ADC_LPF_CUTOFF_HZ too, same as the Butterworth
+//     filter, rather than the textbook Chebyshev convention of using the
+//     ripple-edge frequency directly (verified numerically to be the
+//     wrong choice here - see ssb_adc_filter.h). With -3dB points
+//     matched, Chebyshev is monotonically MORE attenuated than
+//     Butterworth above 3000Hz at every order - at 4th order, e.g. -47.7dB
+//     vs -35.1dB at 8kHz, both converging to the same ultimate
+//     -24dB/octave slope far out (filter ORDER, not family, sets that).
 #define ADC_LPF_CUTOFF_HZ             3000.0f
-#define ADC_LPF_CHEBYSHEV_RIPPLE_DB   1.0f   // standard/commonly-cited spec; small (~0.7dB peak)
-                                              // in-band ripple bump in exchange for the steeper
-                                              // rolloff above - inconsequential for mic audio
+#define ADC_LPF_CHEBYSHEV_RIPPLE_DB   1.0f   // standard/commonly-cited spec; small (~1.4dB peak
+                                              // at 4th order) in-band ripple bump in exchange for
+                                              // the steeper rolloff above - inconsequential for
+                                              // mic audio
 
 // Raw ADC samples cross the ISR->task boundary through a FIFO as plain
 // integers - the ISR does NO filtering at all, just copies. This

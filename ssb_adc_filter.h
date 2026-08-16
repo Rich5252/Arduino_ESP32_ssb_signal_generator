@@ -78,6 +78,50 @@ float ssb_biquad_process(ssb_biquad_t *f, float in);
 // Reset filter state (e.g. if restarting capture) without recomputing coeffs.
 void ssb_biquad_reset(ssb_biquad_t *f);
 
+// ---- 4th-order variant: two cascaded 2nd-order stages ----
+//
+// A cascade of two independently-bilinear-transformed 2nd-order sections
+// is mathematically exact for a true 4th-order digital filter (the
+// bilinear transform's z<->s substitution is applied to a rational
+// function that's already factored into 2nd-order sections - factoring
+// commutes with substitution, so this isn't an approximation of a "real"
+// 4th-order design, it IS one), same technique used throughout audio DSP
+// to build higher-order filters out of RBJ-style biquad stages.
+typedef struct {
+    ssb_biquad_t stage1, stage2;
+} ssb_biquad4_t;
+
+void ssb_biquad4_reset(ssb_biquad4_t *f);
+
+// Process one sample through both cascaded stages in order. Same
+// task-context-only restriction as ssb_biquad_process() (float ops).
+float ssb_biquad4_process(ssb_biquad4_t *f, float in);
+
+// 4th-order Butterworth: both stages share the SAME fc_hz (true -3dB
+// point, same convention as ssb_biquad_lpf_init()) but different Q -
+// the standard per-stage Butterworth pole-angle Qs for N=4:
+// Q1=1/(2*cos(pi/8))=0.541196 (the more heavily damped stage), Q2=1/(2*
+// cos(3*pi/8))=1.306563 (the more resonant stage; cascaded, their peaking
+// cancels the other's rolloff-shoulder to give the maximally-flat result).
+// Cascading two RBJ biquads at the same fc with these two Qs reproduces
+// the true 4th-order Butterworth exactly - no bisection/correction needed
+// (verified numerically: composite -3dB lands within <1e-6 of fc_hz as-is).
+void ssb_biquad4_lpf_init(ssb_biquad4_t *f, float fc_hz, float fs_hz);
+
+// 4th-order Chebyshev Type I, ripple_db passband ripple. UNLIKE the
+// Butterworth cascade above, the two stages are NOT at the same
+// frequency - a Chebyshev prototype's poles sit on an ellipse, not a
+// circle, so each stage gets its own center frequency AND its own Q,
+// both derived from the ripple spec (see ssb_adc_filter.c for the
+// pole-pair math). fc_hz has the same meaning as everywhere else in this
+// file: the TRUE -3dB frequency of the composite (cascaded) response,
+// solved via the same one-time bisection technique
+// ssb_biquad_chebyshev_lpf_init() uses (~40 iterations at init time,
+// applied as a single shared frequency-scale factor across both stages
+// so their relative spacing - set by the ripple/order math - stays
+// correct while the whole pair slides to hit the target -3dB point).
+void ssb_biquad4_chebyshev_lpf_init(ssb_biquad4_t *f, float fc_hz, float fs_hz, float ripple_db);
+
 // ---- Fixed-point (Q15) variant - ISR-safe, integer only ----
 
 #define SSB_BIQUAD_FIXED_SHIFT   15   // Q15: coefficients scaled by 1<<15

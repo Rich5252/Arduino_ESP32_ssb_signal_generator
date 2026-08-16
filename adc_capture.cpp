@@ -21,14 +21,16 @@ static volatile uint16_t s_adc_fifo[ADC_FIFO_SIZE];
 static volatile uint32_t s_adc_fifo_head = 0;   // written only by adc_conv_done_cb (ISR)
 static volatile uint32_t s_adc_fifo_tail = 0;   // written only by adc_capture_read_next_sample() (dsp_task)
 
-// Two float biquads, both always initialized - safe here since only ever
-// called from dsp_task now, never from the ISR (which stays integer-only,
-// see adc_conv_done_cb). Only one is actually used per sample, selected by
-// s_adc_lpf_mode below; keeping both initialized means switching modes
-// live never needs a re-init, only a state reset (see the mode-transition
-// handling in adc_capture_set_lpf_mode()).
-static ssb_biquad_t s_adc_lpf_butterworth;
-static ssb_biquad_t s_adc_lpf_chebyshev;
+// Two 4th-order float biquad cascades (ssb_biquad4_t - two cascaded
+// 2nd-order stages each, see ssb_adc_filter.h), both always initialized -
+// safe here since only ever called from dsp_task now, never from the ISR
+// (which stays integer-only, see adc_conv_done_cb). Only one is actually
+// used per sample, selected by s_adc_lpf_mode below; keeping both
+// initialized means switching modes live never needs a re-init, only a
+// state reset (see the mode-transition handling in
+// adc_capture_set_lpf_mode()).
+static ssb_biquad4_t s_adc_lpf_butterworth;
+static ssb_biquad4_t s_adc_lpf_chebyshev;
 
 // Live OFF/Butterworth/Chebyshev toggle for the ADC LPF, via serial 'f' -
 // see serial_commands.cpp. Lets you compare filtered-vs-raw (or one filter
@@ -149,14 +151,14 @@ void adc_capture_init(void)
     ESP_ERROR_CHECK(adc_continuous_config(s_adc, &dig_cfg));
 
     // Must happen before dsp_task can possibly start draining the FIFO -
-    // adc_capture_read_next_sample() calls ssb_biquad_process() on
+    // adc_capture_read_next_sample() calls ssb_biquad4_process() on
     // whichever filter is selected every tick once mic mode is active.
     // Both are initialized unconditionally regardless of the current mode,
     // so switching modes live (via 'f') never needs a re-init. Fine to
     // init here (task context, at startup).
-    ssb_biquad_lpf_init(&s_adc_lpf_butterworth, ADC_LPF_CUTOFF_HZ, (float)ADC_CONT_SAMPLE_FREQ_HZ);
-    ssb_biquad_chebyshev_lpf_init(&s_adc_lpf_chebyshev, ADC_LPF_CUTOFF_HZ, (float)ADC_CONT_SAMPLE_FREQ_HZ,
-                                   ADC_LPF_CHEBYSHEV_RIPPLE_DB);
+    ssb_biquad4_lpf_init(&s_adc_lpf_butterworth, ADC_LPF_CUTOFF_HZ, (float)ADC_CONT_SAMPLE_FREQ_HZ);
+    ssb_biquad4_chebyshev_lpf_init(&s_adc_lpf_chebyshev, ADC_LPF_CUTOFF_HZ, (float)ADC_CONT_SAMPLE_FREQ_HZ,
+                                    ADC_LPF_CHEBYSHEV_RIPPLE_DB);
 
     // Must register before starting - the driver returns ESP_ERR_INVALID_STATE
     // if you try to add a callback while already running.
@@ -256,10 +258,10 @@ float IRAM_ATTR adc_capture_read_next_sample(void)
         float raw = (float)s_adc_fifo[tail];
         switch (mode) {
             case ADC_LPF_MODE_BUTTERWORTH:
-                s_last_filtered_adc = ssb_biquad_process(&s_adc_lpf_butterworth, raw);
+                s_last_filtered_adc = ssb_biquad4_process(&s_adc_lpf_butterworth, raw);
                 break;
             case ADC_LPF_MODE_CHEBYSHEV:
-                s_last_filtered_adc = ssb_biquad_process(&s_adc_lpf_chebyshev, raw);
+                s_last_filtered_adc = ssb_biquad4_process(&s_adc_lpf_chebyshev, raw);
                 break;
             case ADC_LPF_MODE_OFF:
             default:
@@ -310,9 +312,9 @@ void adc_capture_set_lpf_mode(adc_lpf_mode_t mode)
     // glitching every time.
     if (mode != prev) {
         if (mode == ADC_LPF_MODE_BUTTERWORTH) {
-            ssb_biquad_reset(&s_adc_lpf_butterworth);
+            ssb_biquad4_reset(&s_adc_lpf_butterworth);
         } else if (mode == ADC_LPF_MODE_CHEBYSHEV) {
-            ssb_biquad_reset(&s_adc_lpf_chebyshev);
+            ssb_biquad4_reset(&s_adc_lpf_chebyshev);
         }
         // Switching TO off needs no reset - raw passthrough has no state.
     }
