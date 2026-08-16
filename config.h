@@ -52,6 +52,15 @@
                                         // points (e.g. envelope_predistort.h's calibration table)
                                         // without needing 10 presses of '+'/'-' to move 1dB
 
+// Mic-path DC-blocking single-pole filter's time constant, in seconds -
+// dsp_task computes dc_alpha = expf(-1.0f / (SAMPLE_RATE_HZ *
+// DC_BLOCK_TIME_CONSTANT_S)) from this at startup, instead of hardcoding
+// the per-sample coefficient directly, so it keeps the same real-world
+// cutoff regardless of SAMPLE_RATE_HZ. Value derived from the original
+// hardcoded dc_alpha=0.995 @ 10000Hz: tau = -1/(Fs*ln(alpha)) =
+// -1/(10000*ln(0.995)) ~= 0.019950s.
+#define DC_BLOCK_TIME_CONSTANT_S 0.019950f
+
 // ---- PWM comparison path enable flag. Defined here (before any header
 // that depends on it) rather than down in envelope_output.h - #if needs
 // this to already be known wherever "driver/ledc.h" gets included. ----
@@ -66,14 +75,38 @@
 #define TIMING_DEBUG_ENABLED 1
 #define TIMING_DEBUG_GPIO     4   // within the board's easy-access GPIO1-13 range; not otherwise used
 
-#define SAMPLE_RATE_HZ     10000u  // was 9600 - didn't divide either 80000 (ADC) or 2000000
-                                    // (gptimer resolution_hz) evenly, causing a genuine ~4.8%
-                                    // ADC_SAMPLES_PER_TICK mismatch (true_ratio measured 8.387
-                                    // vs nominal 8) plus imprecise gptimer alarm timing. 10000
-                                    // divides both cleanly (80000/10000=8, 2000000/10000=200)
-                                    // for almost the same period (100us vs 104us) - restores
-                                    // the FIFO's exact-ratio assumption the catch-up logic
-                                    // depends on for smooth operation.
+#define SAMPLE_RATE_HZ     16000u  // was 9600 (see below), then 10000 for a long stretch, now
+                                    // raised to 16000 once the AD9851 write path (bit-bang +
+                                    // fast register writes, see AD9851.c) freed up enough
+                                    // real-time budget: at 10000 write_us alone was ~50-52us of
+                                    // the 100us period; the bit-bang rewrite cut that to ~25us,
+                                    // and with adc+dsp added (~45us total, measured via
+                                    // [timing]) there was real headroom to spend. 16000 is the
+                                    // next value up from 10000 that still divides both 80000
+                                    // (ADC) and 2000000 (gptimer resolution_hz) evenly - the
+                                    // only other clean option below 20000 - see below for why
+                                    // that divisibility matters, and why 20000 itself was ruled
+                                    // out (period drops to 50us, leaving too little margin
+                                    // against the ~12-20us of wakeup jitter already measured).
+                                    //
+                                    // IMPORTANT: SAMPLE_RATE_HZ isn't just this #define - see
+                                    // envelope_gdeq.h's ENV_GDEQ_A1/A2 (fitted separately per
+                                    // Fs, #error's out at compile time for any value other than
+                                    // 10000/16000), settings.h's relative_delay_samples presets
+                                    // (rescaled by the Fs ratio when this last changed, but only
+                                    // an approximation - see that file's header note), and
+                                    // dsp_task's dc_alpha (now derived from DC_BLOCK_TIME_CONSTANT_S
+                                    // below rather than hardcoded, so it doesn't need touching).
+                                    //
+                                    // Original 9600->10000 change: 9600 didn't divide either
+                                    // 80000 (ADC) or 2000000 (gptimer resolution_hz) evenly,
+                                    // causing a genuine ~4.8% ADC_SAMPLES_PER_TICK mismatch
+                                    // (true_ratio measured 8.387 vs nominal 8) plus imprecise
+                                    // gptimer alarm timing. 10000 divided both cleanly
+                                    // (80000/10000=8, 2000000/10000=200) - restored the FIFO's
+                                    // exact-ratio assumption the catch-up logic depends on for
+                                    // smooth operation; 16000 keeps that same property
+                                    // (80000/16000=5, 2000000/16000=125).
 #define HILBERT_TAPS       65   // was briefly tested at 129 to check whether Hilbert filter
                                  // approximation accuracy was the source of the IMD floor that
                                  // tracks 1:1 with signal level below -6dB - real hardware A/B

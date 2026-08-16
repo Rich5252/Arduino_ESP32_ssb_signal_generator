@@ -147,9 +147,12 @@ static bool IRAM_ATTR on_timer_alarm(gptimer_handle_t timer, const gptimer_alarm
 // header.
 static void IRAM_ATTR dsp_task(void* arg)
 {
-    // Simple DC-blocking single-pole high-pass state (mic path only)
+    // Simple DC-blocking single-pole high-pass state (mic path only).
+    // dc_alpha is derived from DC_BLOCK_TIME_CONSTANT_S (config.h) rather
+    // than a hardcoded per-sample constant, so the real-world cutoff stays
+    // the same regardless of SAMPLE_RATE_HZ.
     float dc_estimate = 0.0f;
-    const float dc_alpha = 0.995f;
+    const float dc_alpha = expf(-1.0f / (SAMPLE_RATE_HZ * DC_BLOCK_TIME_CONSTANT_S));
 
 #if AD9851_ATTACHED
     // One-time throwaway SPI transfer, BEFORE the real-time loop below

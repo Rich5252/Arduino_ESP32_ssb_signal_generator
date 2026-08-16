@@ -77,13 +77,29 @@ typedef struct
 // Pre-defined settings
 // -----------------------------------------------------------------------------
 
+// relative_delay_samples below was tuned by ear/scope at SAMPLE_RATE_HZ=10000
+// and is stored as a raw sample count, not a time - so when SAMPLE_RATE_HZ
+// was raised to 16000, every value here was rescaled by 16000/10000=1.6 to
+// preserve the same REAL-TIME delay (e.g. 1.9 samples @ 10000Hz = 190us ->
+// 3.04 samples @ 16000Hz, still 190us). This is only a first-order
+// approximation, for two reasons: (1) it's a straight proportional scale of
+// a by-ear/scope-tuned value, not a re-measurement; (2) more importantly,
+// envelope_gdeq's own contributed delay is NOT the same fraction of a
+// sample at both rates - the 16000Hz-fitted ENV_GDEQ_A1/A2 (see
+// envelope_gdeq.h) add ~163us of mean delay vs. the 10000Hz fit's ~265us,
+// a real ~102us (~1.6 samples @ 16000Hz) reduction independent of this
+// rescale. So for the env_gdeq_enable=true presets specifically, expect the
+// true re-tuned optimum to land LOWER (less positive) than the naive x1.6
+// value below by roughly that amount - a starting hint for '['/']'
+// re-tuning, not a substitute for it. Presets with env_gdeq_enable=false
+// aren't affected by that second factor.
 static const PersistentSettings settingsPresets[10] =
 {
     // Preset 0 - Normal microphone operation
     {
         "Micr",
         AUDIO_SRC_MIC,     // audio_source
-        1.9f,               // relative_delay_samples
+        3.04f,               // relative_delay_samples (was 1.9f @ 10000Hz)
         0.32f,               // env_pwm_offset
         0.8f,               // env_pwm_scale
         true,               // env_gdeq_enable
@@ -98,7 +114,7 @@ static const PersistentSettings settingsPresets[10] =
     {
         "TwoToneButwGD",
         AUDIO_SRC_TWOTONE,
-        1.85f,               // relative_delay_samples
+        2.96f,               // relative_delay_samples (was 1.85f @ 10000Hz)
         0.08f,               // env_pwm_offset
         0.84f,               // env_pwm_scale
         true,                // env_gdeq_enable
@@ -113,7 +129,7 @@ static const PersistentSettings settingsPresets[10] =
     {
         "TwoToneButwNoGD",
         AUDIO_SRC_TWOTONE,
-        -0.6f,               // relative_delay_samples
+        -0.96f,               // relative_delay_samples (was -0.6f @ 10000Hz)
         0.04f,               // env_pwm_offset
         0.82f,               // env_pwm_scale
         false,                // env_gdeq_enable
@@ -125,8 +141,8 @@ static const PersistentSettings settingsPresets[10] =
     },
 
     // Preset 3 - Envelope / PWM test
-        { "BesselNoGD", AUDIO_SRC_TWOTONE, -0.60f, 0.00f, 0.90f, false, true, false, false, 2.0f, true },
-        
+        { "BesselNoGD", AUDIO_SRC_TWOTONE, -0.96f, 0.00f, 0.90f, false, true, false, false, 2.0f, true },  // was -0.60f @ 10000Hz
+
                         // relative_delay_samples
                        // env_pwm_offset
                        // env_pwm_scale
@@ -138,24 +154,23 @@ static const PersistentSettings settingsPresets[10] =
                         // ad9851_output_enable
 
     // Preset 4 - Diagnostic / raw ADC
-        { "AM-ButwGd", AUDIO_SRC_AMTEST, 1.85f, 0.08f, 0.84f, true, true, false, false, 1.0f, true },
+        { "AM-ButwGd", AUDIO_SRC_AMTEST, 2.96f, 0.08f, 0.84f, true, true, false, false, 1.0f, true },  // was 1.85f @ 10000Hz
 
     // Preset 5 -
-    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 1.85f, 0.36f, 0.48f, true, true, false, false, 1.0f, true },
-    //{ "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 1.85f, 0.38f, 0.46f, true, true, false, false, 1.0f, true },
+    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.48f, 0.40f, 0.42f, true, true, false, false, 1.0f, true },  // was 1.55f @ 10000Hz
+
         // Preset 6 -
-    { "TwoToneButwGD Env 1.6-2.9 DelayTuned", AUDIO_SRC_TWOTONE, 1.55f, 0.36f, 0.48f, true, true, false, false, 1.0f, true },
-    //{ "TwoToneButwGD Env 1.6-2.9 DelayTuned", AUDIO_SRC_TWOTONE, 1.55f, 0.38f, 0.46f, true, true, false, false, 1.0f, true },
+    { "TwoToneButwGD Env 1.6-2.9 DelayTuned", AUDIO_SRC_TWOTONE, 2.64f, 0.36f, 0.48f, true, true, false, false, 1.0f, true },  // was 1.65f @ 10000Hz
         // Preset 7 -
-    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 1.85f, 0.40f, 0.46f, true, true, false, false, 1.0f, true },
+    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.96f, 0.40f, 0.46f, true, true, false, false, 1.0f, true },  // was 1.85f @ 10000Hz
         // Preset 8 -
-    { "FM Env 2.2", AUDIO_SRC_FMTEST, 1.85f, 0.12f, 0.48f, true, true, false, false, 0.0f, true },
+    { "FM Env 2.2", AUDIO_SRC_FMTEST, 2.96f, 0.12f, 0.48f, true, true, false, false, 0.0f, true },  // was 1.85f @ 10000Hz
         // Preset 9 -
-    { "AM Env = 1.6 - 2.9", AUDIO_SRC_AMTEST, 1.90f, 0.28f, 0.70f, true, true, true, true, -4.0f, true }
+    { "AM Env = 1.6 - 2.9", AUDIO_SRC_AMTEST, 3.04f, 0.28f, 0.70f, true, true, true, true, -4.0f, true }  // was 1.90f @ 10000Hz
 };
 
 // If this array's size ever changes, ssb_mic_test.ino's serial handler
-// (the `c >= '0' && c <= '4'` preset-select block in loop(), and the
+// (the `c >= '0' && c <= '9'` preset-select block in loop(), and the
 // boot-banner preset listing in setup()) needs its range updated to
 // match - this catches a silent mismatch at compile time instead of
 // leaking a stale range (missing the new last preset, or indexing past

@@ -133,9 +133,9 @@
 #define ADC_FIFO_MASK   (ADC_FIFO_SIZE - 1)
 
 // How many raw ADC samples dsp_task nominally consumes from the FIFO
-// each tick - the exact Fs_adc/Fs_dsp ratio. 80000/10000 = 8 exactly; if
-// either rate ever changes, check this stays an integer division with
-// zero remainder.
+// each tick - the exact Fs_adc/Fs_dsp ratio. 80000/16000 = 5 exactly (was
+// 80000/10000 = 8 before SAMPLE_RATE_HZ was raised); if either rate ever
+// changes, check this stays an integer division with zero remainder.
 #define ADC_SAMPLES_PER_TICK       (ADC_CONT_SAMPLE_FREQ_HZ / SAMPLE_RATE_HZ)
 
 // CATCH-UP THRESHOLD - separate from the nominal rate above. This is the

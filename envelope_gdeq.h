@@ -27,33 +27,52 @@
  * spread of (analog + digital) combined group delay over 100-4300Hz (the
  * two-tone fundamentals, the 1200Hz beat and its harmonics up to the 4th,
  * and the +4300Hz 5th-order IMD product - see project history for why that
- * product specifically matters). Result:
- *   - Analog filter alone: 29.8us peak-to-peak over that band (the real
- *     sim's dispersion is worse than the 13.2us/23.3us figures from
- *     earlier idealized-model estimates - this supersedes those now that
- *     real sim data is in hand).
- *   - Single all-pass section, best case: 19.2us - barely better than
- *     nothing, because the analog delay curve is NON-MONOTONIC (rises
- *     from 66us at 100Hz to a ~77.6us peak near 2150Hz, then falls to
- *     48us at 4300Hz) and one section can only ever produce a monotonic
- *     delay curve (see ssb_allpass1_t's doc comment).
- *   - Two sections, opposite-sign coefficients: 0.85us peak-to-peak - a
- *     ~35x improvement over the analog filter alone, and better than the
- *     Bessel filter's own measured 2.7us spread.
- * NOT YET VALIDATED ON REAL HARDWARE - this is a numerically-fitted
- * prediction against a simulated filter response, the same status the
- * Bessel filter's LTspice design had before real hardware confirmed it.
+ * product specifically matters, and group_delay_fit_notes.md for the fit
+ * script/method in full, including the SAMPLE_RATE_HZ=16000 refit below).
+ * Analog filter alone: 29.8us peak-to-peak over that band, unchanged by Fs
+ * (the real sim's dispersion is worse than the 13.2us/23.3us figures from
+ * earlier idealized-model estimates - this supersedes those now that real
+ * sim data is in hand). The DIGITAL fit result depends on SAMPLE_RATE_HZ,
+ * because a first-order all-pass section's delay curve is shaped over the
+ * full 0-Nyquist range - the same 100-4300Hz audio band is a smaller
+ * fraction of that range at a higher Fs, giving each section less
+ * available curvature per Hz to work with:
+ *   - At 10000Hz: single section best case 19.2us (barely better than
+ *     nothing - the analog curve is NON-MONOTONIC, rising from 66us at
+ *     100Hz to a ~77.6us peak near 2150Hz then falling to 48us at 4300Hz,
+ *     and one section can only ever produce a monotonic curve - see
+ *     ssb_allpass1_t's doc comment). Two sections, opposite-sign
+ *     coefficients: 0.85us peak-to-peak - a ~35x improvement over the
+ *     analog filter alone, and better than the Bessel filter's own
+ *     measured 2.7us spread. Mean added delay: ~265us (2.65 samples).
+ *   - At 16000Hz: two sections only reach 14.7us peak-to-peak - still
+ *     ~2x better than the bare analog filter, but nowhere near the
+ *     10000Hz fit's near-total flattening, for the bandwidth-fraction
+ *     reason above. (For reference, adding more cascaded sections buys
+ *     most of that back - 3 sections reached 10.1us, 4 reached 5.2us, in
+ *     exploratory fits not wired into the code below - worth revisiting
+ *     if 14.7us turns out to matter on real hardware; each extra section
+ *     is one more IRAM_ATTR multiply-add per sample, negligible against
+ *     the current [timing] budget.) Mean added delay: ~163us (2.611
+ *     samples @ 16000Hz) - NOT the same real-time delay as the 10000Hz
+ *     fit's ~265us, a genuine ~102us difference from the coefficients
+ *     themselves, independent of anything to do with sample count
+ *     scaling - see settings.h's relative_delay_samples header note.
+ * NOT YET VALIDATED ON REAL HARDWARE at either Fs - this is a
+ * numerically-fitted prediction against a simulated filter response, the
+ * same status the Bessel filter's LTspice design had before real hardware
+ * confirmed it.
  *
  * IMPORTANT SIDE EFFECT: an all-pass filter can only ADD delay, never
  * subtract it - flattening this curve pushes the envelope path's OVERALL
- * delay up by ~265us on average (2.65 samples @ 10kHz), not just its
+ * delay up (see the per-Fs mean-added-delay figures above), not just its
  * dispersion. The phase/envelope relative-delay line (see relative_delay.h,
- * '['/']') will need to be RE-TUNED FROM SCRATCH once this is enabled: the
- * theoretical starting point is roughly +2.65 samples (positive = hold
- * phase back, matching the sign convention documented at
- * relative_delay.h), a completely different regime from the old
- * best-known -0.20 to -0.25 samples found for the Bessel filter - not a
- * small tweak from that value.
+ * '['/']') will need to be RE-TUNED once this is enabled: the theoretical
+ * starting point is roughly the mean added delay above, in samples at
+ * whichever Fs is active (positive = hold phase back, matching the sign
+ * convention documented at relative_delay.h), a completely different
+ * regime from the old best-known -0.20 to -0.25 samples found for the
+ * Bessel filter - not a small tweak from that value.
  *
  * Applied unconditionally to `envelope` regardless of audio source (see
  * dsp_task in the .ino) - including ENVSTEP and AMTEST - so those
@@ -69,10 +88,27 @@
  */
 
 #include <stdbool.h>
+#include "config.h"
 #include "ssb_dsp.h"
 
+// Selected at compile time by SAMPLE_RATE_HZ (config.h) - see the fitting
+// results in the header comment above for why these AREN'T simply rescaled
+// from one Fs to the other the way a time-domain delay would be. The
+// #error is deliberate: silently running with the wrong Fs's coefficients
+// would be a subtle, hard-to-notice IMD/dispersion regression, not a
+// crash - same failure class this project has repeatedly flagged for
+// AD9851 bit-order mistakes. Add a new #elif (and a matching fit, see
+// group_delay_fit_notes.md) rather than guessing if SAMPLE_RATE_HZ ever
+// changes again.
+#if SAMPLE_RATE_HZ == 16000
+#define ENV_GDEQ_A1  -0.023900f
+#define ENV_GDEQ_A2   0.447131f
+#elif SAMPLE_RATE_HZ == 10000
 #define ENV_GDEQ_A1   0.194594f
 #define ENV_GDEQ_A2  -0.136698f
+#else
+#error "ENV_GDEQ_A1/A2 have only been fitted for SAMPLE_RATE_HZ = 10000 or 16000 - see group_delay_fit_notes.md for the fitting method to add another"
+#endif
 
 // Zeroes both all-pass sections' state and initializes their coefficients
 // (ENV_GDEQ_A1/A2 above). Call once from setup() - always, regardless of
