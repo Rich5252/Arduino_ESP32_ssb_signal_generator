@@ -109,13 +109,35 @@
 // this is cheap additional margin on top.
 #define ADC_CONT_BUF_BYTES        16384  // ~4096 samples, ~50ms headroom @ 80kHz
 
-// 2nd-order Butterworth LPF applied per raw sample in adc_conv_done_cb's
-// downstream consumer, replacing the old N=16 boxcar average - see the
-// AVERAGING comment above. Sits at the top of the voice band on purpose
-// (same reasoning the old 5kHz boxcar corner used): filtering broadband
-// ADC noise without eating wanted audio. Real tuning knob now - not yet
+// 2nd-order LPF applied per raw sample in adc_conv_done_cb's downstream
+// consumer, replacing the old N=16 boxcar average - see the AVERAGING
+// comment above. Sits at the top of the voice band on purpose (same
+// reasoning the old 5kHz boxcar corner used): filtering broadband ADC
+// noise without eating wanted audio. Real tuning knob now - not yet
 // verified by ear or spectrum analyser with the AD9851 in the loop.
-#define ADC_LPF_CUTOFF_HZ         3000.0f
+//
+// Two filter families now share this same fc_hz - toggled live via serial
+// 'f' (see adc_lpf_mode_t below):
+//   - Butterworth (ssb_biquad_lpf_init): maximally flat passband, -3dB
+//     exactly at ADC_LPF_CUTOFF_HZ.
+//   - Chebyshev Type I (ssb_biquad_chebyshev_lpf_init), ripple
+//     ADC_LPF_CHEBYSHEV_RIPPLE_DB below: genuinely "same 3dB bandwidth,
+//     faster rolloff" - ssb_biquad_chebyshev_lpf_init() internally solves
+//     (once, at init time - see ssb_adc_filter.c) for the ripple-edge
+//     parameter that puts its TRUE -3dB point at exactly ADC_LPF_CUTOFF_HZ
+//     too, same as the Butterworth filter, rather than the textbook
+//     Chebyshev convention of feeding the ripple-edge frequency directly
+//     (verified numerically to be the wrong choice here - it shifts -3dB
+//     up to ~3725Hz and is actually WEAKER than Butterworth through most
+//     of the near stopband, the opposite of "faster rolloff"). With -3dB
+//     points matched, the Chebyshev filter is monotonically MORE
+//     attenuated than Butterworth above 3000Hz - up to ~3.8dB more by
+//     10-20kHz, both converging to the same ultimate -12dB/octave slope
+//     far out (filter ORDER, not family, sets that).
+#define ADC_LPF_CUTOFF_HZ             3000.0f
+#define ADC_LPF_CHEBYSHEV_RIPPLE_DB   1.0f   // standard/commonly-cited spec; small (~0.7dB peak)
+                                              // in-band ripple bump in exchange for the steeper
+                                              // rolloff above - inconsequential for mic audio
 
 // Raw ADC samples cross the ISR->task boundary through a FIFO as plain
 // integers - the ISR does NO filtering at all, just copies. This
@@ -163,8 +185,8 @@ void adc_capture_init(void);
 
 // Pops the next batch of raw ADC samples out of the FIFO (nominal
 // ADC_SAMPLES_PER_TICK, with the same catch-up/bleed-off logic the
-// original inline block in dsp_task had), runs each through the biquad
-// (or passes it through raw if bypassed), and returns the last (most
+// original inline block in dsp_task had), runs each through the selected
+// biquad (or passes it through raw if OFF), and returns the last (most
 // recent) filtered value in ADC-code units (~0-4095) - exactly what
 // dsp_task used to keep in s_last_filtered_adc before normalizing to
 // [-1,1] and DC-blocking itself. Called once per dsp_task tick, mic mode
@@ -176,8 +198,25 @@ float IRAM_ATTR adc_capture_read_next_sample(void);
 // loop() every iteration (runs unconditionally, same as the original).
 void adc_capture_service(void);
 
-void adc_capture_set_lpf_bypass(bool bypass);
-bool adc_capture_get_lpf_bypass(void);
+// Live A/B/C toggle for the ADC anti-alias/noise LPF, via serial 'f' - see
+// serial_commands.cpp. OFF passes raw ADC samples through unchanged (was
+// the boolean "bypass=true" state before this became 3-way); BUTTERWORTH
+// and CHEBYSHEV select which of the two filters (see ADC_LPF_CUTOFF_HZ /
+// ADC_LPF_CHEBYSHEV_RIPPLE_DB above) processes the signal.
+typedef enum {
+    ADC_LPF_MODE_OFF = 0,
+    ADC_LPF_MODE_BUTTERWORTH = 1,
+    ADC_LPF_MODE_CHEBYSHEV = 2,
+} adc_lpf_mode_t;
+
+void adc_capture_set_lpf_mode(adc_lpf_mode_t mode);
+adc_lpf_mode_t adc_capture_get_lpf_mode(void);
+
+// Short human-readable name for the current mode ("off"/"Butterworth"/
+// "Chebyshev") - used by the 'f' handler's printf and the 'P' status/
+// preset-dump line, so both stay in sync with the enum automatically
+// rather than duplicating a string-selection ternary in two places.
+const char *adc_capture_lpf_mode_name(adc_lpf_mode_t mode);
 
 // Zeros every counter/watermark below (the 'r' command's ADC-side reset).
 void adc_capture_reset_diag(void);

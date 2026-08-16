@@ -150,9 +150,13 @@ void handle_serial_commands(void)
             Serial.printf("-> envelope-null floor lowered to %.2f (see envelope_floor.h)\r\n",
                           envelope_floor_get());
         } else if (c == 'f') {
-            bool bypass = !adc_capture_get_lpf_bypass();
-            adc_capture_set_lpf_bypass(bypass);
-            Serial.printf("-> ADC LPF %s\r\n", bypass ? "BYPASSED (raw)" : "active");
+            // Cycles off -> Butterworth -> Chebyshev -> off. See
+            // adc_capture.h's adc_lpf_mode_t / ADC_LPF_CUTOFF_HZ /
+            // ADC_LPF_CHEBYSHEV_RIPPLE_DB for what each mode actually does.
+            adc_lpf_mode_t mode = adc_capture_get_lpf_mode();
+            mode = (adc_lpf_mode_t)((mode + 1) % 3);
+            adc_capture_set_lpf_mode(mode);
+            Serial.printf("-> ADC LPF: %s\r\n", adc_capture_lpf_mode_name(mode));
         } else if (c == 'v') {
             diagnostics_toggle_muted();
         } else if (c == 'r') {
@@ -202,7 +206,7 @@ void handle_serial_commands(void)
             // Prints every current lever as a single comma-separated line,
             // in exactly PersistentSettings's field order (name,
             // audio_source, relative_delay_samples, env_pwm_offset,
-            // env_pwm_scale, env_gdeq_enable, adc_lpf_bypass, eq_enable,
+            // env_pwm_scale, env_gdeq_enable, adc_lpf_mode, eq_enable,
             // compressor_enable, master_gain_db, ad9851_output_enable) -
             // wrapped in braces with a trailing comma so the whole line
             // can be pasted directly into settingsPresets[] in settings.h
@@ -234,6 +238,12 @@ void handle_serial_commands(void)
             float rel_delay = 0.0f;
             bool rf_enabled = true;
 #endif
+            // adc_lpf_mode prints as the enum constant name (ADC_LPF_MODE_OFF
+            // etc.), not a string literal - it's a valid C identifier, so
+            // the pasted line compiles directly into settingsPresets[].
+            static const char *k_adc_lpf_mode_enum_name[3] = {
+                "ADC_LPF_MODE_OFF", "ADC_LPF_MODE_BUTTERWORTH", "ADC_LPF_MODE_CHEBYSHEV"
+            };
             Serial.println("-> settings line (paste into settingsPresets[] in settings.h, then rename \"Live\"):");
             Serial.printf("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s },\r\n",
                           audio_source_enum_name(dsp_state_get_audio_source()),
@@ -241,7 +251,7 @@ void handle_serial_commands(void)
                           envelope_output_get_pwm_offset(),
                           envelope_output_get_pwm_scale(),
                           envelope_gdeq_get_enabled() ? "true" : "false",
-                          adc_capture_get_lpf_bypass() ? "true" : "false",
+                          k_adc_lpf_mode_enum_name[adc_capture_get_lpf_mode()],
                           ssb_dsp_get_eq_enabled(dsp_state_get_ssb()) ? "true" : "false",
                           ssb_dsp_get_compressor_enabled(dsp_state_get_ssb()) ? "true" : "false",
                           ssb_dsp_get_master_gain_db(dsp_state_get_ssb()),
@@ -268,7 +278,7 @@ void handle_serial_commands(void)
             // currently have gdeq on, so switching between them keeps the
             // filter running continuously, not jumping every time).
             envelope_gdeq_set_enabled(p.env_gdeq_enable);
-            adc_capture_set_lpf_bypass(p.adc_lpf_bypass);
+            adc_capture_set_lpf_mode(p.adc_lpf_mode);
 
             ssb_dsp_set_eq_enabled(dsp_state_get_ssb(), p.eq_enable);
             ssb_dsp_set_compressor_enabled(dsp_state_get_ssb(), p.compressor_enable);

@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "adc_capture.h"   // adc_lpf_mode_t
 
 
 // Runtime switch between test signals and live mic input, toggled from
@@ -61,7 +62,11 @@ typedef struct
     float env_pwm_scale;
 
     bool env_gdeq_enable;
-    bool adc_lpf_bypass;
+    adc_lpf_mode_t adc_lpf_mode;   // was a plain bool "adc_lpf_bypass" - migrated to a 3-state
+                                    // enum (off/Butterworth/Chebyshev) when the Chebyshev filter
+                                    // option was added; every existing preset had bypass=true,
+                                    // so this was a purely mechanical true->ADC_LPF_MODE_OFF
+                                    // migration with zero behavior change to any preset below
 
     bool eq_enable;
     bool compressor_enable;
@@ -103,7 +108,7 @@ static const PersistentSettings settingsPresets[10] =
         0.32f,               // env_pwm_offset
         0.8f,               // env_pwm_scale
         true,               // env_gdeq_enable
-        true,              // adc_lpf_bypass
+        ADC_LPF_MODE_OFF,   // adc_lpf_mode (was adc_lpf_bypass=true)
         true,               // eq_enable
         true,               // compressor_enable
         -2.0f,               // master_gain_db
@@ -118,7 +123,7 @@ static const PersistentSettings settingsPresets[10] =
         0.08f,               // env_pwm_offset
         0.84f,               // env_pwm_scale
         true,                // env_gdeq_enable
-        true,                // adc_lpf_bypass
+        ADC_LPF_MODE_OFF,    // adc_lpf_mode (was adc_lpf_bypass=true)
         false,               // eq_enable
         false,               // compressor_enable
         +1.0f,               // master_gain_db
@@ -133,7 +138,7 @@ static const PersistentSettings settingsPresets[10] =
         0.04f,               // env_pwm_offset
         0.82f,               // env_pwm_scale
         false,                // env_gdeq_enable
-        true,                // adc_lpf_bypass
+        ADC_LPF_MODE_OFF,    // adc_lpf_mode (was adc_lpf_bypass=true)
         false,               // eq_enable
         false,               // compressor_enable
         +1.0f,               // master_gain_db
@@ -141,32 +146,32 @@ static const PersistentSettings settingsPresets[10] =
     },
 
     // Preset 3 - Envelope / PWM test
-        { "BesselNoGD", AUDIO_SRC_TWOTONE, -0.96f, 0.00f, 0.90f, false, true, false, false, 2.0f, true },  // was -0.60f @ 10000Hz
+        { "BesselNoGD", AUDIO_SRC_TWOTONE, -0.96f, 0.00f, 0.90f, false, ADC_LPF_MODE_OFF, false, false, 2.0f, true },  // was -0.60f @ 10000Hz; adc_lpf_bypass=true
 
                         // relative_delay_samples
                        // env_pwm_offset
                        // env_pwm_scale
                         // env_gdeq_enable
-                        // adc_lpf_bypass
+                        // adc_lpf_mode
                        // eq_enable
                        // compressor_enable
                        // master_gain_db
                         // ad9851_output_enable
 
     // Preset 4 - Diagnostic / raw ADC
-        { "AM-ButwGd", AUDIO_SRC_AMTEST, 2.96f, 0.08f, 0.84f, true, true, false, false, 1.0f, true },  // was 1.85f @ 10000Hz
+        { "AM-ButwGd", AUDIO_SRC_AMTEST, 2.96f, 0.08f, 0.84f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
 
     // Preset 5 -
-    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.48f, 0.40f, 0.42f, true, true, false, false, 1.0f, true },  // was 1.55f @ 10000Hz
+    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.48f, 0.40f, 0.42f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true },  // was 1.55f @ 10000Hz; adc_lpf_bypass=true
 
         // Preset 6 -
-    { "TwoToneButwGD Env 1.6-2.9 DelayTuned", AUDIO_SRC_TWOTONE, 2.64f, 0.36f, 0.48f, true, true, false, false, 1.0f, true },  // was 1.65f @ 10000Hz
+    { "TwoToneButwGD Env 1.6-2.9 DelayTuned", AUDIO_SRC_TWOTONE, 2.64f, 0.36f, 0.48f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true },  // was 1.65f @ 10000Hz; adc_lpf_bypass=true
         // Preset 7 -
-    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.96f, 0.40f, 0.46f, true, true, false, false, 1.0f, true },  // was 1.85f @ 10000Hz
+    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.96f, 0.40f, 0.46f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
         // Preset 8 -
-    { "FM Env 2.2", AUDIO_SRC_FMTEST, 2.96f, 0.12f, 0.48f, true, true, false, false, 0.0f, true },  // was 1.85f @ 10000Hz
+    { "FM Env 2.2", AUDIO_SRC_FMTEST, 2.96f, 0.12f, 0.48f, true, ADC_LPF_MODE_OFF, false, false, 0.0f, true },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
         // Preset 9 -
-    { "AM Env = 1.6 - 2.9", AUDIO_SRC_AMTEST, 3.04f, 0.28f, 0.70f, true, true, true, true, -4.0f, true }  // was 1.90f @ 10000Hz
+    { "AM Env = 1.6 - 2.9", AUDIO_SRC_AMTEST, 3.04f, 0.28f, 0.70f, true, ADC_LPF_MODE_OFF, true, true, -4.0f, true }  // was 1.90f @ 10000Hz; adc_lpf_bypass=true
 };
 
 // If this array's size ever changes, ssb_mic_test.ino's serial handler

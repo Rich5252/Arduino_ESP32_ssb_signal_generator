@@ -21,14 +21,21 @@ static volatile uint16_t s_adc_fifo[ADC_FIFO_SIZE];
 static volatile uint32_t s_adc_fifo_head = 0;   // written only by adc_conv_done_cb (ISR)
 static volatile uint32_t s_adc_fifo_tail = 0;   // written only by adc_capture_read_next_sample() (dsp_task)
 
-static ssb_biquad_t s_adc_lpf;   // float biquad - safe here since only ever called from dsp_task now,
-                                  // never from the ISR (which stays integer-only, see adc_conv_done_cb)
+// Two float biquads, both always initialized - safe here since only ever
+// called from dsp_task now, never from the ISR (which stays integer-only,
+// see adc_conv_done_cb). Only one is actually used per sample, selected by
+// s_adc_lpf_mode below; keeping both initialized means switching modes
+// live never needs a re-init, only a state reset (see the mode-transition
+// handling in adc_capture_set_lpf_mode()).
+static ssb_biquad_t s_adc_lpf_butterworth;
+static ssb_biquad_t s_adc_lpf_chebyshev;
 
-// Live A/B toggle for the ADC LPF, via serial 'f' - see serial_commands.cpp.
-// Lets you compare filtered-vs-raw on the same physical signal without a
-// rebuild, to check whether an artifact is actually coming from the
-// filter or from somewhere else entirely.
-static volatile bool s_adc_lpf_bypass = false;
+// Live OFF/Butterworth/Chebyshev toggle for the ADC LPF, via serial 'f' -
+// see serial_commands.cpp. Lets you compare filtered-vs-raw (or one filter
+// family vs the other) on the same physical signal without a rebuild, to
+// check whether an artifact is actually coming from the filter or from
+// somewhere else entirely.
+static volatile adc_lpf_mode_t s_adc_lpf_mode = ADC_LPF_MODE_OFF;
 
 // Continuity diagnostics: is the ADC stream actually gap-free at
 // ADC_CONT_SAMPLE_FREQ_HZ, or are frames being dropped? The biquad's
@@ -143,9 +150,13 @@ void adc_capture_init(void)
 
     // Must happen before dsp_task can possibly start draining the FIFO -
     // adc_capture_read_next_sample() calls ssb_biquad_process() on
-    // s_adc_lpf every tick once mic mode is active. Fine to init here
-    // (task context, at startup).
-    ssb_biquad_lpf_init(&s_adc_lpf, ADC_LPF_CUTOFF_HZ, (float)ADC_CONT_SAMPLE_FREQ_HZ);
+    // whichever filter is selected every tick once mic mode is active.
+    // Both are initialized unconditionally regardless of the current mode,
+    // so switching modes live (via 'f') never needs a re-init. Fine to
+    // init here (task context, at startup).
+    ssb_biquad_lpf_init(&s_adc_lpf_butterworth, ADC_LPF_CUTOFF_HZ, (float)ADC_CONT_SAMPLE_FREQ_HZ);
+    ssb_biquad_chebyshev_lpf_init(&s_adc_lpf_chebyshev, ADC_LPF_CUTOFF_HZ, (float)ADC_CONT_SAMPLE_FREQ_HZ,
+                                   ADC_LPF_CHEBYSHEV_RIPPLE_DB);
 
     // Must register before starting - the driver returns ESP_ERR_INVALID_STATE
     // if you try to add a callback while already running.
@@ -198,7 +209,7 @@ void adc_capture_init(void)
 float IRAM_ATTR adc_capture_read_next_sample(void)
 {
     static float s_last_filtered_adc = 2048.0f;
-    bool bypass = s_adc_lpf_bypass;
+    adc_lpf_mode_t mode = s_adc_lpf_mode;
 
     uint32_t tail = s_adc_fifo_tail;
     uint32_t head = s_adc_fifo_head;   // snapshot - ISR may still be advancing it, fine for a single consumer
@@ -243,7 +254,18 @@ float IRAM_ATTR adc_capture_read_next_sample(void)
     }
     for (uint32_t i = 0; i < to_pop; i++) {
         float raw = (float)s_adc_fifo[tail];
-        s_last_filtered_adc = bypass ? raw : ssb_biquad_process(&s_adc_lpf, raw);
+        switch (mode) {
+            case ADC_LPF_MODE_BUTTERWORTH:
+                s_last_filtered_adc = ssb_biquad_process(&s_adc_lpf_butterworth, raw);
+                break;
+            case ADC_LPF_MODE_CHEBYSHEV:
+                s_last_filtered_adc = ssb_biquad_process(&s_adc_lpf_chebyshev, raw);
+                break;
+            case ADC_LPF_MODE_OFF:
+            default:
+                s_last_filtered_adc = raw;
+                break;
+        }
         tail = (tail + 1) & ADC_FIFO_MASK;
     }
     s_adc_fifo_tail = tail;
@@ -270,14 +292,47 @@ void adc_capture_service(void)
     }
 }
 
-void adc_capture_set_lpf_bypass(bool bypass)
+void adc_capture_set_lpf_mode(adc_lpf_mode_t mode)
 {
-    s_adc_lpf_bypass = bypass;
+    adc_lpf_mode_t prev = s_adc_lpf_mode;
+
+    // Only one filter's state actually advances per sample (see the
+    // switch in adc_capture_read_next_sample()) - the OTHER filter's z1/z2
+    // sit frozen at whatever they were the last time IT was active, which
+    // could be a long time ago (or never, if this is its first use since
+    // boot - though init already zeroed it then). Switching TO a filtered
+    // mode from a DIFFERENT mode resets that filter's state first, so the
+    // first sample after switching doesn't get fed a stale/discontinuous
+    // z1/z2 - same reset-on-transition reasoning as
+    // envelope_gdeq_set_enabled()'s off->on reset. A no-op "switch" (mode
+    // unchanged, e.g. reapplying the same preset) does NOT reset, so a
+    // filter already running continues running continuously rather than
+    // glitching every time.
+    if (mode != prev) {
+        if (mode == ADC_LPF_MODE_BUTTERWORTH) {
+            ssb_biquad_reset(&s_adc_lpf_butterworth);
+        } else if (mode == ADC_LPF_MODE_CHEBYSHEV) {
+            ssb_biquad_reset(&s_adc_lpf_chebyshev);
+        }
+        // Switching TO off needs no reset - raw passthrough has no state.
+    }
+
+    s_adc_lpf_mode = mode;
 }
 
-bool adc_capture_get_lpf_bypass(void)
+adc_lpf_mode_t adc_capture_get_lpf_mode(void)
 {
-    return s_adc_lpf_bypass;
+    return s_adc_lpf_mode;
+}
+
+const char *adc_capture_lpf_mode_name(adc_lpf_mode_t mode)
+{
+    switch (mode) {
+        case ADC_LPF_MODE_BUTTERWORTH: return "Butterworth";
+        case ADC_LPF_MODE_CHEBYSHEV:   return "Chebyshev";
+        case ADC_LPF_MODE_OFF:
+        default:                      return "off";
+    }
 }
 
 void adc_capture_reset_diag(void)
