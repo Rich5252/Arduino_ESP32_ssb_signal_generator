@@ -9,6 +9,7 @@
 #include "envelope_gdeq.h"
 #include "envelope_output.h"
 #include "ssb_dsp.h"
+#include "carrier_output.h"
 #include "esp_timer.h"
 #include <Arduino.h>
 
@@ -169,6 +170,20 @@ static void print_timing_and_adc_block(uint32_t now)
     ssb_dsp_get_profile(dsp_state_get_ssb(), &prof);
     Serial.printf("[timing]   dsp breakdown: audio_fx=%u fir=%u atan2=%u sqrt=%u\r\n",
                   prof.max_audio_fx_us, prof.max_fir_us, prof.max_atan2_us, prof.max_sqrt_us);
+
+#if AD9851_ATTACHED
+    // Splits the [timing] line's write_us (dominated by the AD9851 SPI
+    // write) into CPU-side prep (FTW math + bit-reversal loop) vs. the
+    // spi_device_polling_transmit() call itself - see ad9851_profile_t
+    // (AD9851.h) and the bus-acquire-once change in ad9851_init() this
+    // is meant to validate the effect of.
+    ad9851_profile_t ad_prof;
+    carrier_output_get_profile(&ad_prof);
+    Serial.printf("[timing]   ad9851 breakdown: prep_us=%u spi_us=%u (prep+spi=%u vs. write_us=%u "
+                  "above - gap is remaining driver/call overhead)\r\n",
+                  ad_prof.max_prep_us, ad_prof.max_spi_us,
+                  ad_prof.max_prep_us + ad_prof.max_spi_us, s_dbg_max_write_us);
+#endif
 
     // Evidence for setting MAX_FREQ_DEV_HZ from real data instead of
     // guessing again - max_unclamped is the TRUE peak deviation the

@@ -151,6 +151,28 @@ static void IRAM_ATTR dsp_task(void* arg)
     float dc_estimate = 0.0f;
     const float dc_alpha = 0.995f;
 
+#if AD9851_ATTACHED
+    // One-time throwaway SPI transfer, BEFORE the real-time loop below
+    // starts - pays a one-time cost here instead of on the loop's first
+    // live tick. Confirmed via [timing]: a fresh boot showed a single
+    // ~264-265us spi_us spike (reproducible across independent reboots -
+    // a deterministic cost, not a scheduling fluke) on exactly the first
+    // dsp_task tick, causing exactly one overrun/late tick, never
+    // recurring afterward. Best explanation: carrier_output_init() (in
+    // setup(), which runs on a different core than dsp_task - see this
+    // function's own IRAM_ATTR comment above) already calls
+    // ad9851_set_frequency() once, but that only warms ITS core's
+    // i-cache; this task's own IRAM_ATTR only covers this project's own
+    // code, not the ESP-IDF spi_master driver internals underneath
+    // spi_device_polling_transmit() - those still live in flash unless
+    // CONFIG_SPI_MASTER_IN_IRAM is set, so Core 0 pays its own first-call
+    // cache-fill cost regardless of what Core 1 already ran. Harmless in
+    // practice (no one is transmitting through this before dsp_task's
+    // loop even starts), but free to eliminate here rather than on a
+    // live sample.
+    carrier_output_set_freq_dev(0.0f);
+#endif
+
     while (1) {
         // Block until the timer ISR notifies us - this sets our sample rate.
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);

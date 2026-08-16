@@ -34,6 +34,18 @@ extern "C" {
  * (e.g. via the existing [timing] instrumentation) once this is wired
  * up; don't assume it fits just because the rest of the pipeline had
  * margin before this was added.
+ *
+ * ad9851_init() acquires the SPI bus once (spi_device_acquire_bus(),
+ * never released until ad9851_deinit()) rather than letting every
+ * ad9851_set_frequency() call take/release it internally - this is a
+ * dedicated single-device bus, called up to 20000x/sec from the
+ * real-time path, so the per-call acquire/release lock overhead
+ * spi_device_polling_transmit() would otherwise pay every time is pure
+ * waste here. Measured real-world write_us has been running well above
+ * the raw 40/spi_clock_hz bit-time estimate (e.g. ~59us observed at
+ * 2MHz vs. ~20us theoretical) - see ad9851_profile_t below for splitting
+ * out how much of that gap is CPU-side prep vs. the SPI transfer itself,
+ * to find out how much this actually recovers.
  */
 
 typedef struct {
@@ -70,6 +82,25 @@ esp_err_t ad9851_init(const ad9851_config_t *cfg, ad9851_handle_t *out_handle);
  *        see the TIMING note above for how long this actually takes.
  */
 void IRAM_ATTR ad9851_set_frequency(ad9851_handle_t handle, uint32_t freq_hz);
+
+/**
+ * @brief Sub-phase timing breakdown of ad9851_set_frequency(), each a
+ *        running high-water mark in microseconds since ad9851_init() -
+ *        same pattern as ssb_dsp_profile_t (ssb_dsp.h). max_prep_us
+ *        covers the FTW multiply-shift plus the 5-byte bit-reversal
+ *        loop; max_spi_us covers just spi_device_polling_transmit()
+ *        itself. Splits what the [timing] line's write_us figure lumps
+ *        together as one number, so a slow write can be attributed to
+ *        genuine SPI clock-out time vs. CPU-side prep vs. (by
+ *        subtraction against write_us) whatever driver-call overhead
+ *        remains, instead of guessing which lever to pull.
+ */
+typedef struct {
+    uint32_t max_prep_us;
+    uint32_t max_spi_us;
+} ad9851_profile_t;
+
+void ad9851_get_profile(ad9851_handle_t handle, ad9851_profile_t *out);
 
 /**
  * @brief Enable/disable RF output via the AD9851's own power-down

@@ -43,4 +43,10 @@ uint32_t IRAM_ATTR carrier_output_set_freq_dev(float delayed_freq_dev_hz);
 bool carrier_output_get_rf_enabled(void);
 void carrier_output_set_rf_enabled(bool enable);
 
+// Thin wrapper over ad9851_get_profile() - see ad9851_profile_t (AD9851.h)
+// for what max_prep_us/max_spi_us each cover. Exposed here so
+// diagnostics.cpp doesn't need its own direct handle to the AD9851
+// module, matching how everything else in [timing] is reached.
+void carrier_output_get_profile(ad9851_profile_t *out);
+
 #endif // AD9851_ATTACHED

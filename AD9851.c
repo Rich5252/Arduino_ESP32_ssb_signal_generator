@@ -2,6 +2,7 @@
 #include "ad9851.h"
 #include "driver/gpio.h"
 #include "esp_rom_sys.h"
+#include "esp_timer.h"
 
 // Set once, based on the actual BS170 circuit used: gate driven directly
 // by the ESP32 GPIO, source to ground, drain pulled up to the AD9851
@@ -36,6 +37,16 @@ struct ad9851_s {
     // volatile for the same reason as the other cross-context flags
     // elsewhere in this project.
     volatile bool power_down;
+
+    // Sub-phase timing high-water marks - see ad9851_profile_t (AD9851.h)
+    // for what each covers. Plain (non-volatile) uint32_t, same
+    // convention ssb_dsp.c already uses for its own profile fields:
+    // written only from the real-time path, read cross-context by
+    // ad9851_get_profile() via diagnostics_service() - 32-bit-aligned
+    // reads/writes are atomic on this target and these are monotonic
+    // high-water marks, so a torn read isn't a real risk.
+    uint32_t max_prep_us;
+    uint32_t max_spi_us;
 };
 
 #define AD9851_CTRL_ENABLE_MULTIPLIER 0x01   // matches the Nano library's AD9851_ENABLE_MULTIPLIER
@@ -150,6 +161,23 @@ esp_err_t ad9851_init(const ad9851_config_t *cfg, ad9851_handle_t *out_handle)
         return err;
     }
 
+    // Acquire the SPI bus once, here, and never release it until
+    // ad9851_deinit() - this is a dedicated single-device bus (the
+    // AD9851's serial interface is the only thing on it), and
+    // ad9851_set_frequency() calls spi_device_polling_transmit() up to
+    // 20000x/sec from the real-time path. Per ESP-IDF's SPI master docs,
+    // a transmit call detects when the calling task already holds the
+    // bus (via spi_device_acquire_bus()) and skips its own internal
+    // acquire/release each time - pure overhead otherwise, on every
+    // single sample, for a lock no other device is ever contending for.
+    err = spi_device_acquire_bus(h->spi, portMAX_DELAY);
+    if (err != ESP_OK) {
+        spi_bus_remove_device(h->spi);
+        spi_bus_free(cfg->spi_host);
+        free(h);
+        return err;
+    }
+
     // Master reset. ESP32 GPIO toggling is far faster than the AD9851's
     // minimum reset pulse width needs, so 1us here is ample margin, not
     // a tight requirement.
@@ -183,6 +211,7 @@ esp_err_t ad9851_init(const ad9851_config_t *cfg, ad9851_handle_t *out_handle)
     };
     err = spi_device_polling_transmit(h->spi, &mode_select);
     if (err != ESP_OK) {
+        spi_device_release_bus(h->spi);
         spi_bus_remove_device(h->spi);
         spi_bus_free(cfg->spi_host);
         free(h);
@@ -199,6 +228,8 @@ esp_err_t ad9851_init(const ad9851_config_t *cfg, ad9851_handle_t *out_handle)
 void IRAM_ATTR ad9851_set_frequency(ad9851_handle_t handle, uint32_t freq_hz)
 {
     if (!handle) return;
+
+    int64_t t0 = esp_timer_get_time();
 
     // Multiply+shift, not freq_hz*2^32/effective_ref_hz directly - see
     // ftw_reciprocal's comment in the struct for why. Algebraically
@@ -230,6 +261,10 @@ void IRAM_ATTR ad9851_set_frequency(ad9851_handle_t handle, uint32_t freq_hz)
 #endif
     }
 
+    int64_t t1 = esp_timer_get_time();
+    uint32_t prep_us = (uint32_t)(t1 - t0);
+    if (prep_us > handle->max_prep_us) handle->max_prep_us = prep_us;
+
     spi_transaction_t t = {
         .length = 40,   // bits
         .tx_buffer = buf,
@@ -237,13 +272,27 @@ void IRAM_ATTR ad9851_set_frequency(ad9851_handle_t handle, uint32_t freq_hz)
     // Polling (not queued) transmit - blocks until done, no FreeRTOS
     // queue/semaphore involved, lowest and most deterministic latency
     // for a call sitting in the real-time sample path. buf is a local
-    // stack array, safe since this call is synchronous.
+    // stack array, safe since this call is synchronous. The bus is
+    // already held (see ad9851_init()'s spi_device_acquire_bus() call),
+    // so this call skips its own internal acquire/release.
     spi_device_polling_transmit(handle->spi, &t);
+
+    int64_t t2 = esp_timer_get_time();
+    uint32_t spi_us = (uint32_t)(t2 - t1);
+    if (spi_us > handle->max_spi_us) handle->max_spi_us = spi_us;
+}
+
+void ad9851_get_profile(ad9851_handle_t handle, ad9851_profile_t *out)
+{
+    if (!handle || !out) return;
+    out->max_prep_us = handle->max_prep_us;
+    out->max_spi_us = handle->max_spi_us;
 }
 
 void ad9851_deinit(ad9851_handle_t handle)
 {
     if (!handle) return;
+    spi_device_release_bus(handle->spi);   // matches ad9851_init()'s acquire
     spi_bus_remove_device(handle->spi);
     free(handle);
 }
