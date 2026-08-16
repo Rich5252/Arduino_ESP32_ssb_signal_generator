@@ -11,41 +11,57 @@ extern "C" {
 #endif
 
 /**
- * @brief ESP-IDF hardware-SPI driver for the AD9851 DDS, matching the
- *        protocol used by the proven Arduino Nano AD9851.h library this
- *        was ported from (LSB-first bit order, SPI Mode 0, 4 FTW bytes
- *        then a control byte, FQ_UD pulsed after each transfer) - NOT
- *        reconstructed from the datasheet tables directly, since those
- *        are genuinely ambiguous between serial/parallel byte ordering
- *        and getting this wrong would silently produce the wrong
- *        frequency with no obvious symptom short of a spectrum analyser.
+ * @brief Driver for the AD9851 DDS, matching the protocol used by the
+ *        proven Arduino Nano AD9851.h library this was ported from
+ *        (LSB-first bit order, SPI Mode 0, 4 FTW bytes then a control
+ *        byte, FQ_UD pulsed after each transfer) - NOT reconstructed
+ *        from the datasheet tables directly, since those are genuinely
+ *        ambiguous between serial/parallel byte ordering and getting
+ *        this wrong would silently produce the wrong frequency with no
+ *        obvious symptom short of a spectrum analyser.
  *
- * FQ_UD is wired as the SPI bus's CS line (spics_io_num) rather than a
- * separate manually-toggled GPIO: the ESP-IDF SPI driver asserts CS LOW
- * for the duration of a transaction and returns it HIGH immediately
- * after - which is exactly the FQ_UD timing the AD9851 wants (low while
- * shifting, low-to-high transition to latch). No separate FQ_UD pulse
- * code needed.
+ *        Two transport implementations share this same API, selected at
+ *        compile time via AD9851_USE_BITBANG in AD9851.c:
+ *
+ *        - Hardware SPI (AD9851_USE_BITBANG=0): FQ_UD wired as the SPI
+ *          bus's CS line (spics_io_num) rather than a separate
+ *          manually-toggled GPIO - the ESP-IDF SPI driver asserts CS LOW
+ *          for the duration of a transaction and returns it HIGH
+ *          immediately after, which is exactly the FQ_UD timing the
+ *          AD9851 wants. Real-world write_us ran well above the raw
+ *          40/spi_clock_hz bit-time estimate even after the bus-acquire-
+ *          once optimization below (e.g. ~50us measured at 4MHz vs.
+ *          ~10-12us of actual clock+prep time) - the gap is
+ *          spi_device_polling_transmit()'s own per-call driver overhead,
+ *          largely independent of the SPI clock rate.
+ *
+ *        - Bit-bang (AD9851_USE_BITBANG=1, current default): DATA/W_CLK/
+ *          FQ_UD are plain GPIOs toggled directly in
+ *          ad9851_set_frequency(), bypassing the SPI peripheral (and its
+ *          per-call overhead) entirely. Added specifically to eliminate
+ *          the overhead described above, once real hardware measurement
+ *          showed it - not the raw SPI clock rate - was the dominant
+ *          cost. See ad9851_set_frequency()'s definition in AD9851.c for
+ *          the electrical derivation (idle levels, edge polarity) that
+ *          keeps this electrically identical to what the SPI path
+ *          already proved out.
  *
  * TIMING: ad9851_set_frequency() is intended to be called every audio
- * sample (e.g. from dsp_task at 20kHz) for continuous phase modulation.
- * A 40-bit transfer takes 40/spi_clock_hz seconds of hard SPI clock time
- * alone - e.g. 20us at 2MHz. Check this against your real-time budget
+ * sample (e.g. from dsp_task at 10kHz) for continuous phase modulation.
+ * Check whichever transport is active against your real-time budget
  * (e.g. via the existing [timing] instrumentation) once this is wired
  * up; don't assume it fits just because the rest of the pipeline had
  * margin before this was added.
  *
  * ad9851_init() acquires the SPI bus once (spi_device_acquire_bus(),
  * never released until ad9851_deinit()) rather than letting every
- * ad9851_set_frequency() call take/release it internally - this is a
- * dedicated single-device bus, called up to 20000x/sec from the
- * real-time path, so the per-call acquire/release lock overhead
- * spi_device_polling_transmit() would otherwise pay every time is pure
- * waste here. Measured real-world write_us has been running well above
- * the raw 40/spi_clock_hz bit-time estimate (e.g. ~59us observed at
- * 2MHz vs. ~20us theoretical) - see ad9851_profile_t below for splitting
- * out how much of that gap is CPU-side prep vs. the SPI transfer itself,
- * to find out how much this actually recovers.
+ * ad9851_set_frequency() call take/release it internally, when the
+ * hardware-SPI transport is selected - this is a dedicated single-device
+ * bus, called up to 20000x/sec from the real-time path, so the per-call
+ * acquire/release lock overhead spi_device_polling_transmit() would
+ * otherwise pay every time is pure waste here. See ad9851_profile_t
+ * below for splitting out how much of write_us is CPU-side prep vs. the
+ * transport itself (SPI transfer, or the bit-bang toggle loop).
  */
 
 typedef struct {
@@ -77,9 +93,10 @@ esp_err_t ad9851_init(const ad9851_config_t *cfg, ad9851_handle_t *out_handle);
 /**
  * @brief Set the output frequency. Computes the 32-bit frequency tuning
  *        word and sends the full 40-bit serial word (FTW + control
- *        byte). Blocking (spi_device_polling_transmit - no queue/
- *        semaphore involved, lowest latency for the real-time path) -
- *        see the TIMING note above for how long this actually takes.
+ *        byte), blocking until it's fully sent - either via
+ *        spi_device_polling_transmit() or the bit-bang toggle loop,
+ *        whichever transport AD9851_USE_BITBANG selects (see AD9851.c).
+ *        See the TIMING note above for how long this actually takes.
  */
 void IRAM_ATTR ad9851_set_frequency(ad9851_handle_t handle, uint32_t freq_hz);
 
@@ -87,12 +104,15 @@ void IRAM_ATTR ad9851_set_frequency(ad9851_handle_t handle, uint32_t freq_hz);
  * @brief Sub-phase timing breakdown of ad9851_set_frequency(), each a
  *        running high-water mark in microseconds since ad9851_init() -
  *        same pattern as ssb_dsp_profile_t (ssb_dsp.h). max_prep_us
- *        covers the FTW multiply-shift plus the 5-byte bit-reversal
- *        loop; max_spi_us covers just spi_device_polling_transmit()
- *        itself. Splits what the [timing] line's write_us figure lumps
- *        together as one number, so a slow write can be attributed to
- *        genuine SPI clock-out time vs. CPU-side prep vs. (by
- *        subtraction against write_us) whatever driver-call overhead
+ *        covers the FTW multiply-shift plus (hardware-SPI transport
+ *        only) the 5-byte bit-reversal loop; max_spi_us covers just the
+ *        transport itself - spi_device_polling_transmit() under the
+ *        hardware-SPI transport, or the GPIO toggle loop under the
+ *        bit-bang transport (name kept as-is across both for direct
+ *        before/after comparison). Splits what the [timing] line's
+ *        write_us figure lumps together as one number, so a slow write
+ *        can be attributed to genuine transport time vs. CPU-side prep
+ *        vs. (by subtraction against write_us) whatever call overhead
  *        remains, instead of guessing which lever to pull.
  */
 typedef struct {
