@@ -101,19 +101,7 @@ typedef struct
 static const PersistentSettings settingsPresets[10] =
 {
     // Preset 0 - Normal microphone operation
-    {
-        "Micr",
-        AUDIO_SRC_MIC,     // audio_source
-        3.04f,               // relative_delay_samples (was 1.9f @ 10000Hz)
-        0.32f,               // env_pwm_offset
-        0.8f,               // env_pwm_scale
-        true,               // env_gdeq_enable
-        ADC_LPF_MODE_OFF,   // adc_lpf_mode (was adc_lpf_bypass=true)
-        true,               // eq_enable
-        true,               // compressor_enable
-        -2.0f,               // master_gain_db
-        true                // ad9851_output_enable
-    },
+    { "Micr latest 16kFs", AUDIO_SRC_MIC, 2.43f, 0.40f, 0.42f, true, ADC_LPF_MODE_CHEBYSHEV, true, true, 11.0f, true },
 
     // Preset 1 - Two-tone test
     {
