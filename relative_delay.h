@@ -44,10 +44,13 @@
 
 #define PHASE_DELAY_MAX_SAMPLES 8   // ring buffer capacity (both rings) - generous headroom
                                      // over the ~1-2 samples actually expected to be needed
-#define DELAY_STEP_SAMPLES 0.05f    // 5us per '['/']' keypress at 10kHz - tightened from an
-                                     // initial 0.25 (25us) once real hardware testing found a
-                                     // sweet spot near -0.25 samples, to resolve it more precisely
-                                     // than that coarser step could
+#define DELAY_STEP_SAMPLES 0.05f    // 5us per '['/']' keypress at 10kHz (3.125us at 16kHz -
+                                     // this is a fixed SAMPLE count, so raising SAMPLE_RATE_HZ
+                                     // makes each keypress a finer real-time step for free,
+                                     // same direction as the 10000->16000 change) - tightened
+                                     // from an initial 0.25 (25us @ 10kHz) once real hardware
+                                     // testing found a sweet spot near -0.25 samples, to resolve
+                                     // it more precisely than that coarser step could
 
 // Both rings are always written/read together, BEFORE either output is
 // driven - the current relative-delay value decides whether the
