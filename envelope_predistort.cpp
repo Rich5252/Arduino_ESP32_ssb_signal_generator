@@ -4,23 +4,29 @@
 
 #include "envelope_predistort.h"
 
-// Desired linear envelope [0,1] -> commanded PWM duty [0,1], 33 points
-// (32 equal bins), derived offline from the real hardware sweep described
-// in envelope_predistort.h via monotonic (PCHIP) interpolation then
-// resampled onto this even grid. LUT[0] is NOT 0.0 - it's 0.3190, the
-// lowest duty actually measured (~32%, gate ~1.05V) - below that the
+// Desired linear envelope [0,1] -> commanded PWM duty [0,1], 65 points
+// (64 equal bins), rebuilt from a much denser real hardware sweep than the
+// original 33-point table - see envelope_predistort.h for the full
+// derivation. LUT[0] is NOT 0.0 - it's 0.3129, the duty below which the
 // path is dead (near the analyzer noise floor regardless of command), so
-// "envelope=0" maps to the lowest achievable duty rather than a duty this
-// hardware can't actually produce a meaningfully lower output at anyway.
-// LUT[32] = 1.0 (100% duty), the observed saturation point.
-static const float ENV_PREDISTORT_LUT[33] = {
-    0.3190f, 0.4368f, 0.4637f, 0.4852f, 0.5034f, 0.5180f, 0.5312f, 0.5461f,
-    0.5633f, 0.5805f, 0.5951f, 0.6075f, 0.6191f, 0.6313f, 0.6457f, 0.6628f,
-    0.6806f, 0.6967f, 0.7101f, 0.7219f, 0.7330f, 0.7440f, 0.7558f, 0.7685f,
-    0.7811f, 0.7942f, 0.8084f, 0.8245f, 0.8427f, 0.8625f, 0.8880f, 0.9242f,
-    1.0000f,
+// "envelope=0" maps to the lowest achievable duty rather than one this
+// hardware can't usefully go lower than anyway. LUT[64] is 0.9495, NOT
+// 1.0 - the denser sweep revealed RF output actually saturates (plateaus
+// at its max measured level) by ~95% duty, so commanding the full 100%
+// beyond that buys nothing; the inversion correctly picks the LOWEST duty
+// that already reaches full output rather than always maxing out.
+static const float ENV_PREDISTORT_LUT[65] = {
+    0.3129f, 0.4164f, 0.4396f, 0.4532f, 0.4644f, 0.4735f, 0.4815f, 0.4901f,
+    0.4987f, 0.5081f, 0.5172f, 0.5262f, 0.5344f, 0.5414f, 0.5480f, 0.5548f,
+    0.5625f, 0.5705f, 0.5779f, 0.5846f, 0.5910f, 0.5973f, 0.6037f, 0.6100f,
+    0.6163f, 0.6227f, 0.6291f, 0.6352f, 0.6415f, 0.6483f, 0.6561f, 0.6669f,
+    0.6789f, 0.6885f, 0.6957f, 0.7018f, 0.7074f, 0.7130f, 0.7190f, 0.7251f,
+    0.7312f, 0.7373f, 0.7435f, 0.7499f, 0.7559f, 0.7618f, 0.7681f, 0.7753f,
+    0.7841f, 0.7980f, 0.8052f, 0.8117f, 0.8181f, 0.8243f, 0.8319f, 0.8427f,
+    0.8491f, 0.8560f, 0.8695f, 0.8779f, 0.8848f, 0.8952f, 0.9039f, 0.9217f,
+    0.9495f,
 };
-#define ENV_PREDISTORT_LUT_LAST_IDX 32   // ENV_PREDISTORT_LUT's last valid index
+#define ENV_PREDISTORT_LUT_LAST_IDX 64   // ENV_PREDISTORT_LUT's last valid index
 
 static volatile bool s_env_predistort_enable = false;
 

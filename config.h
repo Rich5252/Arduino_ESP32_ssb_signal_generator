@@ -47,6 +47,10 @@
                              // 'e' (EQ) / 'c' (compressor) commands, see serial_commands.cpp - flip
                              // back to 0 only if you want the whole subsystem compiled out entirely
 #define MASTER_GAIN_STEP_DB 1.0f  // per '+'/'-' keypress - see ssb_dsp_set_master_gain_db()
+#define MASTER_GAIN_FINE_STEP_DB 0.1f  // per '.'/',' keypress - same idea, finer resolution for
+                                        // dialing in precise single-tone gain-sweep measurement
+                                        // points (e.g. envelope_predistort.h's calibration table)
+                                        // without needing 10 presses of '+'/'-' to move 1dB
 
 // ---- PWM comparison path enable flag. Defined here (before any header
 // that depends on it) rather than down in envelope_output.h - #if needs

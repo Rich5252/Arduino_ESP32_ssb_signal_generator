@@ -116,6 +116,7 @@
 #include "test_signals.h"
 #include "envelope_gdeq.h"
 #include "envelope_predistort.h"
+#include "envelope_floor.h"
 #if AD9851_ATTACHED
 #include "relative_delay.h"
 #include "carrier_output.h"
@@ -209,6 +210,15 @@ static void IRAM_ATTR dsp_task(void* arg)
             ssb_dsp_process_sample(dsp_state_get_ssb(), sample, dsp_state_get_sideband(), &freq_dev_hz, &envelope);
         }
         int64_t t_dsp_done_us = esp_timer_get_time();
+
+        // Envelope-null floor - see envelope_floor.h (envelope-only clamp;
+        // an earlier freq_dev_hz-freezing version was removed after
+        // real-hardware testing showed it caused a hard phase
+        // discontinuity - see that file for the postmortem). Must run on
+        // the RAW envelope straight out of the block above, before
+        // gdeq/predistort reshape it, so the clamp decision reflects the
+        // actual signal. Off by default (floor 0.0), toggle via 'x'/'z'.
+        envelope = envelope_floor_apply(envelope);
 
         // Envelope-path group-delay equalizer - see envelope_gdeq.h for
         // the coefficients/rationale. Applied here, unconditionally
@@ -424,10 +434,12 @@ void setup()
                   "for mapping envelope/phase delay mismatch vs. frequency without a recompile per band.\r\n",
                   test_signals_get_twotone_f1_hz(), test_signals_get_twotone_f2_hz());
     Serial.printf("Send 'e' to toggle EQ (currently %s), 'c' to toggle compressor (currently %s), "
-                  "'+'/'-' for master gain (currently %+.1fdB, %.1fdB/step).\r\n",
+                  "'+'/'-' for master gain (currently %+.2fdB, %.1fdB/step), "
+                  "'.'/',' for fine master gain (%.1fdB/step).\r\n",
                   ssb_dsp_get_eq_enabled(dsp_state_get_ssb()) ? "ON" : "off",
                   ssb_dsp_get_compressor_enabled(dsp_state_get_ssb()) ? "ON" : "off",
-                  ssb_dsp_get_master_gain_db(dsp_state_get_ssb()), MASTER_GAIN_STEP_DB);
+                  ssb_dsp_get_master_gain_db(dsp_state_get_ssb()), MASTER_GAIN_STEP_DB,
+                  MASTER_GAIN_FINE_STEP_DB);
 #if AD9851_ATTACHED
     Serial.printf("Send 'o' to toggle AD9851 RF output on/off (currently %s), "
                   "'['/']' for relative phase/envelope delay (currently %+.2f samples, ~%+.0fus, "
@@ -450,6 +462,10 @@ void setup()
                   "table that REPLACES the 'u'/'j'/'i'/'k' linear offset/scale mapping while on, "
                   "not yet validated beyond the measurement itself.\r\n",
                   envelope_predistort_get_enabled() ? "ON" : "off");
+    Serial.printf("Send 'x'/'z' to raise/lower the envelope-null floor (currently %.2f) - smoothly "
+                  "compresses envelope's [0,1] range into [floor,1], to keep two-tone nulls out "
+                  "of the predistort LUT's steepest region; 0.00 = off.\r\n",
+                  envelope_floor_get());
     // Presets (settings.h) load every lever above in one command - handy
     // once a preset is dialed in, no need to remember/retype the whole
     // sequence of individual knob commands every boot. Loop bound taken

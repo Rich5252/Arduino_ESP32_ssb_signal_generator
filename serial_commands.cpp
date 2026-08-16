@@ -8,6 +8,7 @@
 #include "adc_capture.h"
 #include "envelope_gdeq.h"
 #include "envelope_predistort.h"
+#include "envelope_floor.h"
 #include "envelope_output.h"
 #include "diagnostics.h"
 #include "settings.h"
@@ -140,6 +141,14 @@ void handle_serial_commands(void)
                           now_on ? " - REPLACES the 'u'/'j'/'i'/'k' linear offset/scale mapping "
                                    "while on (see envelope_predistort.h); those knobs have no "
                                    "effect until this is toggled off again" : "");
+        } else if (c == 'x') {
+            envelope_floor_raise();
+            Serial.printf("-> envelope-null floor raised to %.2f (see envelope_floor.h)\r\n",
+                          envelope_floor_get());
+        } else if (c == 'z') {
+            envelope_floor_lower();
+            Serial.printf("-> envelope-null floor lowered to %.2f (see envelope_floor.h)\r\n",
+                          envelope_floor_get());
         } else if (c == 'f') {
             bool bypass = !adc_capture_get_lpf_bypass();
             adc_capture_set_lpf_bypass(bypass);
@@ -175,6 +184,14 @@ void handle_serial_commands(void)
             float new_gain = ssb_dsp_get_master_gain_db(dsp_state_get_ssb()) - MASTER_GAIN_STEP_DB;
             dsp_state_set_master_gain_db(new_gain);
             Serial.printf("-> master gain %+.1f dB\r\n", new_gain);
+        } else if (c == '.') {
+            float new_gain = ssb_dsp_get_master_gain_db(dsp_state_get_ssb()) + MASTER_GAIN_FINE_STEP_DB;
+            dsp_state_set_master_gain_db(new_gain);
+            Serial.printf("-> master gain %+.2f dB\r\n", new_gain);
+        } else if (c == ',') {
+            float new_gain = ssb_dsp_get_master_gain_db(dsp_state_get_ssb()) - MASTER_GAIN_FINE_STEP_DB;
+            dsp_state_set_master_gain_db(new_gain);
+            Serial.printf("-> master gain %+.2f dB\r\n", new_gain);
 #if AD9851_ATTACHED
         } else if (c == 'o') {
             bool now_on = !carrier_output_get_rf_enabled();

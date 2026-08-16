@@ -50,7 +50,23 @@ Off by default. Enabling it pushes the envelope path's overall delay up by ~265�
 |---|---|
 | `D` | Toggle a measured-curve lookup table (`envelope_predistort.h`) that corrects the *static* (memoryless) nonlinearity of the whole envelope→RF-amplitude chain — PWM/RC filter, BS170 gate transfer curve, and the AD9851's own RSET-to-DAC-current relationship, all as one measured end-to-end curve. A different problem from `g`'s: this is amplitude vs. commanded level (present even with a constant carrier), not delay vs. frequency. **REPLACES** the `u`/`j`/`i`/`k` linear offset/scale mapping while on — those knobs have no effect until `D` is toggled off again. **Not yet validated beyond the measurement itself.** |
 
-Off by default. Table derived from a real hardware sweep (single-tone + master-gain steps, PWM ranging at full 0–100% span) — see `envelope_predistort.h` for the full derivation and the curve's shape (dead below ~32% duty, steep turn-on through ~36–55%, compressing to saturation at 100%).
+Off by default. Table derived from a real hardware sweep (single-tone + master-gain steps, PWM ranging at full 0–100% span) — see `envelope_predistort.h` for the full derivation and the curve's shape. Now on its 2nd revision: 65 points built from 95 densely-measured dBm readings (down to 0.1dB steps via `'.'`/`','`) plus 17 gate-voltage readings, up from the original 33-point/19-measurement table. Dead below ~31% duty, steep turn-on through ~31–55%, then a gently-compressing climb that plateaus by ~95% duty rather than the full 100% the first revision assumed.
+
+## Envelope-null floor
+
+| Key | Effect |
+|---|---|
+| `x` | Raise the envelope-null floor by 0.02 |
+| `z` | Lower the envelope-null floor by 0.02 (min 0.00) |
+
+Two-tone envelopes dip toward zero at destructive-interference nulls, driving the commanded duty into the predistort LUT's steepest, most sparsely-characterized region (36–55% duty). `envelope_floor_apply()` (see `envelope_floor.h`) smoothly compresses envelope's whole `[0,1]` range into `[floor,1]` (peak still maps to 1, only the bottom is raised) so it can't be driven that low.
+
+**Two earlier versions were tried and removed** — see `envelope_floor.cpp`'s header comment for both postmortems:
+
+1. Also froze `freq_dev_hz` (phase rate) below the floor, meant to guard against `atan2()` noise near I=Q=0 — wrong for a two-tone signal (the fast phase rotation at a null is genuine required signal content, not noise) and produced a hard phase discontinuity: no effect until the floor got large enough (~0.08 in testing), then products jumping to 0dB right at that threshold as the accumulated phase debt snapped back.
+2. A hard clamp (`min(envelope, floor)`) on the envelope side alone — left a derivative discontinuity at every crossing, which a two-tone signal hits often (near every null); showed up as nearly every product rising gently with each floor increment, a new distortion source confounding the actual question being tested. Replaced with the current continuous affine remap, which has no threshold and no kink anywhere in the trajectory.
+
+Floor starts at 0.00 (off) — raising it trades some true-null carrier suppression (the deepest measured nulls only bought ~58dB anyway, see `envelope_predistort.h`) for keeping envelope out of the LUT's worst region. Applied unconditionally, right after `ssb_dsp_process_sample()`/the ENVSTEP/FMTEST/AMTEST equivalents, before `g`'s group-delay equalizer or `D`'s pre-distortion touch the envelope — so it sees the true raw signal, not a downstream-massaged version of it.
 
 ## Audio processing
 
@@ -60,8 +76,10 @@ Off by default. Table derived from a real hardware sweep (single-tone + master-g
 | `c` | Toggle compressor on/off (automatic makeup gain applied) |
 | `+` | Master gain +1.0dB |
 | `-` | Master gain -1.0dB |
+| `.` | Master gain +0.1dB (fine step) |
+| `,` | Master gain -0.1dB (fine step) |
 
-Master gain scales the *whole* chain (phase + envelope together, inside `ssb_dsp`) — different from the PWM range knobs above, which only touch envelope.
+Master gain scales the *whole* chain (phase + envelope together, inside `ssb_dsp`) — different from the PWM range knobs above, which only touch envelope. `.`/`,` give 0.1dB resolution for dialing in precise gain-sweep measurement points (e.g. re-measuring `envelope_predistort.h`'s calibration table at finer steps) without 10 presses of `+`/`-` per dB.
 
 ## RF output
 
