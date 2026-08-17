@@ -105,18 +105,8 @@ static const PersistentSettings settingsPresets[10] =
 
     // Preset 1 - Two-tone test
     {
-        "TwoToneButwGD",
-        AUDIO_SRC_TWOTONE,
-        2.96f,               // relative_delay_samples (was 1.85f @ 10000Hz)
-        0.08f,               // env_pwm_offset
-        0.84f,               // env_pwm_scale
-        true,                // env_gdeq_enable
-        ADC_LPF_MODE_OFF,    // adc_lpf_mode (was adc_lpf_bypass=true)
-        false,               // eq_enable
-        false,               // compressor_enable
-        +1.0f,               // master_gain_db
-        true                // ad9851_output_enable
-    },
+        "TwoTone Base",
+        AUDIO_SRC_TWOTONE, 0.0f, 0.36f, 0.48f, false, ADC_LPF_MODE_OFF, false, false, 1.0f, true },
 
     // Preset 2 - Single-tone test
     {
@@ -150,7 +140,7 @@ static const PersistentSettings settingsPresets[10] =
         { "AM-ButwGd", AUDIO_SRC_AMTEST, 2.96f, 0.08f, 0.84f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
 
     // Preset 5 -
-    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.43f, 0.36f, 0.48f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true },  // was 1.55f @ 10000Hz; adc_lpf_bypass=true
+    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.43f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV, false, false, 1.0f, true },  // was 1.55f @ 10000Hz; adc_lpf_bypass=true
 
         // Preset 6 -
     { "TwoToneButwGD Env 1.6-2.9 DelayTuned old", AUDIO_SRC_TWOTONE, 2.64f, 0.36f, 0.48f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true },  // was 1.65f @ 10000Hz; adc_lpf_bypass=true
