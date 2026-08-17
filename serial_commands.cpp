@@ -149,6 +149,18 @@ void handle_serial_commands(void)
             envelope_floor_lower();
             Serial.printf("-> envelope-null floor lowered to %.2f (see envelope_floor.h)\r\n",
                           envelope_floor_get());
+        } else if (c == '}') {
+            ssb_dsp_raise_freq_dev_slew_limit(dsp_state_get_ssb());
+            float limit = ssb_dsp_get_freq_dev_slew_limit_hz(dsp_state_get_ssb());
+            if (limit >= SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ) {
+                Serial.println("-> freq_dev slew-rate limit: off (see ssb_dsp.h)");
+            } else {
+                Serial.printf("-> freq_dev slew-rate limit loosened to %.0fHz/sample (see ssb_dsp.h)\r\n", limit);
+            }
+        } else if (c == '{') {
+            ssb_dsp_lower_freq_dev_slew_limit(dsp_state_get_ssb());
+            float limit = ssb_dsp_get_freq_dev_slew_limit_hz(dsp_state_get_ssb());
+            Serial.printf("-> freq_dev slew-rate limit tightened to %.0fHz/sample (see ssb_dsp.h)\r\n", limit);
         } else if (c == 'f') {
             // Cycles off -> Butterworth -> Chebyshev -> off. See
             // adc_capture.h's adc_lpf_mode_t / ADC_LPF_CUTOFF_HZ /
@@ -208,9 +220,10 @@ void handle_serial_commands(void)
             // audio_source, relative_delay_samples, env_pwm_offset,
             // env_pwm_scale, env_gdeq_enable, adc_lpf_mode, eq_enable,
             // compressor_enable, master_gain_db, ad9851_output_enable,
-            // env_predistort_enable, env_floor) - wrapped in braces with a
-            // trailing comma so the whole line can be pasted directly into
-            // settingsPresets[] in settings.h as a new preset entry.
+            // env_predistort_enable, env_floor, freq_dev_slew_limit_hz) -
+            // wrapped in braces with a trailing comma so the whole line
+            // can be pasted directly into settingsPresets[] in settings.h
+            // as a new preset entry.
             // Rename "Live" (and add a numbered comment above it, matching
             // the existing presets' style) after pasting - and remember
             // settings.h's static_assert ties the array size to the
@@ -244,8 +257,20 @@ void handle_serial_commands(void)
             static const char *k_adc_lpf_mode_enum_name[3] = {
                 "ADC_LPF_MODE_OFF", "ADC_LPF_MODE_BUTTERWORTH", "ADC_LPF_MODE_CHEBYSHEV"
             };
+            // freq_dev_slew_limit_hz prints as the sentinel constant's own
+            // name when off, same reasoning as adc_lpf_mode above - so the
+            // pasted line compiles AND stays meaningful (a bare huge float
+            // literal would compile fine too, but wouldn't self-document
+            // as "off" the way the constant name does).
+            char slew_str[40];
+            float slew_limit = ssb_dsp_get_freq_dev_slew_limit_hz(dsp_state_get_ssb());
+            if (slew_limit >= SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ) {
+                snprintf(slew_str, sizeof(slew_str), "SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ");
+            } else {
+                snprintf(slew_str, sizeof(slew_str), "%.0ff", slew_limit);
+            }
             Serial.println("-> settings line (paste into settingsPresets[] in settings.h, then rename \"Live\"):");
-            Serial.printf("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff },\r\n",
+            Serial.printf("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s },\r\n",
                           audio_source_enum_name(dsp_state_get_audio_source()),
                           rel_delay,
                           envelope_output_get_pwm_offset(),
@@ -257,7 +282,8 @@ void handle_serial_commands(void)
                           ssb_dsp_get_master_gain_db(dsp_state_get_ssb()),
                           rf_enabled ? "true" : "false",
                           envelope_predistort_get_enabled() ? "true" : "false",
-                          envelope_floor_get());
+                          envelope_floor_get(),
+                          slew_str);
         } else if (c >= '0' && c <= '9') {
             int preset = c - '0';
             const PersistentSettings& p = settingsPresets[preset];
@@ -297,6 +323,11 @@ void handle_serial_commands(void)
             // set on every preset load is correct as-is.
             envelope_predistort_set_enabled(p.env_predistort_enable);
             envelope_floor_set(p.env_floor);
+
+            // Stateless setter (a plain clamp-and-store on the handle,
+            // same as master_gain_db) - no reset-on-transition concern,
+            // safe to call unconditionally on every preset load.
+            ssb_dsp_set_freq_dev_slew_limit_hz(dsp_state_get_ssb(), p.freq_dev_slew_limit_hz);
 
             Serial.printf("-> preset %d: %s\r\n", preset, p.name);
         }

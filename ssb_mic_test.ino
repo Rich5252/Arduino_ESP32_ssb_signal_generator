@@ -410,7 +410,7 @@ void setup()
             .enable = AUDIO_FX_ENABLED,
             .hpf_freq_hz = 300.0f,
             .presence_freq_hz = 2200.0f,
-            .presence_gain_db = 4.0f,
+            .presence_gain_db = 2.0f,
             .presence_q = 1.0f,
             .comp_threshold = 0.1f,
             .comp_ratio = 3.5f,
@@ -491,6 +491,19 @@ void setup()
                   "compresses envelope's [0,1] range into [floor,1], to keep two-tone nulls out "
                   "of the predistort LUT's steepest region; 0.00 = off.\r\n",
                   envelope_floor_get());
+    {
+        float slew = ssb_dsp_get_freq_dev_slew_limit_hz(dsp_state_get_ssb());
+        if (slew >= SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ) {
+            Serial.println("Send '{'/'}' to tighten/loosen the freq_dev slew-rate limit (currently off) - "
+                          "smooths only the sharp per-sample frequency swing at a two-tone envelope "
+                          "null (ordinary content never approaches it), leaving normal audio untouched.");
+        } else {
+            Serial.printf("Send '{'/'}' to tighten/loosen the freq_dev slew-rate limit (currently "
+                          "%.0fHz/sample) - smooths only the sharp per-sample frequency swing at a "
+                          "two-tone envelope null (ordinary content never approaches it), leaving "
+                          "normal audio untouched.\r\n", slew);
+        }
+    }
     // Presets (settings.h) load every lever above in one command - handy
     // once a preset is dialed in, no need to remember/retype the whole
     // sequence of individual knob commands every boot. Loop bound taken

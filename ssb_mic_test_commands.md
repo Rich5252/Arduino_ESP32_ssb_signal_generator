@@ -68,6 +68,19 @@ Two-tone envelopes dip toward zero at destructive-interference nulls, driving th
 
 Floor starts at 0.00 (off) — raising it trades some true-null carrier suppression (the deepest measured nulls only bought ~58dB anyway, see `envelope_predistort.h`) for keeping envelope out of the LUT's worst region. Applied unconditionally, right after `ssb_dsp_process_sample()`/the ENVSTEP/FMTEST/AMTEST equivalents, before `g`'s group-delay equalizer or `D`'s pre-distortion touch the envelope — so it sees the true raw signal, not a downstream-massaged version of it.
 
+## freq_dev slew-rate limiter
+
+| Key | Effect |
+|---|---|
+| `{` | Tighten the `freq_dev_hz` slew-rate limit (turns it on at 2000Hz/sample if currently off, then steps down 250Hz/sample at a time, floor 100Hz/sample) |
+| `}` | Loosen the limit (steps up 250Hz/sample, then turns fully off past 8000Hz/sample) |
+
+The phase-side counterpart to the envelope-null floor above — see `ssb_dsp.h`'s `ssb_dsp_set_freq_dev_slew_limit_hz()` doc comment for the full derivation. This limits how fast `freq_dev_hz` (the FM deviation fed to the AD9851 each sample) is allowed to *change* from one sample to the next — a different thing from `MAX_FREQ_DEV_HZ`, which limits its *value*. Verified numerically (a double-precision reimplementation of the exact DSP algorithm run alongside the real fast-math code, on synthetic two-tone input): real content, away from any envelope null, never asks `freq_dev_hz` to change faster than ~60Hz/sample even on busy high-center-frequency bands, while a genuine destructive-interference null asks for ~8000Hz/sample in a single step — a 100x+ gap with nothing in between. That single-sample swing is a real, correctly-computed requirement (it represents the true instantaneous phase reversal at the null), but a fast transient in frequency is inherently wideband in the spectrum. Limiting the slew trades a little reconstruction fidelity right at the null for less spectral splatter, without touching ordinary content.
+
+Deliberately not a repeat of either envelope-floor mistake above: it doesn't freeze `freq_dev_hz` (no phase debt to snap back later — the AD9851 just integrates whatever frequency word it's handed each sample, so a slower-than-ideal ramp through the null *is* the applied modulation, not a deferred correction), and it isn't a hard value clamp (a slew limiter's output is continuous by construction, no derivative kink at any threshold). Applied inside `ssb_dsp_process_sample()`, after the `max_unclamped_freq_dev_hz` diagnostic captures the true unlimited peak and before the existing `MAX_FREQ_DEV_HZ` magnitude clamp (which still applies on top, unchanged).
+
+Off by default (same convention as `g`/`D`/`x`/`z`) — not yet validated on real hardware beyond the numeric derivation above.
+
 ## Audio processing
 
 | Key | Effect |
@@ -99,7 +112,7 @@ Master gain scales the *whole* chain (phase + envelope together, inside `ssb_dsp
 
 | Key | Effect |
 |---|---|
-| `0`-`9` | Load a preset from `settings.h` — sets every lever above (audio source, relative delay, PWM offset/scale, gdeq, ADC LPF mode, EQ, compressor, master gain, RF output, envelope pre-distortion, envelope-null floor) in one command. Boot banner lists the current names (dynamically, from the array's own size — always up to date). |
+| `0`-`9` | Load a preset from `settings.h` — sets every lever above (audio source, relative delay, PWM offset/scale, gdeq, ADC LPF mode, EQ, compressor, master gain, RF output, envelope pre-distortion, envelope-null floor, freq_dev slew-rate limit) in one command. Boot banner lists the current names (dynamically, from the array's own size — always up to date). |
 | `P` | Print the current value of every one of those same levers as a single comma-separated line, wrapped in `{ ... },` and in exactly `PersistentSettings`'s field order — copy/paste it straight into the `settingsPresets[]` array in `settings.h` as a new preset. Rename the placeholder `"Live"` name (and add a numbered comment above it, matching the existing presets' style) after pasting. |
 
 Edit the `settingsPresets` array in `settings.h` to change them, or dial in levers live and use `P` to generate the line instead of hand-typing values — check the live boot banner or `settings.h` itself for the current name/count rather than this doc, since the preset list changes often during active tuning. There's a compile-time check tying the array size to the `'0'`-`'9'` range (`settings.h`'s `static_assert`), so resizing it without updating `loop()`/`setup()`/`serial_commands.cpp`'s preset-select block — and the boot banner's own preset listing loop, which now reads the array size directly rather than a hardcoded count — fails the build instead of silently misbehaving.

@@ -185,6 +185,65 @@ void ssb_dsp_get_freq_dev_stats(ssb_dsp_handle_t handle, ssb_dsp_freq_dev_stats_
 void ssb_dsp_reset_freq_dev_stats(ssb_dsp_handle_t handle);
 
 /**
+ * @brief Optional per-sample SLEW-RATE limit on freq_dev_hz - distinct
+ *        from max_freq_dev_hz above, which limits the VALUE. This limits
+ *        how much freq_dev is allowed to CHANGE from one sample to the
+ *        next.
+ *
+ *        Motivation, confirmed numerically (a from-scratch double-
+ *        precision reimplementation of this exact algorithm run
+ *        side-by-side against the real fast-math code on synthetic
+ *        two-tone input): away from any envelope null, real two-tone
+ *        content never asks freq_dev to move faster than roughly
+ *        60Hz/sample, even on busy high-center-frequency bands. A
+ *        genuine destructive-interference null asks for ~8000Hz/sample
+ *        in a single step - a 100x+ gap with nothing in between. That
+ *        single-sample swing is a real, correctly-computed requirement
+ *        (representing the true instantaneous phase reversal at the
+ *        null), but a fast transient in frequency is inherently wideband
+ *        in the spectrum - this is a way to trade a little reconstruction
+ *        fidelity right at the null for a lot less spectral splatter,
+ *        without touching ordinary content at all.
+ *
+ *        Deliberately NOT a freeze - see envelope_floor.h's NOTE 1
+ *        postmortem for why that was wrong (built up a "phase debt" that
+ *        snapped back as a hard discontinuity). This keeps moving every
+ *        sample, just capped in how fast: the AD9851 simply integrates
+ *        whatever frequency word it's handed each sample, so a slightly
+ *        slower-than-ideal ramp through the null IS the actual applied
+ *        modulation, not a deferred correction owed to it later. Also NOT
+ *        a hard value clamp - see NOTE 2's postmortem (derivative
+ *        discontinuity at every crossing). A slew limiter's output is
+ *        continuous by construction, so there's no kink introduced at
+ *        any threshold.
+ *
+ *        Applied in ssb_dsp_process_sample() AFTER max_unclamped_freq_dev_hz
+ *        tracks the true (pre-limit) peak, BEFORE the existing
+ *        max_freq_dev_hz magnitude clamp - so that diagnostic still
+ *        reflects the real, unlimited signal, and the safety clamp still
+ *        has final say regardless of this setting.
+ *
+ *        Off (unlimited) by default/at init, same convention as
+ *        'g'/'D'/'x'/'z' - existing tuning isn't disturbed until this is
+ *        deliberately dialed in. "Off" is a literal large sentinel value
+ *        (SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ) rather than a special-cased
+ *        flag - any limit at or above 2x a sane max_freq_dev_hz can never
+ *        actually engage anyway (freq_dev itself is bounded to
+ *        +/-max_freq_dev_hz), so the sentinel is just "comfortably above
+ *        that", not magic. ssb_dsp_raise_freq_dev_slew_limit()/lower()
+ *        snap sensibly at both the off end and a practical minimum - see
+ *        ssb_dsp.c.
+ */
+#define SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ  1.0e6f
+
+void IRAM_ATTR ssb_dsp_set_freq_dev_slew_limit_hz(ssb_dsp_handle_t handle, float limit_hz);
+float ssb_dsp_get_freq_dev_slew_limit_hz(ssb_dsp_handle_t handle);
+void ssb_dsp_raise_freq_dev_slew_limit(ssb_dsp_handle_t handle);  // '}' - loosen (snaps to fully off
+                                                                    // past the practical ceiling)
+void ssb_dsp_lower_freq_dev_slew_limit(ssb_dsp_handle_t handle);  // '{' - tighten (snaps to a sane
+                                                                    // starting point when coming from off)
+
+/**
  * @brief Sub-phase timing breakdown of ssb_dsp_process_sample, each a
  *        running high-water mark in microseconds since ssb_dsp_init().
  *        Measured internally via esp_timer_get_time() - negligible

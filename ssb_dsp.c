@@ -244,6 +244,16 @@ struct ssb_dsp_s {
     float max_unclamped_freq_dev_hz;
     uint32_t freq_dev_clip_count;
 
+    // See ssb_dsp_set_freq_dev_slew_limit_hz()'s doc comment in ssb_dsp.h.
+    // freq_dev_slew_limit_hz is the configured limit (SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ
+    // = off), written occasionally from a command handler hence volatile,
+    // same reasoning as master_gain_db below. slew_limited_prev_freq_dev_hz
+    // is the limiter's own internal per-sample state (the last value it
+    // actually output) - real-time-path-only, never touched from outside
+    // ssb_dsp_process_sample(), so it does NOT need to be volatile.
+    volatile float freq_dev_slew_limit_hz;
+    float slew_limited_prev_freq_dev_hz;
+
     // audio_fx_configured: was the EQ/compressor subsystem set up at all
     // at ssb_dsp_init() (i.e. was ssb_audio_fx_config_t::enable true)?
     // This gates whether the biquad/compressor state even exists - if
@@ -330,6 +340,8 @@ esp_err_t ssb_dsp_init(const ssb_dsp_config_t *cfg, ssb_dsp_handle_t *out_handle
     h->have_prev_phase = false;
     h->prev_phase = 0.0f;
     h->delay_head = 0;
+    h->freq_dev_slew_limit_hz = SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ;
+    h->slew_limited_prev_freq_dev_hz = 0.0f;
 
     h->hilbert_coeffs = calloc(h->num_taps, sizeof(float));
     h->delay_line = calloc(h->num_taps, sizeof(float));
@@ -446,6 +458,62 @@ void ssb_dsp_reset_freq_dev_stats(ssb_dsp_handle_t handle)
     if (!handle) return;
     handle->max_unclamped_freq_dev_hz = 0.0f;
     handle->freq_dev_clip_count = 0;
+}
+
+// Step size and bounds for '{'/'}' - see ssb_dsp.h's doc comment. Step
+// chosen well above the ~60Hz/sample worst-case seen on real (non-null)
+// two-tone content, so every step in the useful range stays meaningfully
+// coarser than that floor. MIN sits comfortably above that same ~60Hz/
+// sample figure too, so even the tightest reachable setting shouldn't
+// start touching legitimate content. MAX_FINITE is the last step before
+// snapping to fully off - a limit that high can already barely ever
+// engage (raw freq_dev itself never exceeds max_freq_dev_hz, ~8000Hz, so
+// a same-sign single-sample swing that large is already the largest
+// possible), it exists as one more step on the way to off rather than a
+// functionally meaningful setting of its own.
+#define FREQ_DEV_SLEW_STEP_HZ        250.0f
+#define FREQ_DEV_SLEW_MIN_HZ         100.0f
+#define FREQ_DEV_SLEW_MAX_FINITE_HZ 8000.0f
+// First value dialed in when going from off -> on via '{' - comfortably
+// above real content's own worst-case slew, comfortably below a null
+// event's ~8000Hz/sample, so it actually engages only where intended.
+#define FREQ_DEV_SLEW_START_HZ      2000.0f
+
+void IRAM_ATTR ssb_dsp_set_freq_dev_slew_limit_hz(ssb_dsp_handle_t handle, float limit_hz)
+{
+    if (!handle) return;
+    if (limit_hz < FREQ_DEV_SLEW_MIN_HZ) limit_hz = FREQ_DEV_SLEW_MIN_HZ;
+    handle->freq_dev_slew_limit_hz = limit_hz;
+}
+
+float ssb_dsp_get_freq_dev_slew_limit_hz(ssb_dsp_handle_t handle)
+{
+    return handle ? handle->freq_dev_slew_limit_hz : SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ;
+}
+
+void ssb_dsp_raise_freq_dev_slew_limit(ssb_dsp_handle_t handle)
+{
+    if (!handle) return;
+    float cur = handle->freq_dev_slew_limit_hz;
+    if (cur >= FREQ_DEV_SLEW_MAX_FINITE_HZ) {
+        handle->freq_dev_slew_limit_hz = SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ;  // one more step past the
+                                                                                // last finite step = off
+    } else {
+        handle->freq_dev_slew_limit_hz = cur + FREQ_DEV_SLEW_STEP_HZ;
+    }
+}
+
+void ssb_dsp_lower_freq_dev_slew_limit(ssb_dsp_handle_t handle)
+{
+    if (!handle) return;
+    float cur = handle->freq_dev_slew_limit_hz;
+    if (cur >= SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ) {
+        handle->freq_dev_slew_limit_hz = FREQ_DEV_SLEW_START_HZ;  // off -> on at a sane starting point,
+                                                                    // not a step down from a huge number
+    } else {
+        float next = cur - FREQ_DEV_SLEW_STEP_HZ;
+        handle->freq_dev_slew_limit_hz = next < FREQ_DEV_SLEW_MIN_HZ ? FREQ_DEV_SLEW_MIN_HZ : next;
+    }
 }
 
 void ssb_dsp_get_profile(ssb_dsp_handle_t handle, ssb_dsp_profile_t *out)
@@ -592,6 +660,22 @@ void IRAM_ATTR ssb_dsp_process_sample(ssb_dsp_handle_t handle,
     // content) and directly hurt sideband suppression.
     float abs_freq_dev = fabsf(freq_dev);
     if (abs_freq_dev > handle->max_unclamped_freq_dev_hz) handle->max_unclamped_freq_dev_hz = abs_freq_dev;
+
+    // Slew-rate limit: see ssb_dsp_set_freq_dev_slew_limit_hz()'s doc
+    // comment in ssb_dsp.h. Runs AFTER the true-peak diagnostic above (so
+    // that stays meaningful) and BEFORE the magnitude clamp below (which
+    // still applies on top, unchanged, as a final safety net regardless
+    // of this setting). Off (limit_hz == SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ)
+    // reduces to freq_dev unchanged every sample - the delta can never
+    // exceed a limit that large, so neither branch below ever fires.
+    {
+        float limit_hz = handle->freq_dev_slew_limit_hz;
+        float delta = freq_dev - handle->slew_limited_prev_freq_dev_hz;
+        if (delta > limit_hz) delta = limit_hz;
+        else if (delta < -limit_hz) delta = -limit_hz;
+        freq_dev = handle->slew_limited_prev_freq_dev_hz + delta;
+        handle->slew_limited_prev_freq_dev_hz = freq_dev;
+    }
 
     // Clamp: prevents phase noise near zero-crossings of the envelope from
     // producing large spurious instantaneous-frequency spikes (this is the
