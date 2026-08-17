@@ -207,25 +207,25 @@ void handle_serial_commands(void)
             // in exactly PersistentSettings's field order (name,
             // audio_source, relative_delay_samples, env_pwm_offset,
             // env_pwm_scale, env_gdeq_enable, adc_lpf_mode, eq_enable,
-            // compressor_enable, master_gain_db, ad9851_output_enable) -
-            // wrapped in braces with a trailing comma so the whole line
-            // can be pasted directly into settingsPresets[] in settings.h
-            // as a new preset entry. Rename "Live" (and add a numbered
-            // comment above it, matching the existing presets' style)
-            // after pasting - and remember settings.h's static_assert
-            // ties the array size to the '0'-'9' range in this file, so
-            // adding an 11th preset needs that range widened too (see the
-            // static_assert's own comment in settings.h).
+            // compressor_enable, master_gain_db, ad9851_output_enable,
+            // env_predistort_enable, env_floor) - wrapped in braces with a
+            // trailing comma so the whole line can be pasted directly into
+            // settingsPresets[] in settings.h as a new preset entry.
+            // Rename "Live" (and add a numbered comment above it, matching
+            // the existing presets' style) after pasting - and remember
+            // settings.h's static_assert ties the array size to the
+            // '0'-'9' range in this file, so adding an 11th preset needs
+            // that range widened too (see the static_assert's own comment
+            // in settings.h).
             //
-            // Deliberately does NOT include envelope pre-distortion
-            // ('D', envelope_predistort.h) - not yet part of
-            // PersistentSettings, so it's reported as a separate line
-            // below instead of folded into the pasteable one. Worth
-            // knowing before pasting this into a preset: if 'D' is ON
-            // right now, the env_pwm_offset/env_pwm_scale values in the
-            // line below reflect the mapping that's currently INACTIVE
-            // (pre-distortion is overriding them) - they'll only take
-            // effect again once 'D' is toggled off.
+            // env_predistort_enable ('D', envelope_predistort.h) IS
+            // included now, folded into the pasteable line - worth knowing
+            // before pasting this into a preset: if 'D' is ON right now,
+            // the env_pwm_offset/env_pwm_scale values in the line below
+            // reflect the mapping that's currently INACTIVE (pre-distortion
+            // is overriding them) - they'll only take effect again on
+            // whichever of the two (env_predistort_enable=false, or 'D'
+            // toggled off live) happens first.
 #if AD9851_ATTACHED
             float rel_delay = relative_delay_get_samples();
             bool rf_enabled = carrier_output_get_rf_enabled();
@@ -245,7 +245,7 @@ void handle_serial_commands(void)
                 "ADC_LPF_MODE_OFF", "ADC_LPF_MODE_BUTTERWORTH", "ADC_LPF_MODE_CHEBYSHEV"
             };
             Serial.println("-> settings line (paste into settingsPresets[] in settings.h, then rename \"Live\"):");
-            Serial.printf("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s },\r\n",
+            Serial.printf("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff },\r\n",
                           audio_source_enum_name(dsp_state_get_audio_source()),
                           rel_delay,
                           envelope_output_get_pwm_offset(),
@@ -255,7 +255,9 @@ void handle_serial_commands(void)
                           ssb_dsp_get_eq_enabled(dsp_state_get_ssb()) ? "true" : "false",
                           ssb_dsp_get_compressor_enabled(dsp_state_get_ssb()) ? "true" : "false",
                           ssb_dsp_get_master_gain_db(dsp_state_get_ssb()),
-                          rf_enabled ? "true" : "false");
+                          rf_enabled ? "true" : "false",
+                          envelope_predistort_get_enabled() ? "true" : "false",
+                          envelope_floor_get());
         } else if (c >= '0' && c <= '9') {
             int preset = c - '0';
             const PersistentSettings& p = settingsPresets[preset];
@@ -287,6 +289,14 @@ void handle_serial_commands(void)
 #if AD9851_ATTACHED
             carrier_output_set_rf_enabled(p.ad9851_output_enable);
 #endif
+
+            // Both stateless/pure functions of their input (see
+            // envelope_predistort_set_enabled()'s and
+            // envelope_floor_set()'s own comments) - no reset-on-transition
+            // concern the way envelope_gdeq_set_enabled() has, so a plain
+            // set on every preset load is correct as-is.
+            envelope_predistort_set_enabled(p.env_predistort_enable);
+            envelope_floor_set(p.env_floor);
 
             Serial.printf("-> preset %d: %s\r\n", preset, p.name);
         }

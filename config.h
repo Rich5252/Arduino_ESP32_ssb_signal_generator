@@ -116,20 +116,28 @@
                                  // timing residual - see relative_delay.h's fractional delay
                                  // line, added specifically to test that instead. Must stay ODD
                                  // if changed again.
-#define MAX_FREQ_DEV_HZ    8000.0f  // TEMPORARILY raised from 2800.0f for diagnostic A/B
-                                     // testing - real hardware showed a consistent ~+100Hz
-                                     // offset on BOTH tones of a 700/1900Hz two-tone test
-                                     // (landed at 800/1999Hz) while a single 1000Hz tone was
-                                     // exactly on frequency; fast_atan2/fast_sqrt already ruled
-                                     // out via direct A/B (SSB_DSP_FAST_TRIG=0 test, no change).
-                                     // This tests whether the (symmetric) clamp is engaging
-                                     // asymmetrically against an asymmetric underlying two-tone
-                                     // deviation signal near the beat envelope's nulls - a
-                                     // single tone never approaches the old 2800Hz ceiling, so
-                                     // this wouldn't have been visible there either way. Revert
-                                     // to 2800.0f once this test is done, whichever way it goes -
-                                     // 8000Hz is deliberately generous for testing, not a
-                                     // considered permanent value.
+#define MAX_FREQ_DEV_HZ    8000.0f  // Originally raised from 2800.0f for a diagnostic A/B test -
+                                     // real hardware showed a consistent ~+100Hz offset on BOTH
+                                     // tones of a 700/1900Hz two-tone test (landed at 800/1999Hz)
+                                     // while a single 1000Hz tone was exactly on frequency;
+                                     // fast_atan2/fast_sqrt already ruled out via direct A/B
+                                     // (SSB_DSP_FAST_TRIG=0 test, no change). Raising the clamp
+                                     // let ssb_dsp.c's max_unclamped_freq_dev_hz diagnostic (see
+                                     // diagnostics.cpp's '[dsp] max_unclamped=' line) measure the
+                                     // TRUE peak deviation without the clamp masking it - came
+                                     // back ~4800-4900Hz for real two-tone signals (see
+                                     // FM_TEST_DEV_HZ below), well above the old 2800Hz ceiling,
+                                     // meaning that clamp was routinely engaging on real peaks,
+                                     // not just as a rare edge-case safety limit. Whether that
+                                     // clamping was actually the CAUSE of the +100Hz offset was
+                                     // never confirmed either way - that thread was left open.
+                                     //
+                                     // Separately, real hardware mic white-noise testing showed
+                                     // the freq-dev clamp performs better set higher - so 8000Hz
+                                     // is being KEPT for now rather than reverted to 2800.0f, but
+                                     // still isn't a deliberately-chosen final value (no attempt
+                                     // yet to find where between ~4900Hz and 8000Hz is actually
+                                     // optimal, vs. just "high enough to stop hurting").
 
 // ---- Isolation test signal parameters (ENVSTEP / FMTEST / AMTEST) - see
 // audio_source_t in settings.h for what each mode does. ----

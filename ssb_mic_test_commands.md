@@ -91,7 +91,7 @@ Master gain scales the *whole* chain (phase + envelope together, inside `ssb_dsp
 
 | Key | Effect |
 |---|---|
-| `f` | Toggle ADC low-pass filter bypass (raw vs. filtered) — for A/B testing whether an artifact comes from the filter |
+| `f` | Cycle the ADC anti-alias low-pass filter: off → Butterworth → Chebyshev → off. Both are 4th-order (two cascaded biquads), same 3kHz -3dB point; Chebyshev trades a small in-band ripple (~1.4dB) for noticeably more stopband rejection above cutoff — see `adc_capture.h`/`ssb_adc_filter.h`. For A/B testing whether an artifact comes from the filter, and which filter family/order helps most |
 | `v` | Mute/unmute the once-per-second `[timing]`/`[adc]`/`[dsp]` diagnostic block — mute this before adjusting other settings if you want to actually see the confirmation lines |
 | `r` | Reset all diagnostic counters/watermarks for a clean measurement window (doesn't touch any of the settings above, only the stats) |
 
@@ -99,7 +99,7 @@ Master gain scales the *whole* chain (phase + envelope together, inside `ssb_dsp
 
 | Key | Effect |
 |---|---|
-| `0`-`9` | Load a preset from `settings.h` — sets every lever above (audio source, relative delay, PWM offset/scale, gdeq, ADC LPF bypass, EQ, compressor, master gain, RF output) in one command. Boot banner lists the current names (dynamically, from the array's own size — always up to date). |
+| `0`-`9` | Load a preset from `settings.h` — sets every lever above (audio source, relative delay, PWM offset/scale, gdeq, ADC LPF mode, EQ, compressor, master gain, RF output, envelope pre-distortion, envelope-null floor) in one command. Boot banner lists the current names (dynamically, from the array's own size — always up to date). |
 | `P` | Print the current value of every one of those same levers as a single comma-separated line, wrapped in `{ ... },` and in exactly `PersistentSettings`'s field order — copy/paste it straight into the `settingsPresets[]` array in `settings.h` as a new preset. Rename the placeholder `"Live"` name (and add a numbered comment above it, matching the existing presets' style) after pasting. |
 
 Edit the `settingsPresets` array in `settings.h` to change them, or dial in levers live and use `P` to generate the line instead of hand-typing values — check the live boot banner or `settings.h` itself for the current name/count rather than this doc, since the preset list changes often during active tuning. There's a compile-time check tying the array size to the `'0'`-`'9'` range (`settings.h`'s `static_assert`), so resizing it without updating `loop()`/`setup()`/`serial_commands.cpp`'s preset-select block — and the boot banner's own preset listing loop, which now reads the array size directly rather than a hardcoded count — fails the build instead of silently misbehaving.
@@ -111,7 +111,7 @@ Edit the `settingsPresets` array in `settings.h` to change them, or dial in leve
 - Master gain: -2dB
 - Relative delay: 0 samples
 - Envelope group-delay equalizer: off
-- `MAX_FREQ_DEV_HZ`: 8000Hz (temporarily raised from the original 2800Hz for diagnostic testing — revert before considering this production-ready)
+- `MAX_FREQ_DEV_HZ`: 8000Hz. Originally raised from 2800Hz just to measure the real unclamped two-tone peak deviation (`[dsp] max_unclamped`, see `diagnostics.cpp`) while chasing a ~+100Hz two-tone frequency offset; that measurement came back ~4800-4900Hz — well above the old 2800Hz ceiling, meaning that clamp was routinely engaging on real signal peaks, not just as an edge-case safety limit. Whether that clamping was actually the *cause* of the +100Hz offset was never confirmed either way. Separately, real-hardware mic white-noise testing showed the freq-dev clamp performs better set higher, so **8000Hz is being kept for now** rather than reverted to 2800Hz — not yet landed on a final permanent value.
 
 ## Quick workflow reminders
 
