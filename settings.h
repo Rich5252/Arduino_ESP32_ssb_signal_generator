@@ -130,7 +130,7 @@ static const PersistentSettings settingsPresets[10] =
 {
     // Preset 0 - Normal microphone operation
 
-    {"Micr latest 16kFs",  AUDIO_SRC_MIC, 2.50f, 0.34f, 0.66f, true, ADC_LPF_MODE_CHEBYSHEV, false, true, 4.1f, true, false, 0.00f,
+    {"Micr latest 16kFs",  AUDIO_SRC_MIC, 2.50f, 0.34f, 0.66f, true, ADC_LPF_MODE_CHEBYSHEV, true, true, 4.1f, true, false, 0.00f,
     SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, true },
     
     // Preset 1 - Two-tone test
