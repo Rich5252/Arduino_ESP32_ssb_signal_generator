@@ -129,8 +129,8 @@ static const PersistentSettings settingsPresets[10] =
     // Preset 1 - Two-tone test
     {
     "TwoTone Base",
-    AUDIO_SRC_TWOTONE, 0.0f, 0.36f, 0.48f, false, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f,
-    SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ},  // freq_dev_slew_limit_hz
+     AUDIO_SRC_TWOTONE, 0.00f, 0.20f, 0.90f, false, ADC_LPF_MODE_OFF, false, false, -2.0f, true, false, 0.00f, 
+     SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ },  // freq_dev_slew_limit_hz
 
     // Preset 2 - Single-tone test
     {
