@@ -95,6 +95,14 @@ typedef struct
     float freq_dev_slew_limit_hz; // '{'/'}' - freq_dev slew-rate limit, Hz/sample (ssb_dsp.h);
                                    // SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ = off
 
+    // Added when this lever was introduced (envelope output interpolation,
+    // envelope_interp.h) - appended at the END for the same reason every
+    // trailing field above was: every existing preset's POSITIONAL
+    // initializer list below still lines up unchanged, only this one new
+    // trailing value needed adding to each.
+    bool envelope_interp_enable;  // 'I' - ENVELOPE_INTERP_FACTOR-x envelope output
+                                   // interpolation (envelope_interp.h), off by default
+
 } PersistentSettings;
 
 
@@ -122,15 +130,15 @@ static const PersistentSettings settingsPresets[10] =
 {
     // Preset 0 - Normal microphone operation
 
-    {"Micr latest 16kFs", AUDIO_SRC_MIC, 2.43f, 0.40f, 0.42f, true, ADC_LPF_MODE_CHEBYSHEV, true, true, 11.0f, true, true, 0.0f,               // env_floor
-        SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ  // freq_dev_slew_limit_hz},
+    {"Micr latest 16kFs",  AUDIO_SRC_MIC, 2.50f, 0.34f, 0.66f, true, ADC_LPF_MODE_CHEBYSHEV, false, true, 4.1f, true, false, 0.00f,
+    SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, true },
     },
 
     // Preset 1 - Two-tone test
     {
     "TwoTone Base",
-     AUDIO_SRC_TWOTONE, 0.00f, 0.20f, 0.90f, false, ADC_LPF_MODE_OFF, false, false, -2.0f, true, false, 0.00f, 
-     SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ },  // freq_dev_slew_limit_hz
+    AUDIO_SRC_TWOTONE, 0.00f, 0.20f, 0.90f, false, ADC_LPF_MODE_OFF, false, false, -2.0f, true, false, 0.00f,
+    SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false },
 
     // Preset 2 - Single-tone test
     {
@@ -147,11 +155,12 @@ static const PersistentSettings settingsPresets[10] =
         true,               // ad9851_output_enable
         false,              // env_predistort_enable
         0.0f,               // env_floor
-        SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ  // freq_dev_slew_limit_hz
+        SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ,  // freq_dev_slew_limit_hz
+        false               // envelope_interp_enable
     },
 
     // Preset 3 - Envelope / PWM test
-        { "BesselNoGD", AUDIO_SRC_TWOTONE, -0.96f, 0.00f, 0.90f, false, ADC_LPF_MODE_OFF, false, false, 2.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ },  // was -0.60f @ 10000Hz; adc_lpf_bypass=true
+        { "BesselNoGD", AUDIO_SRC_TWOTONE, -0.96f, 0.00f, 0.90f, false, ADC_LPF_MODE_OFF, false, false, 2.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false },  // was -0.60f @ 10000Hz; adc_lpf_bypass=true
 
                         // relative_delay_samples
                        // env_pwm_offset
@@ -165,21 +174,22 @@ static const PersistentSettings settingsPresets[10] =
                        // env_predistort_enable
                         // env_floor
                         // freq_dev_slew_limit_hz
+                        // envelope_interp_enable
 
     // Preset 4 - Diagnostic / raw ADC
-    { "AM-ButwGd", AUDIO_SRC_AMTEST, 2.96f, 0.08f, 0.84f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
+    { "AM-ButwGd", AUDIO_SRC_AMTEST, 2.96f, 0.08f, 0.84f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
 
     // Preset 5 -
-    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.43f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV, false, false, 1.0f, true, true, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ},  // was 1.55f @ 10000Hz; adc_lpf_bypass=true
+    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.43f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV, false, false, 1.0f, true, true, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false},  // was 1.55f @ 10000Hz; adc_lpf_bypass=true
 
         // Preset 6 -
-    { "TwoToneButwGD Env 1.6-2.9 DelayTuned", AUDIO_SRC_TWOTONE, 2.64f, 0.36f, 0.48f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ },  // was 1.65f @ 10000Hz; adc_lpf_bypass=true
+    { "TwoToneButwGD Env 1.6-2.9 DelayTuned", AUDIO_SRC_TWOTONE, 2.64f, 0.36f, 0.48f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false },  // was 1.65f @ 10000Hz; adc_lpf_bypass=true
         // Preset 7 -
-    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.96f, 0.40f, 0.46f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
+    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.96f, 0.40f, 0.46f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
         // Preset 8 -
-    { "FM Env 2.2", AUDIO_SRC_FMTEST, 2.96f, 0.12f, 0.48f, true, ADC_LPF_MODE_OFF, false, false, 0.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
+    { "FM Env 2.2", AUDIO_SRC_FMTEST, 2.96f, 0.12f, 0.48f, true, ADC_LPF_MODE_OFF, false, false, 0.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
         // Preset 9 -
-    { "AM Env = 1.6 - 2.9", AUDIO_SRC_AMTEST, 3.04f, 0.28f, 0.70f, true, ADC_LPF_MODE_OFF, true, true, -4.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ }  // was 1.90f @ 10000Hz; adc_lpf_bypass=true
+    { "AM Env = 1.6 - 2.9", AUDIO_SRC_AMTEST, 3.04f, 0.28f, 0.70f, true, ADC_LPF_MODE_OFF, true, true, -4.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false }  // was 1.90f @ 10000Hz; adc_lpf_bypass=true
 };
 
 // If this array's size ever changes, ssb_mic_test.ino's serial handler

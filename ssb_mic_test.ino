@@ -122,6 +122,7 @@
 #include "carrier_output.h"
 #endif
 #include "envelope_output.h"
+#include "envelope_interp.h"
 #include "diagnostics.h"
 #include "serial_commands.h"
 
@@ -176,9 +177,93 @@ static void IRAM_ATTR dsp_task(void* arg)
     carrier_output_set_freq_dev(0.0f);
 #endif
 
+    // Fast-tick counter for envelope_interp's v4 design (see envelope_
+    // interp.h): the sample gptimer itself now runs at ENVELOPE_INTERP_
+    // FACTOR x SAMPLE_RATE_HZ, but the full DSP pipeline below still only
+    // runs on 1 in ENVELOPE_INTERP_FACTOR of those wakes ("full" ticks,
+    // still true SAMPLE_RATE_HZ) - the rest just walk envelope_interp's
+    // linear ramp and return immediately. dsp_task-private, single-
+    // threaded - see init_sample_timer() for the timer side of this.
+    uint32_t fast_tick_count = 0;
+    // Which ENVELOPE_INTERP_FACTOR-sized "group" of fast ticks the last
+    // full tick belonged to (fast_tick_count / ENVELOPE_INTERP_FACTOR) -
+    // see the is_full_tick check below for why this replaced a plain
+    // "% ENVELOPE_INTERP_FACTOR == 0" check.
+    uint32_t last_full_group = 0;
+
     while (1) {
-        // Block until the timer ISR notifies us - this sets our sample rate.
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // Block until the timer ISR notifies us - this sets our fast tick
+        // rate (ENVELOPE_INTERP_FACTOR x SAMPLE_RATE_HZ - see above).
+        //
+        // ulTaskNotifyTake(pdTRUE, ...) - xClearCountOnExit=pdTRUE - CLEARS
+        // FreeRTOS's notification count to 0 on every take, but its RETURN
+        // VALUE is how many times the ISR actually gave (i.e. how many
+        // real fast-tick periods have elapsed) since our last take - if
+        // dsp_task is ever even briefly late getting back here (a cache
+        // stall, a moment of contention, anything), two or more real
+        // 15.6us hardware periods can coalesce into a single wake. Bug
+        // fix (found on real hardware: envelope timing was jittery, IMDs
+        // shuffled, EVEN WITH 'I' fully disabled): the first cut of this
+        // loop discarded that return value and did a bare fast_tick_
+        // count++ per wake, which silently desyncs fast_tick_count from
+        // the TRUE hardware period count the moment even one coalescing
+        // event happens - after that, "full" ticks (where the real DSP
+        // work and the real PWM write happen) start firing at the wrong,
+        // irregular offsets relative to the true SAMPLE_RATE_HZ grid,
+        // indefinitely, until another coalescing event randomly happens
+        // to correct (or worsen) the drift. That's sample-clock jitter on
+        // the DSP rate itself - explains both symptoms (irregular
+        // envelope timing; IMDs moving both up and down, not uniformly,
+        // which is what jitter does to a spurious floor). Fix: advance
+        // fast_tick_count by the ACTUAL elapsed count, not by 1 - it then
+        // always equals the true cumulative hardware period count since
+        // boot, so long-run phase can never PERMANENTLY drift, no matter
+        // how many wakes it took to get there.
+        uint32_t elapsed_fast_ticks = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (elapsed_fast_ticks < 1) {
+            elapsed_fast_ticks = 1;   // shouldn't happen (portMAX_DELAY blocks until >=1), defensive only
+        }
+        fast_tick_count += elapsed_fast_ticks;
+
+        // Bug fix on top of the above (found on real hardware: envelope
+        // still "moving around" even after the fix above landed): a bare
+        // "fast_tick_count % ENVELOPE_INTERP_FACTOR == 0" check assumes a
+        // coalescing event always lands EXACTLY on a multiple of
+        // ENVELOPE_INTERP_FACTOR. It doesn't have to - if a full tick's
+        // own DSP processing occasionally takes long enough that MORE
+        // than ENVELOPE_INTERP_FACTOR real hardware periods elapse before
+        // getting back here, fast_tick_count can jump straight PAST the
+        // next full-tick boundary (e.g. 3 -> 8, skipping 4 entirely) - a
+        // plain modulo check then stays false for several more ticks
+        // until the count next happens to land exactly on a multiple,
+        // meaning that period's real DSP sample (ADC/Hilbert/atan2/AD9851/
+        // the lot) is skipped outright, not just an interpolation cosmetic
+        // step - and the NEXT full tick is delayed by however many extra
+        // sub-periods it takes to re-land on a clean multiple, compounding
+        // the original overrun instead of just absorbing it. Comparing
+        // which ENVELOPE_INTERP_FACTOR-sized GROUP fast_tick_count falls
+        // into, rather than its exact remainder, fixes this: any update
+        // that crosses one or more group boundaries is recognized as a
+        // full tick immediately, on the very next wake, however far past
+        // the exact boundary the coalesced count landed - so a bad
+        // overrun still costs the one sample it made unrecoverable, but
+        // never cascades into delaying subsequent ones too.
+        uint32_t fast_tick_group = fast_tick_count / ENVELOPE_INTERP_FACTOR;
+        bool is_full_tick = (fast_tick_group != last_full_group);
+        if (is_full_tick) {
+            last_full_group = fast_tick_group;
+        }
+
+        if (!is_full_tick) {
+            // Cheap path: no ADC read, no DSP compute, no AD9851/DAC/
+            // diagnostics work - just one more step of envelope_interp's
+            // ramp (a no-op when interpolation is disabled). Everything
+            // below this block is the ORIGINAL per-tick body, unchanged,
+            // now only reached on the 1-in-ENVELOPE_INTERP_FACTOR "full"
+            // ticks.
+            envelope_interp_on_interp_tick();
+            continue;
+        }
 
 #if TIMING_DEBUG_ENABLED
         digitalWrite(TIMING_DEBUG_GPIO, HIGH);
@@ -305,7 +390,13 @@ static void IRAM_ATTR dsp_task(void* arg)
         relative_delay_apply(freq_dev_hz, envelope, &delayed_freq_dev_hz, &delayed_envelope);
 #endif
 
-        envelope_output_write_pwm(delayed_envelope);
+        // t_start_us (captured at the very top of this tick, before any
+        // DSP processing) is passed through so envelope_interp's ramp can
+        // use it as its own t=0 reference - see envelope_interp.h's v4.1
+        // note for why a timestamp taken at THIS call site instead
+        // (after the full pipeline above has already run) would make the
+        // ramp's timing wrong, not just imprecise.
+        envelope_interp_on_full_tick(delayed_envelope, t_start_us);
 
 #if AD9851_ATTACHED
         uint32_t tx_freq = carrier_output_set_freq_dev(delayed_freq_dev_hz);
@@ -350,13 +441,20 @@ static void IRAM_ATTR dsp_task(void* arg)
     }
 }
 
+// Fires at ENVELOPE_INTERP_FACTOR x SAMPLE_RATE_HZ now (envelope_interp.h's
+// v4 design - see dsp_task's own fast-tick-counter comment for the other
+// half of this). resolution_hz is scaled up by the same factor alarm_count
+// is scaled down by, so alarm_count comes out to EXACTLY the same value
+// (2000000/SAMPLE_RATE_HZ) it always was - this is still the identical
+// "N ticks of a M Hz clock" relationship this timer has always used, just
+// counting a faster clock the same number of ticks, not a new formula.
 static void init_sample_timer(void)
 {
     gptimer_handle_t timer = NULL;
     gptimer_config_t timer_cfg = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 2000000, // 1MHz tick = 1us resolution
+        .resolution_hz = 2000000UL * ENVELOPE_INTERP_FACTOR,
     };
     gptimer_new_timer(&timer_cfg, &timer);
 
@@ -366,7 +464,7 @@ static void init_sample_timer(void)
     gptimer_register_event_callbacks(timer, &cbs, NULL);
 
     gptimer_alarm_config_t alarm_cfg = {
-        .alarm_count = 2000000 / SAMPLE_RATE_HZ,
+        .alarm_count = 2000000UL / SAMPLE_RATE_HZ,
         .reload_count = 0,
     };
     alarm_cfg.flags.auto_reload_on_alarm = true;  // nested dotted designators aren't valid C++
@@ -440,6 +538,7 @@ void setup()
     // command switches source at runtime.
     adc_capture_init();
     envelope_output_init();
+    envelope_interp_init();
 
     // dsp_task on Core 0, high priority - the phase-critical path.
     xTaskCreatePinnedToCore(dsp_task, "ssb_dsp_task", 4096, NULL,
@@ -487,6 +586,11 @@ void setup()
                   "table that REPLACES the 'u'/'j'/'i'/'k' linear offset/scale mapping while on, "
                   "not yet validated beyond the measurement itself.\r\n",
                   envelope_predistort_get_enabled() ? "ON" : "off");
+    Serial.printf("Send 'I' to toggle %dx envelope output interpolation (currently %s) - smooths the "
+                  "PWM duty staircase between DSP ticks to push its zero-order-hold spectral image "
+                  "out past the analog filter's stopband (per QMX's own amplitude-interpolation "
+                  "trick), not yet validated on real hardware.\r\n",
+                  ENVELOPE_INTERP_FACTOR, envelope_interp_get_enabled() ? "ON" : "off");
     Serial.printf("Send 'x'/'z' to raise/lower the envelope-null floor (currently %.2f) - smoothly "
                   "compresses envelope's [0,1] range into [floor,1], to keep two-tone nulls out "
                   "of the predistort LUT's steepest region; 0.00 = off.\r\n",

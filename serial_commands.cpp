@@ -10,6 +10,7 @@
 #include "envelope_predistort.h"
 #include "envelope_floor.h"
 #include "envelope_output.h"
+#include "envelope_interp.h"
 #include "diagnostics.h"
 #include "settings.h"
 #include "ssb_dsp.h"
@@ -161,6 +162,11 @@ void handle_serial_commands(void)
             ssb_dsp_lower_freq_dev_slew_limit(dsp_state_get_ssb());
             float limit = ssb_dsp_get_freq_dev_slew_limit_hz(dsp_state_get_ssb());
             Serial.printf("-> freq_dev slew-rate limit tightened to %.0fHz/sample (see ssb_dsp.h)\r\n", limit);
+        } else if (c == 'I') {
+            bool now_on = !envelope_interp_get_enabled();
+            envelope_interp_set_enabled(now_on);   // internally seeds prev/target on an off->on transition
+            Serial.printf("-> %dx envelope output interpolation %s (see envelope_interp.h)\r\n",
+                          ENVELOPE_INTERP_FACTOR, now_on ? "ON" : "off");
         } else if (c == 'f') {
             // Cycles off -> Butterworth -> Chebyshev -> off. See
             // adc_capture.h's adc_lpf_mode_t / ADC_LPF_CUTOFF_HZ /
@@ -220,7 +226,8 @@ void handle_serial_commands(void)
             // audio_source, relative_delay_samples, env_pwm_offset,
             // env_pwm_scale, env_gdeq_enable, adc_lpf_mode, eq_enable,
             // compressor_enable, master_gain_db, ad9851_output_enable,
-            // env_predistort_enable, env_floor, freq_dev_slew_limit_hz) -
+            // env_predistort_enable, env_floor, freq_dev_slew_limit_hz,
+            // envelope_interp_enable) -
             // wrapped in braces with a trailing comma so the whole line
             // can be pasted directly into settingsPresets[] in settings.h
             // as a new preset entry.
@@ -270,7 +277,7 @@ void handle_serial_commands(void)
                 snprintf(slew_str, sizeof(slew_str), "%.0ff", slew_limit);
             }
             Serial.println("-> settings line (paste into settingsPresets[] in settings.h, then rename \"Live\"):");
-            Serial.printf("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s },\r\n",
+            Serial.printf("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s },\r\n",
                           audio_source_enum_name(dsp_state_get_audio_source()),
                           rel_delay,
                           envelope_output_get_pwm_offset(),
@@ -283,7 +290,8 @@ void handle_serial_commands(void)
                           rf_enabled ? "true" : "false",
                           envelope_predistort_get_enabled() ? "true" : "false",
                           envelope_floor_get(),
-                          slew_str);
+                          slew_str,
+                          envelope_interp_get_enabled() ? "true" : "false");
         } else if (c >= '0' && c <= '9') {
             int preset = c - '0';
             const PersistentSettings& p = settingsPresets[preset];
@@ -328,6 +336,12 @@ void handle_serial_commands(void)
             // same as master_gain_db) - no reset-on-transition concern,
             // safe to call unconditionally on every preset load.
             ssb_dsp_set_freq_dev_slew_limit_hz(dsp_state_get_ssb(), p.freq_dev_slew_limit_hz);
+
+            // Same reset-on-enable reasoning as the 'g'/'I' handlers -
+            // shared via envelope_interp_set_enabled() itself, so an
+            // off->on transition on preset load seeds prev/target cleanly
+            // too, not just when toggled live.
+            envelope_interp_set_enabled(p.envelope_interp_enable);
 
             Serial.printf("-> preset %d: %s\r\n", preset, p.name);
         }
