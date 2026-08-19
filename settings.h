@@ -132,6 +132,19 @@ static const PersistentSettings settingsPresets[10] =
 
     {"Micr latest 16kFs",    AUDIO_SRC_MIC, 2.48f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV, false, false, 33.0f, true, false, 0.00f,
     SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, true },
+                                                    // relative_delay_samples
+                                                    // env_pwm_offset
+                                                    // env_pwm_scale
+                                                    // env_gdeq_enable
+                                                    // adc_lpf_mode
+                                                    // eq_enable
+                                                    // compressor_enable
+                                                    // master_gain_db
+                                                    // ad9851_output_enable
+                                                    // env_predistort_enable
+                                                    // env_floor
+                                                    // freq_dev_slew_limit_hz
+                                                    // envelope_interp_enable
     
     // Preset 1 - Two-tone test
     {
