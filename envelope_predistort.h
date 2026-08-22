@@ -27,7 +27,7 @@
  * ranging set to its full 0-100% span (offset=0, scale=1) so the
  * measurement isn't pre-restricted to any particular sub-window.
  *
- * REVISION 2 (current): 95 dBm readings at 0.1-0.5dB command steps (using
+ * REVISION 2 (superseded): 95 dBm readings at 0.1-0.5dB command steps (using
  * the '.'/',' fine master-gain command, see config.h's
  * MASTER_GAIN_FINE_STEP_DB) from -16dB to +5dB, densest through -11dB to
  * -5dB where the curve is steepest, plus 17 DC gate-voltage readings at
@@ -52,9 +52,60 @@
  * (only ~4 of the 19 points fell in it) - this revision exists to fix
  * that.
  *
- * PCHIP specifically (not a plain cubic spline), both revisions, to avoid
- * overshoot/ringing through the steep BS170 turn-on region, which would
- * break the monotonicity a pre-distortion table depends on to be
+ * REVISION 3 (current): built from an automated SDRuno logger (not a
+ * manual point-by-point read like REVISIONS 1-2), sweeping the '.'/','
+ * fine master-gain command in 0.1dB steps from -30dB to +6.2dB - 363
+ * dBm readings, far denser AND far wider-range than REVISION 2's 95
+ * points over -16dB to +5dB, with visibly tighter repeatability (the
+ * flat noise-floor segment scatters by only +/-0.037dB across 101
+ * points) than a hand-read sweep could manage.
+ *
+ * Gate-voltage side NOT re-measured this revision (the automated logger
+ * can't read it) - instead confirmed, not assumed: three spot checks
+ * against REVISION 2's 17-point gate-voltage curve (0dB: 2.40V vs.
+ * REVISION 2's 2.44V; the saturation ceiling: 3.26V, an exact match) show
+ * the curve's own shape hasn't moved, so REVISION 2's interior
+ * gate-voltage curve was kept UNCHANGED and only extended at both ends
+ * with two new anchor points (-30dB=0.98V, +6.2dB=3.26V) so the wider new
+ * domain doesn't rely on PCHIP extrapolating past REVISION 2's original
+ * -16dB/+5dB fitted range (which the REVISION 1/2 notes below already
+ * flag as going wild fast outside its domain).
+ *
+ * What changed vs. REVISION 2, in duty terms: the floor (LUT[0]) moved
+ * from 0.3129 to 0.3008 - the new sweep's lower floor (down to -30dB
+ * command, vs. REVISION 2's -16dB) resolves a bit more real signal before
+ * hitting the true noise floor (found flat at -97.96dBm from -30dB to
+ * -20dB, with a faint but real rising tail from -20dB to -17dB REVISION 2
+ * never saw). Through the steep turn-on region the new data consistently
+ * wants ~1.0-1.5 duty-percentage-points MORE than REVISION 2 assumed (the
+ * new RF sweep reads ~0.28dB more attenuated there, on average, than
+ * REVISION 2 measured - a real circuit/measurement difference, not
+ * noise, given how tight this revision's repeatability is). The single
+ * biggest change is at the top: LUT[64] moved from 0.9495 to 0.9882 - the
+ * old table's steep-turn-on-only measurement density meant it never
+ * caught the full slow final approach to saturation (REVISION 2 only
+ * swept to +5dB; this revision's readings only truly flatten out by
+ * ~+3.3dB and hold flat to +6.2dB), so REVISION 2 was likely under-driving
+ * at full-envelope commands.
+ *
+ * Resolution check (does 65 points do this new data justice?): simulating
+ * envelope_predistort_process()'s own linear interpolation against the
+ * dense 363-point ground truth shows the table is a good match almost
+ * everywhere (RMS error under 5 of the RSET LEDC channel's 1024 PWM
+ * counts), but two spots fall short of that: the final bin (98.4%-100%
+ * envelope) alone accounts for up to ~29 counts of error, since the
+ * curve's steep final approach to saturation doesn't fit well in one
+ * straight segment; a few bins through the turn-on-to-plateau transition
+ * (roughly 22-44% envelope) show 6-10 counts. If real-hardware
+ * two-tone/IMD testing (see below) shows this matters in practice, the
+ * fix is concentrating more points in those two specific regions (a
+ * REVISION 4, non-uniform grid) rather than a blanket doubling - flagged
+ * here rather than pre-emptively done, since it wasn't asked for and
+ * REVISION 3 hasn't been validated on hardware yet at all.
+ *
+ * PCHIP specifically (not a plain cubic spline), all three revisions, to
+ * avoid overshoot/ringing through the steep BS170 turn-on region, which
+ * would break the monotonicity a pre-distortion table depends on to be
  * invertible at all.
  *
  * Shape found (confirmed and sharpened by REVISION 2): near-dead below
@@ -68,9 +119,14 @@
  * 2 revealed RF output actually plateaus at its max measured level by
  * ~95% duty (dBm flat from there to 100%), so the true "envelope=1"
  * duty is ~0.9495, not 1.0 - REVISION 1 didn't have a fine enough grid
- * near the top to see this and assumed literal 100%. No genuinely linear
- * stretch anywhere, which is why a shaping table (not just picking a
- * "clean window" sub-range) was the right fix.
+ * near the top to see this and assumed literal 100%. REVISION 3's wider,
+ * denser top-end sweep sharpened this further: the plateau doesn't
+ * actually finish settling until duty is ~98.8%, not ~95% - REVISION 2's
+ * own top-end density (stopping at +5dB) wasn't quite enough to catch the
+ * last of the climb either, same class of miss as REVISION 1 had, just a
+ * smaller version of it. No genuinely linear stretch anywhere, which is
+ * why a shaping table (not just picking a "clean window" sub-range) was
+ * the right fix.
  *
  * A real-hardware A/B test of REVISION 1 surfaced two IMPORTANT NEGATIVE
  * RESULTS worth recording so they aren't retried: (1) trying to avoid
@@ -91,8 +147,10 @@
  * full measured range. See serial_commands.cpp's 'D' handler for the
  * toggle and its console note about this.
  *
- * NOT YET VALIDATED ON REAL HARDWARE beyond the measurement itself - the
- * table is only as good as this revision's 95 points. Off by default so
+ * REVISION 3 NOT YET VALIDATED ON REAL HARDWARE beyond the measurement
+ * itself - REVISION 2 did get a real-hardware A/B (see the IMPORTANT
+ * NEGATIVE RESULTS above), but REVISION 3 is a straight table swap that
+ * hasn't been re-run through two-tone/IMD testing yet. Off by default so
  * existing tuning isn't disturbed until deliberately opted into, same
  * convention as envelope_gdeq.h's 'g'.
  */
