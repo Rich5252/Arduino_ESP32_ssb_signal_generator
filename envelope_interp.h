@@ -157,8 +157,8 @@
  *
  * No locking anywhere in this version, unlike v1-v3 (which all needed a
  * spinlock because an ISR or second task shared the ramp state directly):
- * s_prev_env/s_target_env/s_tick_start_us/s_last_value are dsp_task-
- * PRIVATE - on_full_tick()/on_interp_tick() are only ever called from dsp_task
+ * s_p0..s_p3/s_m1/s_m2/s_tick_start_us/s_last_value are dsp_task-PRIVATE -
+ * on_full_tick()/on_interp_tick() are only ever called from dsp_task
  * itself, strictly sequentially, and no other task reaches into them.
  * envelope_interp_set_enabled() IS called from a different task (whichever
  * one processes serial commands - loop(), Core 1) - but rather than
@@ -190,6 +190,75 @@
  * always made), but worth watching on the existing '[timing]' diagnostic
  * overlay ('v') after enabling 'I', same as every other not-yet-bench-
  * confirmed feature here.
+ *
+ * ---- v4.2: linear ramp -> Catmull-Rom / cubic Hermite curve ----
+ * Motivated by a real question: is there a cheaper way to improve
+ * envelope-path fidelity than raising ENVELOPE_INTERP_FACTOR to 8?
+ * Answer: raising it further is a dead end regardless of CPU budget -
+ * RSET_MOD_LEDC_FREQ_HZ (the LEDC PWM carrier, fixed at 78125Hz) is a
+ * hard ceiling on any useful envelope update rate, and 4x (64kHz) is
+ * already the highest multiple of SAMPLE_RATE_HZ that stays under it; 8x
+ * (128kHz) would write the duty register faster than the PWM carrier
+ * itself can act on it, for zero real benefit. Curve SHAPE, not update
+ * RATE, was the remaining lever: v4's ramp is a straight line between
+ * consecutive full-tick samples, which has a kink at every tick boundary
+ * - real spectral content a smooth signal shouldn't have. Catmull-Rom
+ * fits a smooth cubic through the same samples instead, with no extra
+ * PWM/wake-rate cost at all (same 4 calls per full tick as before, still
+ * ENVELOPE_INTERP_FACTOR=4 - a few more FLOPs per call is the entire
+ * added cost).
+ *
+ * Validated first in an offline Python simulation (not this codebase)
+ * against two of this project's own real test signals, not an arbitrary
+ * synthetic one: the two-tone envelope (700/1900Hz, TWOTONE_AMPLITUDE=
+ * 0.45 - closed-form analytic envelope = 2A*|cos(pi*(f2-f1)*t)|, a
+ * full-wave-rectified 600Hz cosine with a hard null every 1/1200s) and
+ * the AM-test envelope (AM_TEST_MOD_HZ=1200Hz smooth sine, no fold at
+ * all). Result was a genuine split, not a clean win either way: ~23dB
+ * interpolation-error reduction on the smooth AM-test envelope, but only
+ * ~2dB on the two-tone envelope specifically - because that error is
+ * dominated by the null's own hard fold (a derivative discontinuity),
+ * which no smooth interpolant, linear or cubic, can fit well; null-region
+ * behavior is envelope_floor's job, not this one's. So: worth having as a
+ * general envelope-quality improvement (mic audio and most other test
+ * modes should see something closer to the AM-test result), but don't
+ * expect it to move the two-tone IMD3 number much on its own.
+ *
+ * Data layout: s_prev_env/s_target_env (2 points) became s_p0..s_p3 (4
+ * consecutive full-tick samples, oldest to newest) plus two tangents
+ * s_m1/s_m2, all recomputed once per full tick and reused across that
+ * tick's interp ticks - same reuse pattern v4 already used, just wider
+ * history. The segment actually RENDERED during any given full tick is
+ * [s_p1,s_p2] - s_p0/s_p3 only shape the tangents at each end (standard
+ * Catmull-Rom: m1=(p2-p0)/2, m2=(p3-p1)/2), they're never points the
+ * curve itself passes through.
+ *
+ * Latency cost: v4 already added one full tick (~62.5us) of group delay
+ * by design (see "arrives at the new value only at the far end of the
+ * interval" above) - v4.2 adds ONE MORE full tick on top of that (~125us
+ * total now), because the tangent at the segment's own right end (s_m2)
+ * needs s_p3 - the NEXT full tick's value - which only becomes known the
+ * instant that next tick's on_full_tick() call happens. This is the
+ * standard Catmull-Rom look-ahead requirement, not a bug, and it's
+ * exactly the same category of fixed envelope-path delay relative_delay
+ * ('['/']') already exists to compensate - re-tune it after enabling,
+ * same as 'g' and 'I' itself already ask you to.
+ *
+ * A cubic, unlike v4's straight line, can mathematically over/undershoot
+ * slightly beyond its own segment endpoints on a sharp enough feature -
+ * neither real test signal above triggered this, but a synthetic
+ * worst-case check (two duty-0 samples flanked by two much higher ones -
+ * close to what a two-tone null looks like) did produce a small negative
+ * excursion. compute_ramp_value() clamps its result to [0,1] to close
+ * this off unconditionally, since envelope_output_write_pwm() casts
+ * straight to an unsigned duty with no clamp of its own downstream - an
+ * unclamped negative excursion would become a huge duty via unsigned
+ * wraparound, not a small negative one.
+ *
+ * NOT yet validated on real hardware - baseline already captured before
+ * this change (linear 'I' x4, current 'D' predistort table) via the
+ * user's own logger, specifically so this change has a direct before/
+ * after to compare against once flashed.
  */
 
 #include <stdbool.h>

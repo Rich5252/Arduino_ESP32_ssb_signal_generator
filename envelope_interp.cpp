@@ -9,6 +9,11 @@
  * on_interp_tick() and compute_ramp_value() below) - fixes real,
  * structural jitter found on hardware even after the notification-
  * coalescing fix. See envelope_interp.h for the full explanation.
+ *
+ * v4.2: straight-line ramp -> Catmull-Rom / cubic Hermite curve. Only the
+ * CURVE compute_ramp_value() evaluates changed - the time-accurate frac
+ * derivation from v4.1 is untouched. See envelope_interp.h for the
+ * simulation results and latency tradeoff behind this.
  */
 
 #include "envelope_interp.h"
@@ -24,14 +29,19 @@
 // way nothing else was, so it gets its own float-precision constant.
 static const float SAMPLE_PERIOD_US_F = 1.0e6f / (float)SAMPLE_RATE_HZ;
 
-// s_prev_env/s_target_env/s_tick_start_us/s_last_value are dsp_task-
-// PRIVATE - only on_full_tick()/on_interp_tick() ever touch them, and both
-// are only ever called from dsp_task itself, strictly sequentially. No
-// other task reaches into these, so no volatile/locking is needed for
-// them at all (a genuine change from v1-v3, which all needed a spinlock
-// because an ISR or second task shared this exact state).
-static float   s_prev_env     = 0.0f;
-static float   s_target_env   = 0.0f;
+// v4.2: FOUR consecutive full-tick envelope samples now, not two - s_p0
+// (oldest) through s_p3 (newest) - plus the two Hermite tangents for the
+// segment currently being rendered (s_m1/s_m2), recomputed once per full
+// tick and reused across that tick's interp ticks, same as v4's
+// s_prev_env/s_target_env were. Still dsp_task-PRIVATE for the same
+// reason as v4 (see below) - only on_full_tick()/on_interp_tick() ever
+// touch them, both only ever called from dsp_task itself, strictly
+// sequentially. No other task reaches into these, so no volatile/locking
+// is needed for them at all (a genuine change from v1-v3, which all
+// needed a spinlock because an ISR or second task shared this exact
+// state).
+static float   s_p0 = 0.0f, s_p1 = 0.0f, s_p2 = 0.0f, s_p3 = 0.0f;
+static float   s_m1 = 0.0f, s_m2 = 0.0f;  // tangents for the current [s_p1,s_p2] segment
 static int64_t s_tick_start_us = 0;   // esp_timer_get_time() at the TRUE start of the current full tick - see header comment
 static float   s_last_value   = 0.0f; // whatever was last submitted, enabled or not
 
@@ -52,10 +62,16 @@ static volatile bool s_reseed_pending = false;
 // this tick group's true start, not on how many on_interp_tick() calls
 // have happened to fire. Whatever calls DO happen - however many, however
 // irregularly spaced, even after a coalescing event drops some - each one
-// computes the mathematically correct point on the prev->target line for
-// the instant it actually runs, so the rendered envelope stays consistent
-// tick to tick regardless of exactly how many discrete steps happened to
-// render on any given cycle.
+// computes the mathematically correct point on the CURVE for the instant
+// it actually runs, so the rendered envelope stays consistent tick to
+// tick regardless of exactly how many discrete steps happened to render
+// on any given cycle. That frac derivation is unchanged from v4.1 - v4.2
+// only changed what's evaluated AT frac: a Catmull-Rom cubic Hermite
+// through s_p1->s_p2 (using s_p0/s_p3 to shape the tangents at each end,
+// not as points the curve itself passes through) instead of v4's straight
+// line between the same two endpoints. Standard Hermite basis functions
+// (h00/h10/h01/h11); see envelope_interp.h for why this needs one more
+// full tick of look-ahead than v4's plain 2-point ramp did.
 static float IRAM_ATTR compute_ramp_value(void)
 {
     float elapsed_us = (float)(esp_timer_get_time() - s_tick_start_us);
@@ -65,13 +81,41 @@ static float IRAM_ATTR compute_ramp_value(void)
     } else if (frac > 1.0f) {
         frac = 1.0f;
     }
-    return s_prev_env + frac * (s_target_env - s_prev_env);
+    float frac2 = frac * frac;
+    float frac3 = frac2 * frac;
+    float h00 =  2.0f * frac3 - 3.0f * frac2 + 1.0f;
+    float h10 =         frac3 - 2.0f * frac2 + frac;
+    float h01 = -2.0f * frac3 + 3.0f * frac2;
+    float h11 =         frac3 -        frac2;
+    float value = h00 * s_p1 + h10 * s_m1 + h01 * s_p2 + h11 * s_m2;
+
+    // Unlike v4's straight line (which can never leave the [s_p1,s_p2]
+    // range), a cubic CAN over/undershoot slightly beyond its own
+    // endpoints on a sharp enough feature - confirmed with a synthetic
+    // worst-case dip (two duty-0 samples flanked by two much higher
+    // ones, close to what a two-tone envelope null looks like), even
+    // though neither real test signal this was validated against
+    // (two-tone, AM-test) triggered it. s_p1/s_p2 themselves are always
+    // in [0,1] (the .ino clamps envelope before ever calling
+    // envelope_interp_on_full_tick()), so this clamp only ever trims a
+    // genuine curve overshoot, never a legitimately out-of-range input -
+    // and it matters here specifically because envelope_output_write_pwm()
+    // casts straight to an unsigned duty with no clamp of its own: a
+    // negative excursion left unclamped would become a huge duty value
+    // via unsigned wraparound, not a small negative one.
+    if (value < 0.0f) {
+        value = 0.0f;
+    } else if (value > 1.0f) {
+        value = 1.0f;
+    }
+    return value;
 }
 
 void envelope_interp_init(void)
 {
-    s_prev_env = 0.0f;
-    s_target_env = 0.0f;
+    s_p0 = s_p1 = s_p2 = s_p3 = 0.0f;
+    s_m1 = 0.0f;
+    s_m2 = 0.0f;
     s_tick_start_us = 0;
     s_last_value = 0.0f;
     s_reseed_pending = false;
@@ -80,14 +124,19 @@ void envelope_interp_init(void)
 void IRAM_ATTR envelope_interp_on_full_tick(float envelope, int64_t tick_start_us)
 {
     if (s_reseed_pending) {
-        // An off->on transition happened since our last tick - anchor the
-        // ramp at the last real value instead of gliding from whatever
-        // s_prev_env/s_target_env happened to hold from before it was
-        // last disabled. Applied here, in dsp_task's own context, rather
-        // than inside set_enabled() itself (a different task/core) - see
-        // the statics' own comment above for why.
-        s_prev_env = s_last_value;
-        s_target_env = s_last_value;
+        // An off->on transition happened since our last tick - anchor ALL
+        // FOUR history points at the last real value (not just two, like
+        // v4 did) instead of gliding from whatever stale/zero history
+        // they held from before it was last disabled. Tangents computed
+        // from four equal points are both zero, so the first rendered
+        // segment is flat too - same "already-arrived" guarantee v4 had,
+        // extended to the wider history v4.2 now keeps. Applied here, in
+        // dsp_task's own context, rather than inside set_enabled() itself
+        // (a different task/core) - see the statics' own comment above
+        // for why.
+        s_p0 = s_p1 = s_p2 = s_p3 = s_last_value;
+        s_m1 = 0.0f;
+        s_m2 = 0.0f;
         s_reseed_pending = false;
     }
 
@@ -106,11 +155,22 @@ void IRAM_ATTR envelope_interp_on_full_tick(float envelope, int64_t tick_start_u
         return;
     }
 
-    // Start a new ramp from the previous full-tick's value to this one -
-    // arriving at the true new value only at the far end of the interval
-    // is intentional, not a bug; see header comment for why.
-    s_prev_env = s_target_env;
-    s_target_env = envelope;
+    // Shift the four-sample history and bring in this tick's own value as
+    // the NEWEST point (s_p3) - not as the segment about to be rendered.
+    // The segment rendered THIS tick is [s_p1,s_p2], one tick further
+    // back than v4's [old target, this tick's value] was, because the
+    // Catmull-Rom tangent at that segment's own right end (s_m2) needs
+    // the NEXT point (s_p3) to already be known - which it only just
+    // became, this instant. Arriving at s_p2 only at the far end of the
+    // interval is the same intentional v4 property (see header comment);
+    // v4.2 just adds one more full tick of that same kind of delay on top
+    // of it, for the reason above.
+    s_p0 = s_p1;
+    s_p1 = s_p2;
+    s_p2 = s_p3;
+    s_p3 = envelope;
+    s_m1 = 0.5f * (s_p2 - s_p0);
+    s_m2 = 0.5f * (s_p3 - s_p1);
 
     envelope_output_write_pwm(compute_ramp_value());
 
