@@ -147,3 +147,8 @@ void envelope_interp_set_enabled(bool enable)
 
     s_enabled = enable;
 }
+
+bool envelope_interp_reseed_pending(void)
+{
+    return s_reseed_pending;
+}

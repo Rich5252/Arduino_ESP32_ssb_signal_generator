@@ -52,7 +52,7 @@
  * (only ~4 of the 19 points fell in it) - this revision exists to fix
  * that.
  *
- * REVISION 3 (current): built from an automated SDRuno logger (not a
+ * REVISION 3 (superseded): built from an automated SDRuno logger (not a
  * manual point-by-point read like REVISIONS 1-2), sweeping the '.'/','
  * fine master-gain command in 0.1dB steps from -30dB to +6.2dB - 363
  * dBm readings, far denser AND far wider-range than REVISION 2's 95
@@ -88,45 +88,92 @@
  * ~+3.3dB and hold flat to +6.2dB), so REVISION 2 was likely under-driving
  * at full-envelope commands.
  *
- * Resolution check (does 65 points do this new data justice?): simulating
+ * REVISION 3's own resolution check (superseded, kept for history): simulating
  * envelope_predistort_process()'s own linear interpolation against the
- * dense 363-point ground truth shows the table is a good match almost
+ * dense 363-point ground truth showed the table was a good match almost
  * everywhere (RMS error under 5 of the RSET LEDC channel's 1024 PWM
- * counts), but two spots fall short of that: the final bin (98.4%-100%
- * envelope) alone accounts for up to ~29 counts of error, since the
+ * counts), but two spots fell short of that: the final bin (98.4%-100%
+ * envelope) alone accounted for up to ~29 counts of error, since the
  * curve's steep final approach to saturation doesn't fit well in one
  * straight segment; a few bins through the turn-on-to-plateau transition
- * (roughly 22-44% envelope) show 6-10 counts. If real-hardware
- * two-tone/IMD testing (see below) shows this matters in practice, the
- * fix is concentrating more points in those two specific regions (a
- * REVISION 4, non-uniform grid) rather than a blanket doubling - flagged
- * here rather than pre-emptively done, since it wasn't asked for and
- * REVISION 3 hasn't been validated on hardware yet at all.
+ * (roughly 22-44% envelope) showed 6-10 counts.
+ *
+ * REVISION 4 (current): built from the 'd'/'>'/'<'/'N'/'B' direct duty
+ * override commands (envelope_output.h), sweeping every single raw LEDC
+ * duty count 1-1023 one at a time and reading dBm directly at each -
+ * 1023 exact points, denser even than REVISION 3's 363, and for the
+ * first time with NO gate-voltage inference anywhere in the chain: this
+ * table's x-axis (duty) is the literal commanded value, not backed out
+ * from a DC voltage reading via REVISION 1-3's `duty = V_gate / 3.26V`
+ * conversion.
+ *
+ * That direct data overturned the gate-voltage conversion itself, not
+ * just refined it. Smoking-gun cross-check: REVISION 3 believed duty
+ * 0.3008 (~duty 308) was still at the noise floor (its LUT[0], derived
+ * from a 0.98V gate reading at the -30dB command point). Commanding
+ * duty=308 directly measures -75.4dBm - 22dB ABOVE the real noise floor,
+ * already well up the curve. The real dead zone (output statistically
+ * indistinguishable from the -97.6dBm floor) only runs to about duty
+ * 200-226, not duty 308. Rebuilding the table from this direct data
+ * (isotonic-regression-smoothed to remove single-sample measurement
+ * noise, then inverted the same PCHIP way as REVISIONS 1-3) shows the
+ * gap isn't just at the floor: through essentially the whole 0-90%
+ * envelope range, REVISION 3 was commanding roughly 40-120 MORE PWM
+ * counts (about 4-12% of the full 1024-count range) than this direct
+ * data shows is actually needed for the same RF output, converging with
+ * REVISION 3 only above ~90% envelope where both approach full duty.
+ * Likely explanation: `V_gate / 3.26V` assumed gate voltage rises
+ * straight-line proportional to commanded duty; real gate voltage
+ * appears to climb FASTER than duty through most of the range and only
+ * becomes proportional near saturation, i.e. the conversion wasn't
+ * wrong by a fixed offset, it was the wrong SHAPE of function. This
+ * doesn't retroactively change any of this project's earlier delay-
+ * tuning/IMD conclusions - `env_predistort_enable` was off in every
+ * two-tone/noise-loading capture analyzed so far, so this table was
+ * never actually driving the RSET pin during those tests.
+ *
+ * REVISION 4's resolution check: simulating the 65-point piecewise-linear
+ * table against the dense 1023-point ground truth gives RMS error under 1
+ * count through the turn-on and mid-climb regions (5-95% envelope) -
+ * better than REVISION 3 managed even against its own, sparser ground
+ * truth, simply because every single duty count was actually measured
+ * instead of inferred between 0.1dB command steps. The top plateau
+ * (95-100%) still shows up to ~12 counts of error (a straight segment
+ * still slightly underfits the last bit of compression before
+ * saturation), and the very bottom point (LUT[0], envelope=0) shows a
+ * large-looking error against the dense data by construction - but that's
+ * the same noise-floor-degeneracy artifact flagged in REVISION 3's own
+ * check, just larger here because REVISION 4 has ~180 dense ground-truth
+ * points sitting in that dead zone instead of a handful: duty 1 through
+ * ~200 are all electrically interchangeable (same floor-level RF
+ * output), so ANY of them is an equally correct answer for "envelope=0"
+ * and comparing LUT[0] against one particular dense-data duty in that
+ * range isn't a real resolution shortfall.
  *
  * PCHIP specifically (not a plain cubic spline), all three revisions, to
  * avoid overshoot/ringing through the steep BS170 turn-on region, which
  * would break the monotonicity a pre-distortion table depends on to be
  * invertible at all.
  *
- * Shape found (confirmed and sharpened by REVISION 2): near-dead below
- * ~31% duty (gate under ~1.05V - output pinned near the analyzer's noise
+ * Shape found, REVISION 4 (supersedes the duty percentages below, which
+ * were all built on the flawed gate-voltage conversion): dead below
+ * ~20% duty (200-226 out of 1023 - output pinned at the analyzer's noise
  * floor regardless of how much lower you command, confirming this path
  * has a real, non-zero floor rather than reaching genuine envelope zero -
- * see project history's EER deep-null-vs-linear-range discussion), a
- * steep turn-on through roughly 31-55% duty (the region needing the most
- * correction, and where REVISION 2 concentrated its extra density), then
- * a long gently-compressing climb - but NOT all the way to 100%: REVISION
- * 2 revealed RF output actually plateaus at its max measured level by
- * ~95% duty (dBm flat from there to 100%), so the true "envelope=1"
- * duty is ~0.9495, not 1.0 - REVISION 1 didn't have a fine enough grid
- * near the top to see this and assumed literal 100%. REVISION 3's wider,
- * denser top-end sweep sharpened this further: the plateau doesn't
- * actually finish settling until duty is ~98.8%, not ~95% - REVISION 2's
- * own top-end density (stopping at +5dB) wasn't quite enough to catch the
- * last of the climb either, same class of miss as REVISION 1 had, just a
- * smaller version of it. No genuinely linear stretch anywhere, which is
- * why a shaping table (not just picking a "clean window" sub-range) was
- * the right fix.
+ * see project history's EER deep-null-vs-linear-range discussion), then
+ * a steep turn-on through roughly 30-45% duty. Because the LUT's grid is
+ * even in ENVELOPE, not duty, and this whole dead-zone-plus-initial-climb
+ * is so compressed in duty terms, it collapses into the table's very
+ * first bin (LUT[0]=0.001 to LUT[1]=0.2998) - real commanded duty stays
+ * inside the dead zone for desired envelopes up to about 1%, then rises
+ * fast to the real turn-on point by envelope~1.5%. Above that, a long
+ * gently-compressing climb, same shape REVISIONS 1-3 all found - and
+ * this time the plateau genuinely IS reached at duty=1.0 (LUT[64]),
+ * because REVISION 4's own sweep went all the way to the hardware
+ * ceiling (duty=1023) rather than needing REVISION 2/3's inference about
+ * where flattening finishes. No genuinely linear stretch anywhere, which
+ * is why a shaping table (not just picking a "clean window" sub-range)
+ * was the right fix.
  *
  * A real-hardware A/B test of REVISION 1 surfaced two IMPORTANT NEGATIVE
  * RESULTS worth recording so they aren't retried: (1) trying to avoid
@@ -147,12 +194,15 @@
  * full measured range. See serial_commands.cpp's 'D' handler for the
  * toggle and its console note about this.
  *
- * REVISION 3 NOT YET VALIDATED ON REAL HARDWARE beyond the measurement
+ * REVISION 4 NOT YET VALIDATED ON REAL HARDWARE beyond the measurement
  * itself - REVISION 2 did get a real-hardware A/B (see the IMPORTANT
- * NEGATIVE RESULTS above), but REVISION 3 is a straight table swap that
- * hasn't been re-run through two-tone/IMD testing yet. Off by default so
- * existing tuning isn't disturbed until deliberately opted into, same
- * convention as envelope_gdeq.h's 'g'.
+ * NEGATIVE RESULTS above), but REVISION 4, like REVISION 3 before it, is
+ * a straight table swap that hasn't been re-run through two-tone/IMD
+ * testing yet - and given how much this revision moved the duty axis
+ * versus REVISION 3 (see the REVISION 4 notes above), that check matters
+ * more here than it did for REVISION 3's more modest refinement. Off by
+ * default so existing tuning isn't disturbed until deliberately opted
+ * into, same convention as envelope_gdeq.h's 'g'.
  */
 
 #include <stdbool.h>

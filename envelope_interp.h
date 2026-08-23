@@ -233,3 +233,12 @@ bool envelope_interp_get_enabled(void);
 // transition (already in the requested state) does nothing, same
 // convention as envelope_gdeq_set_enabled().
 void envelope_interp_set_enabled(bool enable);
+
+// True from the moment an off->on transition is requested until
+// dsp_task's next full tick actually applies the reseed (on_full_tick()
+// above) - i.e. the window where set_enabled(true) has returned but the
+// internal switch hasn't taken effect yet. Exposed so a caller that wants
+// to report state only once the switch is truly complete internally, not
+// just once the request has been queued, can poll this first - see
+// serial_commands.cpp's 'I' handler.
+bool envelope_interp_reseed_pending(void);

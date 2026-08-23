@@ -5,28 +5,32 @@
 #include "envelope_predistort.h"
 
 // Desired linear envelope [0,1] -> commanded PWM duty [0,1], 65 points
-// (64 equal bins), rebuilt from a much denser real hardware sweep than the
-// original 33-point table - see envelope_predistort.h for the full
-// derivation. LUT[0] is NOT 0.0 - it's 0.3008, the duty below which the
-// path is dead (near the analyzer noise floor regardless of command), so
-// "envelope=0" maps to the lowest achievable duty rather than one this
-// hardware can't usefully go lower than anyway. LUT[64] is 0.9882, NOT
-// 1.0 - REVISION 3's much denser top-end sweep revealed RF output doesn't
-// actually finish saturating until duty is almost literal 100% (REVISION
-// 2's 0.9495 undershot this - see envelope_predistort.h's REVISION 3
-// notes - meaning that table was leaving real output on the table at
-// full-envelope commands); the inversion correctly picks the LOWEST duty
-// that already reaches full output rather than always maxing out.
+// (64 equal bins). REVISION 4 - see envelope_predistort.h for the full
+// derivation. Built directly from the 'd'/'>'/'<'/'N'/'B' direct duty
+// override commands (envelope_output.h) sweeping every single raw LEDC
+// count 1-1023 against a measured dBm reading - no gate-voltage inference
+// anywhere in this table, unlike REVISIONS 1-3. LUT[0] is 0.001 (duty=1,
+// essentially fully off) - REVISION 4's exhaustive sweep found the whole
+// path reads as noise floor from duty=1 clear through duty~200-226, so
+// "envelope=0" is mapped to the LOWEST duty in that dead range rather
+// than holding the gate open any further than necessary (REVISIONS 1-3
+// assumed the dead zone ran to duty~0.30-0.32 instead - see
+// envelope_predistort.h's REVISION 4 notes for why that turned out to be
+// wrong by a wide margin, not just at this floor point but through most
+// of the table). LUT[64] is a clean 1.0 - this sweep's own top point
+// (duty=1023, literal 100%) IS the measured maximum, so unlike REVISIONS
+// 2-3 there's no inference needed to find where output actually finishes
+// saturating.
 static const float ENV_PREDISTORT_LUT[65] = {
-    0.3008f, 0.4196f, 0.4423f, 0.4542f, 0.4678f, 0.4758f, 0.4825f, 0.4904f,
-    0.5054f, 0.5134f, 0.5230f, 0.5294f, 0.5388f, 0.5471f, 0.5497f, 0.5621f,
-    0.5724f, 0.5775f, 0.5864f, 0.5885f, 0.5988f, 0.6035f, 0.6122f, 0.6201f,
-    0.6256f, 0.6345f, 0.6418f, 0.6493f, 0.6556f, 0.6644f, 0.6720f, 0.6791f,
-    0.6856f, 0.6918f, 0.6973f, 0.7022f, 0.7072f, 0.7119f, 0.7170f, 0.7221f,
-    0.7274f, 0.7332f, 0.7396f, 0.7468f, 0.7548f, 0.7640f, 0.7727f, 0.7819f,
-    0.7908f, 0.7997f, 0.8088f, 0.8167f, 0.8248f, 0.8336f, 0.8424f, 0.8512f,
-    0.8599f, 0.8689f, 0.8780f, 0.8867f, 0.8958f, 0.9035f, 0.9130f, 0.9277f,
-    0.9882f,
+    0.0010f, 0.2998f, 0.3267f, 0.3442f, 0.3606f, 0.3727f, 0.3848f, 0.3955f,
+    0.4088f, 0.4187f, 0.4273f, 0.4372f, 0.4463f, 0.4540f, 0.4639f, 0.4777f,
+    0.4868f, 0.4949f, 0.5038f, 0.5103f, 0.5189f, 0.5277f, 0.5361f, 0.5438f,
+    0.5522f, 0.5606f, 0.5664f, 0.5758f, 0.5841f, 0.5923f, 0.6005f, 0.6087f,
+    0.6169f, 0.6250f, 0.6332f, 0.6413f, 0.6494f, 0.6575f, 0.6656f, 0.6738f,
+    0.6819f, 0.6901f, 0.6983f, 0.7065f, 0.7148f, 0.7230f, 0.7313f, 0.7395f,
+    0.7479f, 0.7563f, 0.7648f, 0.7734f, 0.7820f, 0.7907f, 0.7997f, 0.8089f,
+    0.8182f, 0.8281f, 0.8382f, 0.8494f, 0.8617f, 0.8765f, 0.8956f, 0.9264f,
+    1.0000f,
 };
 #define ENV_PREDISTORT_LUT_LAST_IDX 64   // ENV_PREDISTORT_LUT's last valid index
 
