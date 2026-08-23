@@ -172,24 +172,7 @@ void handle_serial_commands(void)
         } else if (c == 'I') {
             bool now_on = !envelope_interp_get_enabled();
             envelope_interp_set_enabled(now_on);   // internally seeds prev/target on an off->on transition
-            if (now_on) {
-                // Report ON only once dsp_task has actually applied the
-                // reseed on its next full tick (envelope_interp.cpp's
-                // on_full_tick()), not just once the request was queued -
-                // set_enabled() above returns immediately, but the real
-                // switch happens asynchronously on dsp_task's own core/
-                // task. A full tick is at most ~62.5us away at 16kHz, so
-                // 5ms is a generous bound, not a tight one - this is a
-                // one-off busy-wait per keypress on loop()/Core 1, not a
-                // hot path, and it can never hang: if dsp_task were
-                // somehow stalled the timeout still lets this return and
-                // print (rather than block serial handling forever).
-                uint32_t wait_start_us = micros();
-                while (envelope_interp_reseed_pending() && (micros() - wait_start_us) < 5000UL) {
-                    // busy-wait for the reseed to be consumed
-                }
-            }
-            Serial.printf("-> %dx envelope output interpolation %s (see envelope_interp.h)\r\n",
+            Serial.printf("-> %dx envelope output %s (see envelope_interp.h)                                                            \r\n",
                           ENVELOPE_INTERP_FACTOR, now_on ? "ON" : "off");
         } else if (c == 'f') {
             // Cycles off -> Butterworth -> Chebyshev -> off. See
@@ -414,16 +397,4 @@ void handle_serial_commands(void)
             Serial.printf("-> preset %d: %s\r\n", preset, p.name);
         }
     }
-
-    // Force whatever got printed above out onto the USB-CDC wire before
-    // returning to loop() - added after 'I' was seen to sometimes not
-    // show a response at all on real hardware (the message was queued,
-    // just not necessarily flushed out promptly under load - see
-    // envelope_interp.h's 'I' toggle and this project's own v3 design-
-    // history note about a background task at a similar wake rate
-    // starving Core 1 serial handling). A no-op if nothing was printed
-    // this call. Covers every command here, not just 'I' - an automated
-    // test logger expecting a confirmed response after every command
-    // shouldn't have to special-case one key.
-    Serial.flush();
 }
