@@ -20,6 +20,78 @@
 #include "carrier_output.h"
 #endif
 #include <Arduino.h>
+#include <cstdarg>
+#include <cstring>
+
+// Every command reply in this file is sent through serial_reply() below,
+// rather than calling Serial.print()/println()/printf() directly - this
+// is what fixes a real, reproducible bug found on real hardware: the 'I'
+// command would sometimes not reply when switching interpolation ON, and
+// then send TWO replies together on the next 'I' (switching off).
+//
+// Root cause: "-> 4x envelope output interpolation ON (see
+// envelope_interp.h)\r\n" is exactly 64 bytes long - and 64 bytes is the
+// USB full-speed CDC bulk endpoint's max packet size on the ESP32-S3's
+// native USB. USB CDC marks the end of a transfer with either a "short"
+// packet (fewer bytes than the endpoint's max packet size) or an
+// explicit trailing zero-length packet (ZLP). When a transfer's total
+// length is an EXACT multiple of 64, neither happens on its own - the
+// host's CDC-ACM driver can't tell whether that 64-byte chunk is the
+// whole message or just the first packet of a longer one, so it holds
+// the data back rather than handing it to the terminal application
+// (Arduino IDE Monitor, PuTTY, or a custom logger - all three showed the
+// identical symptom, which is what pointed away from anything
+// app-specific and toward this transport-layer explanation). Only once
+// MORE bytes are queued behind it - i.e. the NEXT reply - does the total
+// stop being a clean 64-byte multiple, and both replies get delivered
+// together. This is a widely-reported, generic USB CDC-ACM behavior, not
+// anything specific to this board (see e.g. hathach/tinyusb#2041,
+// STMicroelectronics/STM32CubeF3#2). Serial.flush() does NOT fix it: by
+// the time flush() runs, the exact-64-byte packet has already gone out
+// the door - flush() just waits for the TX queue to drain, it can't
+// retroactively add a terminator to a transfer the device already
+// considers complete.
+//
+// The 'I' "off" reply happened to be 65 bytes (not a multiple of 64), so
+// it always flushed cleanly on its own - which is why the bug looked
+// like it only affected switching ON. The actual trigger was just that
+// one reply's coincidental byte count, not anything about ON vs off.
+//
+// Rather than pad that one string, every reply in this file is routed
+// through here: it formats like printf, then pads the transmitted length
+// by one harmless trailing space whenever it would otherwise land
+// exactly on a 64-byte boundary. That means no future wording change,
+// digit-width change (e.g. a different ENVELOPE_INTERP_FACTOR), or any
+// other command's variable-length numeric field can silently
+// reintroduce this same bug somewhere else in this file.
+static void serial_reply(const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int len = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    if (len < 0) {
+        return;   // formatting error - nothing sane to send
+    }
+    if ((size_t)len >= sizeof(buf)) {
+        len = (int)sizeof(buf) - 1;   // truncated - still send what fit
+    }
+
+    if (len > 0 && (len % 64) == 0 && (size_t)len < sizeof(buf) - 1) {
+        // Insert the padding space just before the trailing "\r\n" every
+        // reply in this file ends with (rather than appending after it),
+        // so it never leaks onto the front of whatever gets printed next.
+        int insert_at = (len >= 2 && buf[len - 2] == '\r' && buf[len - 1] == '\n')
+                         ? len - 2 : len;
+        memmove(&buf[insert_at + 1], &buf[insert_at], (size_t)(len - insert_at) + 1);
+        buf[insert_at] = ' ';
+        len++;
+    }
+
+    Serial.write((const uint8_t *)buf, (size_t)len);
+}
 
 // Returns the C symbol name (e.g. "AUDIO_SRC_MIC") for a given
 // audio_source_t, for the 'P' settings-dump command below - distinct from
@@ -60,26 +132,26 @@ void handle_serial_commands(void)
 
         if (c == 't' && src != AUDIO_SRC_TWOTONE) {
             dsp_state_set_audio_source(AUDIO_SRC_TWOTONE);
-            Serial.println("-> two-tone test signal");
+            serial_reply("-> two-tone test signal\r\n");
         } else if (c == 's' && src != AUDIO_SRC_SINGLETONE) {
             dsp_state_set_audio_source(AUDIO_SRC_SINGLETONE);
-            Serial.printf("-> single-tone test signal (%.0fHz)\r\n", SINGLETONE_HZ);
+            serial_reply("-> single-tone test signal (%.0fHz)\r\n", SINGLETONE_HZ);
         } else if (c == 'm' && src != AUDIO_SRC_MIC) {
             dsp_state_set_audio_source(AUDIO_SRC_MIC);
-            Serial.println("-> live mic input");
+            serial_reply("-> live mic input\r\n");
         } else if (c == 'p' && src != AUDIO_SRC_ENVSTEP) {
             dsp_state_set_audio_source(AUDIO_SRC_ENVSTEP);
-            Serial.printf("-> envelope step test (%.1fHz square wave, carrier fixed - "
+            serial_reply("-> envelope step test (%.1fHz square wave, carrier fixed - "
                           "measure the RSET node's rise/settling time against this edge)\r\n", ENVSTEP_HZ);
         } else if (c == 'y' && src != AUDIO_SRC_FMTEST) {
             dsp_state_set_audio_source(AUDIO_SRC_FMTEST);
-            Serial.printf("-> FM isolation test (%.0fHz sine mod, %.0fHz peak deviation, beta=%.2f - "
+            serial_reply("-> FM isolation test (%.0fHz sine mod, %.0fHz peak deviation, beta=%.2f - "
                           "expect FM sidebands at fc+/-n*%.0fHz, no envelope content - "
                           "isolates AD9851/SPI chain from Hilbert/DSP math)\r\n",
                           FM_TEST_MOD_HZ, FM_TEST_DEV_HZ, FM_TEST_DEV_HZ/FM_TEST_MOD_HZ, FM_TEST_MOD_HZ);
         } else if (c == 'h' && src != AUDIO_SRC_AMTEST) {
             dsp_state_set_audio_source(AUDIO_SRC_AMTEST);
-            Serial.printf("-> AM isolation test (%.0fHz sine mod, %.0f%% depth, carrier fixed - "
+            serial_reply("-> AM isolation test (%.0fHz sine mod, %.0f%% depth, carrier fixed - "
                           "expect ONLY fc+/-%.0fHz sideband pair, no FM content - "
                           "isolates RSET/PWM/filter path from AD9851/DSP)\r\n",
                           AM_TEST_MOD_HZ, AM_TEST_DEPTH * 200.0f, AM_TEST_MOD_HZ);
@@ -96,7 +168,7 @@ void handle_serial_commands(void)
             if (!was_twotone) {
                 dsp_state_set_audio_source(AUDIO_SRC_TWOTONE);
             }
-            Serial.printf("-> two-tone band: %s (f1=%.0fHz f2=%.0fHz)%s - "
+            serial_reply("-> two-tone band: %s (f1=%.0fHz f2=%.0fHz)%s - "
                           "re-tune relative delay ('['/']') for this band before capturing\r\n",
                           band_name, test_signals_get_twotone_f1_hz(), test_signals_get_twotone_f2_hz(),
                           was_twotone ? "" : ", two-tone mode enabled");
@@ -104,14 +176,14 @@ void handle_serial_commands(void)
         } else if (c == ']') {
             relative_delay_increase();
             float d = relative_delay_get_samples();
-            Serial.printf("-> relative delay %+.2f samples (~%+.0fus) - %s\r\n",
+            serial_reply("-> relative delay %+.2f samples (~%+.0fus) - %s\r\n",
                           d, d * 1000000.0f / SAMPLE_RATE_HZ,
                           d > 0.0f ? "phase held back" :
                           d < 0.0f ? "envelope held back" : "aligned");
         } else if (c == '[') {
             relative_delay_decrease();
             float d = relative_delay_get_samples();
-            Serial.printf("-> relative delay %+.2f samples (~%+.0fus) - %s\r\n",
+            serial_reply("-> relative delay %+.2f samples (~%+.0fus) - %s\r\n",
                           d, d * 1000000.0f / SAMPLE_RATE_HZ,
                           d > 0.0f ? "phase held back" :
                           d < 0.0f ? "envelope held back" : "aligned");
@@ -119,60 +191,60 @@ void handle_serial_commands(void)
         } else if (c == 'u') {
             envelope_output_raise_pwm_offset();
             float off = envelope_output_get_pwm_offset(), scale = envelope_output_get_pwm_scale();
-            Serial.printf("-> PWM duty range %.0f%%-%.0f%% (offset=%.2f, scale=%.2f)\r\n",
+            serial_reply("-> PWM duty range %.0f%%-%.0f%% (offset=%.2f, scale=%.2f)\r\n",
                           off * 100.0f, (off + scale > 1.0f ? 1.0f : off + scale) * 100.0f, off, scale);
         } else if (c == 'j') {
             envelope_output_lower_pwm_offset();
             float off = envelope_output_get_pwm_offset(), scale = envelope_output_get_pwm_scale();
-            Serial.printf("-> PWM duty range %.0f%%-%.0f%% (offset=%.2f, scale=%.2f)\r\n",
+            serial_reply("-> PWM duty range %.0f%%-%.0f%% (offset=%.2f, scale=%.2f)\r\n",
                           off * 100.0f, (off + scale > 1.0f ? 1.0f : off + scale) * 100.0f, off, scale);
         } else if (c == 'i') {
             envelope_output_widen_pwm_scale();
             float off = envelope_output_get_pwm_offset(), scale = envelope_output_get_pwm_scale();
-            Serial.printf("-> PWM duty range %.0f%%-%.0f%% (offset=%.2f, scale=%.2f)\r\n",
+            serial_reply("-> PWM duty range %.0f%%-%.0f%% (offset=%.2f, scale=%.2f)\r\n",
                           off * 100.0f, (off + scale > 1.0f ? 1.0f : off + scale) * 100.0f, off, scale);
         } else if (c == 'k') {
             envelope_output_narrow_pwm_scale();
             float off = envelope_output_get_pwm_offset(), scale = envelope_output_get_pwm_scale();
-            Serial.printf("-> PWM duty range %.0f%%-%.0f%% (offset=%.2f, scale=%.2f)\r\n",
+            serial_reply("-> PWM duty range %.0f%%-%.0f%% (offset=%.2f, scale=%.2f)\r\n",
                           off * 100.0f, (off + scale > 1.0f ? 1.0f : off + scale) * 100.0f, off, scale);
         } else if (c == 'g') {
             bool now_on = !envelope_gdeq_get_enabled();
             envelope_gdeq_set_enabled(now_on);   // internally resets state on an off->on transition
-            Serial.printf("-> envelope group-delay equalizer %s%s\r\n", now_on ? "ON" : "off",
+            serial_reply("-> envelope group-delay equalizer %s%s\r\n", now_on ? "ON" : "off",
                           now_on ? " - re-tune relative delay ('['/']') from scratch, "
                                    "theoretical starting point ~+2.65 samples (see envelope_gdeq.h)" : "");
         } else if (c == 'D') {
             bool now_on = !envelope_predistort_get_enabled();
             envelope_predistort_set_enabled(now_on);
-            Serial.printf("-> envelope pre-distortion %s%s\r\n", now_on ? "ON" : "off",
+            serial_reply("-> envelope pre-distortion %s%s\r\n", now_on ? "ON" : "off",
                           now_on ? " - REPLACES the 'u'/'j'/'i'/'k' linear offset/scale mapping "
                                    "while on (see envelope_predistort.h); those knobs have no "
                                    "effect until this is toggled off again" : "");
         } else if (c == 'x') {
             envelope_floor_raise();
-            Serial.printf("-> envelope-null floor raised to %.2f (see envelope_floor.h)\r\n",
+            serial_reply("-> envelope-null floor raised to %.2f (see envelope_floor.h)\r\n",
                           envelope_floor_get());
         } else if (c == 'z') {
             envelope_floor_lower();
-            Serial.printf("-> envelope-null floor lowered to %.2f (see envelope_floor.h)\r\n",
+            serial_reply("-> envelope-null floor lowered to %.2f (see envelope_floor.h)\r\n",
                           envelope_floor_get());
         } else if (c == '}') {
             ssb_dsp_raise_freq_dev_slew_limit(dsp_state_get_ssb());
             float limit = ssb_dsp_get_freq_dev_slew_limit_hz(dsp_state_get_ssb());
             if (limit >= SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ) {
-                Serial.println("-> freq_dev slew-rate limit: off (see ssb_dsp.h)");
+                serial_reply("-> freq_dev slew-rate limit: off (see ssb_dsp.h)\r\n");
             } else {
-                Serial.printf("-> freq_dev slew-rate limit loosened to %.0fHz/sample (see ssb_dsp.h)\r\n", limit);
+                serial_reply("-> freq_dev slew-rate limit loosened to %.0fHz/sample (see ssb_dsp.h)\r\n", limit);
             }
         } else if (c == '{') {
             ssb_dsp_lower_freq_dev_slew_limit(dsp_state_get_ssb());
             float limit = ssb_dsp_get_freq_dev_slew_limit_hz(dsp_state_get_ssb());
-            Serial.printf("-> freq_dev slew-rate limit tightened to %.0fHz/sample (see ssb_dsp.h)\r\n", limit);
+            serial_reply("-> freq_dev slew-rate limit tightened to %.0fHz/sample (see ssb_dsp.h)\r\n", limit);
         } else if (c == 'I') {
             bool now_on = !envelope_interp_get_enabled();
             envelope_interp_set_enabled(now_on);   // internally seeds prev/target on an off->on transition
-            Serial.printf("-> %dx envelope output %s (see envelope_interp.h)                                                            \r\n",
+            serial_reply("-> %dx envelope output interpolation %s (see envelope_interp.h)\r\n",
                           ENVELOPE_INTERP_FACTOR, now_on ? "ON" : "off");
         } else if (c == 'f') {
             // Cycles off -> Butterworth -> Chebyshev -> off. See
@@ -181,7 +253,7 @@ void handle_serial_commands(void)
             adc_lpf_mode_t mode = adc_capture_get_lpf_mode();
             mode = (adc_lpf_mode_t)((mode + 1) % 3);
             adc_capture_set_lpf_mode(mode);
-            Serial.printf("-> ADC LPF: %s\r\n", adc_capture_lpf_mode_name(mode));
+            serial_reply("-> ADC LPF: %s\r\n", adc_capture_lpf_mode_name(mode));
         } else if (c == 'v') {
             diagnostics_toggle_muted();
         } else if (c == 'r') {
@@ -196,31 +268,31 @@ void handle_serial_commands(void)
             diagnostics_reset();
             adc_capture_reset_diag();
             ssb_dsp_reset_freq_dev_stats(dsp_state_get_ssb());
-            Serial.println("-> diagnostics reset, clean window starting now");
+            serial_reply("-> diagnostics reset, clean window starting now\r\n");
         } else if (c == 'e') {
             bool now_on = !ssb_dsp_get_eq_enabled(dsp_state_get_ssb());
             ssb_dsp_set_eq_enabled(dsp_state_get_ssb(), now_on);
-            Serial.printf("-> EQ (HPF+presence) %s\r\n", now_on ? "ON" : "off");
+            serial_reply("-> EQ (HPF+presence) %s\r\n", now_on ? "ON" : "off");
         } else if (c == 'c') {
             bool now_on = !ssb_dsp_get_compressor_enabled(dsp_state_get_ssb());
             ssb_dsp_set_compressor_enabled(dsp_state_get_ssb(), now_on);
-            Serial.printf("-> compressor %s\r\n", now_on ? "ON" : "off");
+            serial_reply("-> compressor %s\r\n", now_on ? "ON" : "off");
         } else if (c == '+') {
             float new_gain = ssb_dsp_get_master_gain_db(dsp_state_get_ssb()) + MASTER_GAIN_STEP_DB;
             dsp_state_set_master_gain_db(new_gain);
-            Serial.printf("-> master gain %+.1f dB\r\n", new_gain);
+            serial_reply("-> master gain %+.1f dB\r\n", new_gain);
         } else if (c == '-') {
             float new_gain = ssb_dsp_get_master_gain_db(dsp_state_get_ssb()) - MASTER_GAIN_STEP_DB;
             dsp_state_set_master_gain_db(new_gain);
-            Serial.printf("-> master gain %+.1f dB\r\n", new_gain);
+            serial_reply("-> master gain %+.1f dB\r\n", new_gain);
         } else if (c == '.') {
             float new_gain = ssb_dsp_get_master_gain_db(dsp_state_get_ssb()) + MASTER_GAIN_FINE_STEP_DB;
             dsp_state_set_master_gain_db(new_gain);
-            Serial.printf("-> master gain %+.2f dB\r\n", new_gain);
+            serial_reply("-> master gain %+.2f dB\r\n", new_gain);
         } else if (c == ',') {
             float new_gain = ssb_dsp_get_master_gain_db(dsp_state_get_ssb()) - MASTER_GAIN_FINE_STEP_DB;
             dsp_state_set_master_gain_db(new_gain);
-            Serial.printf("-> master gain %+.2f dB\r\n", new_gain);
+            serial_reply("-> master gain %+.2f dB\r\n", new_gain);
         } else if (c == 'd') {
             // Direct duty override - see envelope_output.h's header
             // comment. Bypasses master gain/envelope/offset-scale/
@@ -238,38 +310,38 @@ void handle_serial_commands(void)
             if (now_on) {
                 s_duty_override_value = 0;
                 envelope_output_write_duty_raw(s_duty_override_value);
-                Serial.printf("-> duty override ON, duty=%lu/%lu ('>'/'<'=+-1, 'N'/'B'=+-16; "
+                serial_reply("-> duty override ON, duty=%lu/%lu ('>'/'<'=+-1, 'N'/'B'=+-16; "
                               "dsp_task's normal envelope pipeline is now locked out of the "
                               "RSET output until 'd' again)\r\n",
                               (unsigned long)s_duty_override_value, (unsigned long)max_duty);
             } else {
-                Serial.println("-> duty override off (dsp_task's normal envelope pipeline back in control)");
+                serial_reply("-> duty override off (dsp_task's normal envelope pipeline back in control)\r\n");
             }
         } else if (c == '>' && envelope_output_duty_override_get_enabled()) {
             uint32_t max_duty = envelope_output_get_max_duty();
             if (s_duty_override_value < max_duty) s_duty_override_value++;
             envelope_output_write_duty_raw(s_duty_override_value);
-            Serial.printf("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
+            serial_reply("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
         } else if (c == '<' && envelope_output_duty_override_get_enabled()) {
             uint32_t max_duty = envelope_output_get_max_duty();
             if (s_duty_override_value > 0) s_duty_override_value--;
             envelope_output_write_duty_raw(s_duty_override_value);
-            Serial.printf("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
+            serial_reply("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
         } else if (c == 'N' && envelope_output_duty_override_get_enabled()) {
             uint32_t max_duty = envelope_output_get_max_duty();
             s_duty_override_value = (s_duty_override_value + 16 > max_duty) ? max_duty : s_duty_override_value + 16;
             envelope_output_write_duty_raw(s_duty_override_value);
-            Serial.printf("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
+            serial_reply("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
         } else if (c == 'B' && envelope_output_duty_override_get_enabled()) {
             uint32_t max_duty = envelope_output_get_max_duty();
             s_duty_override_value = (s_duty_override_value < 16) ? 0 : s_duty_override_value - 16;
             envelope_output_write_duty_raw(s_duty_override_value);
-            Serial.printf("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
+            serial_reply("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
 #if AD9851_ATTACHED
         } else if (c == 'o') {
             bool now_on = !carrier_output_get_rf_enabled();
             carrier_output_set_rf_enabled(now_on);
-            Serial.printf("-> AD9851 RF output %s\r\n", now_on ? "ON" : "off (powered down)");
+            serial_reply("-> AD9851 RF output %s\r\n", now_on ? "ON" : "off (powered down)");
 #endif
         } else if (c == 'P') {
             // Prints every current lever as a single comma-separated line,
@@ -327,8 +399,8 @@ void handle_serial_commands(void)
             } else {
                 snprintf(slew_str, sizeof(slew_str), "%.0ff", slew_limit);
             }
-            Serial.println("-> settings line (paste into settingsPresets[] in settings.h, then rename \"Live\"):");
-            Serial.printf("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s },\r\n",
+            serial_reply("-> settings line (paste into settingsPresets[] in settings.h, then rename \"Live\"):\r\n");
+            serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s },\r\n",
                           audio_source_enum_name(dsp_state_get_audio_source()),
                           rel_delay,
                           envelope_output_get_pwm_offset(),
@@ -394,7 +466,7 @@ void handle_serial_commands(void)
             // too, not just when toggled live.
             envelope_interp_set_enabled(p.envelope_interp_enable);
 
-            Serial.printf("-> preset %d: %s\r\n", preset, p.name);
+            serial_reply("-> preset %d: %s\r\n", preset, p.name);
         }
     }
 }
