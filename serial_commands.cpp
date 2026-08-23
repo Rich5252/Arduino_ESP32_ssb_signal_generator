@@ -414,4 +414,16 @@ void handle_serial_commands(void)
             Serial.printf("-> preset %d: %s\r\n", preset, p.name);
         }
     }
+
+    // Force whatever got printed above out onto the USB-CDC wire before
+    // returning to loop() - added after 'I' was seen to sometimes not
+    // show a response at all on real hardware (the message was queued,
+    // just not necessarily flushed out promptly under load - see
+    // envelope_interp.h's 'I' toggle and this project's own v3 design-
+    // history note about a background task at a similar wake rate
+    // starving Core 1 serial handling). A no-op if nothing was printed
+    // this call. Covers every command here, not just 'I' - an automated
+    // test logger expecting a confirmed response after every command
+    // shouldn't have to special-case one key.
+    Serial.flush();
 }
