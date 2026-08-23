@@ -87,10 +87,49 @@
 void envelope_output_init(void);
 
 // Drives the PWM comparison output from the (already relative-delayed)
-// envelope value. No-op if PWM_COMPARISON_ENABLED is 0. Call once per
-// dsp_task tick, BEFORE the AD9851 write - see the .cpp for why the
-// ordering matters.
+// envelope value. No-op if PWM_COMPARISON_ENABLED is 0, ALSO a no-op
+// while duty-override mode is active (see below) - dsp_task calls this
+// unconditionally every full tick, same as always; the no-op happens
+// internally so dsp_task itself needed no changes for this feature.
 void IRAM_ATTR envelope_output_write_pwm(float delayed_envelope);
+
+// ---- Direct duty override ('d' + '>'/'<'/'N'/'B', serial_commands.cpp) ----
+// For characterizing the RSET/PWM/filter/AD9851 chain directly against a
+// KNOWN, exact commanded duty count, bypassing master gain, envelope,
+// offset/scale, AND the predistort LUT entirely - see
+// envelope_predistort.h's REVISION 3 notes for why this exists (the
+// gate-voltage-inference chain that REVISION 2/3 relied on to back out
+// duty from a DC voltage reading is no longer needed at all once duty can
+// just be commanded and read back directly). The carrier/phase (AD9851)
+// path is completely unaffected - whatever audio source is selected
+// keeps running normally; 's' (single-tone, phase held rock-steady) is
+// the natural choice while sweeping this.
+//
+// Writes an EXACT raw PWM duty count [0, (1<<RSET_MOD_LEDC_RES)-1]
+// straight to the RSET LEDC channel - no float conversion, no offset/
+// scale, nothing else in between. Called only from serial_commands.cpp
+// (loop()/Core 1, not dsp_task/Core 0 - same non-ISR context
+// envelope_output_write_pwm() itself is always called from, so this
+// needs no new ISR-safety consideration).
+void IRAM_ATTR envelope_output_write_duty_raw(uint32_t duty);
+
+// The highest valid raw duty count, i.e. (1<<RSET_MOD_LEDC_RES)-1 - a
+// getter rather than making callers reach for RSET_MOD_LEDC_RES
+// themselves, since that's an ledc_timer_bit_t enum from driver/ledc.h,
+// which only THIS file's .cpp includes; serial_commands.cpp (the only
+// other caller) has no reason to need that header itself.
+uint32_t envelope_output_get_max_duty(void);
+
+// While enabled, envelope_output_write_pwm() above becomes a no-op every
+// tick - the LEDC hardware just continues outputting whatever duty
+// envelope_output_write_duty_raw() last wrote (LEDC holds its duty
+// register between explicit updates, so dsp_task doesn't need to keep
+// re-writing it - and by skipping the write entirely rather than trying
+// to race it, dsp_task's normal envelope pipeline can never fight the
+// override). 'd' toggles this; entering it resets the working duty value
+// to 0 - see serial_commands.cpp.
+bool envelope_output_duty_override_get_enabled(void);
+void envelope_output_duty_override_set_enabled(bool enable);
 
 // Hands the (un-delayed) envelope value to dac_task via the 1-deep
 // "latest value wins" queue, decimated to DAC_TARGET_UPDATE_RATE_HZ. Call

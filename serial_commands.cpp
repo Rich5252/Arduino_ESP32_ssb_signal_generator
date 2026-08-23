@@ -39,6 +39,13 @@ static const char *audio_source_enum_name(audio_source_t src)
     }
 }
 
+// Working duty value for 'd'/'>'/'<'/'N'/'B' (direct duty override, see
+// envelope_output.h) - lives here, not in envelope_output.cpp, since it's
+// only ever touched from this file's own single-threaded command
+// handling (loop()/Core 1); envelope_output.cpp only needs to know the
+// override's on/off state, not the stepping value itself.
+static uint32_t s_duty_override_value = 0;
+
 void handle_serial_commands(void)
 {
     // Runtime source switch: 't' -> two-tone, 's' -> single-tone, 'm' ->
@@ -214,6 +221,50 @@ void handle_serial_commands(void)
             float new_gain = ssb_dsp_get_master_gain_db(dsp_state_get_ssb()) - MASTER_GAIN_FINE_STEP_DB;
             dsp_state_set_master_gain_db(new_gain);
             Serial.printf("-> master gain %+.2f dB\r\n", new_gain);
+        } else if (c == 'd') {
+            // Direct duty override - see envelope_output.h's header
+            // comment. Bypasses master gain/envelope/offset-scale/
+            // predistort entirely so the RSET/PWM/filter/AD9851 chain can
+            // be characterized against a KNOWN, exact commanded duty
+            // count instead of one inferred from a gate-voltage reading -
+            // see envelope_predistort.h's REVISION 3 notes for why this
+            // was added. The carrier/phase path is untouched - select a
+            // steady source separately (e.g. 's', single-tone, phase
+            // rock-steady - the same choice REVISION 1/2's own
+            // characterization used).
+            bool now_on = !envelope_output_duty_override_get_enabled();
+            envelope_output_duty_override_set_enabled(now_on);
+            uint32_t max_duty = envelope_output_get_max_duty();
+            if (now_on) {
+                s_duty_override_value = 0;
+                envelope_output_write_duty_raw(s_duty_override_value);
+                Serial.printf("-> duty override ON, duty=%lu/%lu ('>'/'<'=+-1, 'N'/'B'=+-16; "
+                              "dsp_task's normal envelope pipeline is now locked out of the "
+                              "RSET output until 'd' again)\r\n",
+                              (unsigned long)s_duty_override_value, (unsigned long)max_duty);
+            } else {
+                Serial.println("-> duty override off (dsp_task's normal envelope pipeline back in control)");
+            }
+        } else if (c == '>' && envelope_output_duty_override_get_enabled()) {
+            uint32_t max_duty = envelope_output_get_max_duty();
+            if (s_duty_override_value < max_duty) s_duty_override_value++;
+            envelope_output_write_duty_raw(s_duty_override_value);
+            Serial.printf("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
+        } else if (c == '<' && envelope_output_duty_override_get_enabled()) {
+            uint32_t max_duty = envelope_output_get_max_duty();
+            if (s_duty_override_value > 0) s_duty_override_value--;
+            envelope_output_write_duty_raw(s_duty_override_value);
+            Serial.printf("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
+        } else if (c == 'N' && envelope_output_duty_override_get_enabled()) {
+            uint32_t max_duty = envelope_output_get_max_duty();
+            s_duty_override_value = (s_duty_override_value + 16 > max_duty) ? max_duty : s_duty_override_value + 16;
+            envelope_output_write_duty_raw(s_duty_override_value);
+            Serial.printf("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
+        } else if (c == 'B' && envelope_output_duty_override_get_enabled()) {
+            uint32_t max_duty = envelope_output_get_max_duty();
+            s_duty_override_value = (s_duty_override_value < 16) ? 0 : s_duty_override_value - 16;
+            envelope_output_write_duty_raw(s_duty_override_value);
+            Serial.printf("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
 #if AD9851_ATTACHED
         } else if (c == 'o') {
             bool now_on = !carrier_output_get_rf_enabled();

@@ -50,7 +50,19 @@ Off by default. Enabling it pushes the envelope path's overall delay up by ~265�
 |---|---|
 | `D` | Toggle a measured-curve lookup table (`envelope_predistort.h`) that corrects the *static* (memoryless) nonlinearity of the whole envelope→RF-amplitude chain — PWM/RC filter, BS170 gate transfer curve, and the AD9851's own RSET-to-DAC-current relationship, all as one measured end-to-end curve. A different problem from `g`'s: this is amplitude vs. commanded level (present even with a constant carrier), not delay vs. frequency. **REPLACES** the `u`/`j`/`i`/`k` linear offset/scale mapping while on — those knobs have no effect until `D` is toggled off again. **Not yet validated beyond the measurement itself.** |
 
-Off by default. Table derived from a real hardware sweep (single-tone + master-gain steps, PWM ranging at full 0–100% span) — see `envelope_predistort.h` for the full derivation and the curve's shape. Now on its 2nd revision: 65 points built from 95 densely-measured dBm readings (down to 0.1dB steps via `'.'`/`','`) plus 17 gate-voltage readings, up from the original 33-point/19-measurement table. Dead below ~31% duty, steep turn-on through ~31–55%, then a gently-compressing climb that plateaus by ~95% duty rather than the full 100% the first revision assumed.
+Off by default. Table derived from a real hardware sweep (single-tone + master-gain steps, PWM ranging at full 0–100% span) — see `envelope_predistort.h` for the full derivation and the curve's shape. Now on its 3rd revision: same 65 points, but rebuilt from an automated SDRuno logger's 363 dBm readings (0.1dB steps, -30dB to +6.2dB — far denser and wider-range than REVISION 2's 95 manually-read points over -16dB to +5dB), with the original 17-point gate-voltage curve kept but extended and spot-checked rather than re-measured (the automated logger can't read gate voltage — see `envelope_predistort.h`). Dead below ~30% duty, steep turn-on through ~30-55% (now wanting ~1-1.5 duty points more than REVISION 2 through most of that climb), then a gently-compressing climb that doesn't actually finish plateauing until ~98.8% duty, not the ~95% REVISION 2 assumed — REVISION 2's own top-end sweep wasn't quite dense enough to catch the last of it either, same class of miss as REVISION 1 had with the same region.
+
+## Direct duty override
+
+| Key | Effect |
+|---|---|
+| `d` | Toggle direct duty override on/off. While on, `dsp_task`'s normal envelope pipeline is locked out of the RSET output entirely (bypasses master gain, envelope, `u`/`j`/`i`/`k` offset/scale, AND `D`'s predistort LUT) — the LEDC hardware just holds whatever duty was last explicitly set below. Turning it on resets the working value to 0. Turning it off hands control back to the normal pipeline. |
+| `>` | Step duty +1 count (finest resolution — only does anything while `d` is on) |
+| `<` | Step duty -1 count |
+| `N` | Step duty +16 counts (coarse) |
+| `B` | Step duty -16 counts (coarse) |
+
+Each step prints `-> duty NNN/1023`, same style as the `-> master gain ...` line. For characterizing the RSET/PWM/filter/AD9851 chain against a *known, exact* commanded duty count instead of one inferred from a gate-voltage reading — the reason this exists, see `envelope_predistort.h`'s REVISION 3 notes. The carrier/phase path is unaffected by this — select a steady source separately (`s`, single-tone, phase held rock-steady, is the natural choice — same as REVISION 1/2's own characterization used). Not yet used for a real sweep.
 
 ## Envelope-null floor
 

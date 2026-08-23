@@ -137,9 +137,17 @@ void envelope_output_init(void)
 #endif
 }
 
+static volatile bool s_duty_override_enabled = false;
+
 void IRAM_ATTR envelope_output_write_pwm(float delayed_envelope)
 {
 #if PWM_COMPARISON_ENABLED
+    if (s_duty_override_enabled) {
+        // Direct duty-set command (envelope_output_write_duty_raw(), via
+        // serial_commands.cpp's 'd'/'>'/'<'/'N'/'B') owns the LEDC duty
+        // register right now - see envelope_output.h's header comment.
+        return;
+    }
     uint32_t max_duty = (1u << RSET_MOD_LEDC_RES) - 1u;
     uint32_t duty = (uint32_t)(delayed_envelope * (float)max_duty);
     ledc_set_duty(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_CH, duty);
@@ -147,6 +155,35 @@ void IRAM_ATTR envelope_output_write_pwm(float delayed_envelope)
 #else
     (void)delayed_envelope;
 #endif
+}
+
+void IRAM_ATTR envelope_output_write_duty_raw(uint32_t duty)
+{
+#if PWM_COMPARISON_ENABLED
+    uint32_t max_duty = (1u << RSET_MOD_LEDC_RES) - 1u;
+    if (duty > max_duty) {
+        duty = max_duty;
+    }
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_CH, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_CH);
+#else
+    (void)duty;
+#endif
+}
+
+uint32_t envelope_output_get_max_duty(void)
+{
+    return (1u << RSET_MOD_LEDC_RES) - 1u;
+}
+
+bool envelope_output_duty_override_get_enabled(void)
+{
+    return s_duty_override_enabled;
+}
+
+void envelope_output_duty_override_set_enabled(bool enable)
+{
+    s_duty_override_enabled = enable;
 }
 
 void IRAM_ATTR envelope_output_submit_dac_sample(float envelope)
