@@ -96,18 +96,46 @@
 // bandwidth tradeoff now; not yet verified by ear or against real
 // spurious data - flagged for the same "listen to it, don't assume"
 // treatment the old N value got.
+//
+// TRIED, REVERTED: dropped to 48000 (ratio 3, ADC_SAMPLES_PER_TICK 5->3) to
+// try to free Core-0 CPU headroom ahead of revisiting the gptimer-core
+// wakeup-jitter question (see init_sample_timer()'s own "TRIED, REVERTED"
+// comment in the .ino - a real crash there showed Core 0 had zero spare
+// budget at 80kHz). Real hardware showed two problems: (1) max_busy_us
+// came back flat-to-slightly-worse (46us vs the ~44us baseline) - no clear
+// CPU win to show for it at all; (2) noise got ~1dB worse broadband and
+// MUCH worse specifically in the 3-6kHz band. Root cause for (2): the ADC
+// ISR still delivers bursts of ADC_CONT_FRAME_SAMPLES (16) samples at a
+// time regardless of this rate, so dropping the rate stretched the burst
+// interval from 3.2 dsp ticks (80kHz) to 5.33 ticks (48kHz) - a much
+// longer gap between refills at only 3 samples/tick of drain, which
+// [adc] fifo: min=0 / starve_ticks_total in the tens-of-thousands
+// confirmed was genuinely hitting zero, not just a comfortable margin.
+// A starved tick makes adc_capture_read_next_sample() re-return the last
+// filtered value (see adc_capture.cpp's to_pop=available branch) - a
+// small zero-order-hold repeat recurring at the burst rate itself
+// (ADC_CONT_SAMPLE_FREQ_HZ/ADC_CONT_FRAME_SAMPLES = 48000/16 = exactly
+// 3000Hz) - i.e. a periodic artifact landing its fundamental and first
+// harmonic right on 3000/6000Hz, matching the reported band precisely.
+// Shrinking ADC_CONT_FRAME_SAMPLES to compensate was proposed but not yet
+// tried before the whole experiment was called off - "keep the dB we've
+// already got" took priority. Left here for the next time someone's
+// tempted to touch this knob again.
 #define ADC_CONT_SAMPLE_FREQ_HZ   80000u   // within ESP32-S3's continuous-mode range
 #define ADC_CONT_FRAME_SAMPLES    16    // DMA chunk size only now - see AVERAGING note above.
                                          // If adc_continuous_new_handle() errors on this, the
                                          // driver enforces a different frame-size constraint -
                                          // report the exact error and we'll adjust.
 #define ADC_CONT_FRAME_BYTES      (ADC_CONT_FRAME_SAMPLES * SOC_ADC_DIGI_DATA_BYTES_PER_CONV)
-// 4x the original size - 4096 bytes (1024 samples, ~12.7ms headroom @
-// ~80.6kHz actual) turned out to be smaller than loop() could stall for
-// on a slow-baud Serial.printf() burst, causing real on_pool_ovf events
-// (see adc_capture_get_diag()). Raising baud rate is the primary fix;
-// this is cheap additional margin on top.
-#define ADC_CONT_BUF_BYTES        16384  // ~4096 samples, ~50ms headroom @ 80kHz
+// 4x the original size - 4096 bytes (1024 samples) turned out to be
+// smaller than loop() could stall for on a slow-baud Serial.printf()
+// burst, causing real on_pool_ovf events (see adc_capture_get_diag()).
+// Raising baud rate is the primary fix; this is cheap additional margin
+// on top - ~50ms headroom @ 80kHz (headroom-in-TIME grows as
+// ADC_CONT_SAMPLE_FREQ_HZ drops, same fixed byte/sample budget spread
+// over a slower rate, if that's ever revisited - see ADC_CONT_SAMPLE_FREQ_HZ's
+// own "TRIED, REVERTED" comment above).
+#define ADC_CONT_BUF_BYTES        16384  // ~4096 samples
 
 // 4th-order LPF (two cascaded biquads, ssb_biquad4_t - see
 // ssb_adc_filter.h) applied per raw sample in adc_conv_done_cb's
@@ -169,8 +197,10 @@
 
 // How many raw ADC samples dsp_task nominally consumes from the FIFO
 // each tick - the exact Fs_adc/Fs_dsp ratio. 80000/16000 = 5 exactly (was
-// 80000/10000 = 8 before SAMPLE_RATE_HZ was raised); if either rate ever
-// changes, check this stays an integer division with zero remainder.
+// 80000/10000 = 8 before SAMPLE_RATE_HZ was raised; a 48000/16000=3 rate
+// was tried and reverted - see ADC_CONT_SAMPLE_FREQ_HZ's own comment
+// above) - if either rate ever changes, check this stays an integer
+// division with zero remainder.
 #define ADC_SAMPLES_PER_TICK       (ADC_CONT_SAMPLE_FREQ_HZ / SAMPLE_RATE_HZ)
 
 // CATCH-UP THRESHOLD - separate from the nominal rate above. This is the

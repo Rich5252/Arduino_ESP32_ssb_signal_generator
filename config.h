@@ -107,6 +107,14 @@
                                     // exact-ratio assumption the catch-up logic depends on for
                                     // smooth operation; 16000 keeps that same property
                                     // (80000/16000=5, 2000000/16000=125).
+                                    //
+                                    // A drop to ADC_CONT_SAMPLE_FREQ_HZ=48000 (adc_capture.h) was
+                                    // tried, to free Core-0 headroom for the wakeup-jitter work
+                                    // below - reverted after real hardware showed no clear CPU
+                                    // win and a real noise regression (see that #define's own
+                                    // "TRIED, REVERTED" comment for the full story). Rate is back
+                                    // to 80000 - the divisibility numbers above are live again as
+                                    // written, not just historical.
 #define HILBERT_TAPS       65   // was briefly tested at 129 to check whether Hilbert filter
                                  // approximation accuracy was the source of the IMD floor that
                                  // tracks 1:1 with signal level below -6dB - real hardware A/B
