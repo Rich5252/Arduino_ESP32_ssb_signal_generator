@@ -544,6 +544,22 @@ void setup()
     xTaskCreatePinnedToCore(dsp_task, "ssb_dsp_task", 4096, NULL,
                              configMAX_PRIORITIES - 2, &s_dsp_task, 0);
 
+    // TRIED, REVERTED: moved this call into dsp_task()'s own body (Core 0)
+    // instead of here, on the theory that gptimer's alarm ISR living on
+    // Core 1 (setup()/loop()'s default core) while dsp_task lives on Core
+    // 0 was costing a cross-core IPI hop on every tick, explaining a
+    // [timing] wakeup-jitter figure that didn't track busy_us. Real
+    // hardware disagreed hard: regular reboots, and every [timing] number
+    // got WORSE, not better (max_busy_us 44->62us i.e. right at the 62us
+    // period edge, ADC actual sps collapsed to ~4.75k against an 80k
+    // target, pool_ovf_total went from 0 to nonzero, dsp long-window rate
+    // came in -2.6% off nominal instead of ~0.000%) - all consistent with
+    // the board crash-looping rather than running steady-state slower.
+    // Reverted back to calling it from here (unchanged from before that
+    // experiment) pending an actual Guru Meditation / panic backtrace to
+    // explain WHY moving it broke things, rather than guessing again
+    // blind. See ssb_mic_test_commands.md / chat history around this date
+    // for the full wakeup-jitter investigation this was chasing.
     init_sample_timer();
     diagnostics_init();
 
