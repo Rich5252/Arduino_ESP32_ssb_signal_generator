@@ -85,6 +85,10 @@
 //   - rock-solid periodic on GPIO_ISR, jitter only shows up on
 //     TIMING_DEBUG_GPIO -> the jitter is purely in the cross-core
 //     notify/hand-off from gptimer's ISR (Core 1) to dsp_task (Core 0).
+//     TRIED co-locating them on Core 1 instead to eliminate this hand-off
+//     entirely (see the .ino's dsp_task creation site) - real hardware
+//     starved Serial completely, reverted; root cause not yet understood,
+//     so this hand-off is still live and still the leading jitter suspect.
 //   - GPIO_ISR itself already jitters -> something on Core 1 is delaying
 //     gptimer's alarm ISR from firing promptly in the first place, and
 //     GPIO_ADC is there to test the leading suspect: adc_continuous's own

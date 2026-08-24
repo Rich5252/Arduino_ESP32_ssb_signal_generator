@@ -57,12 +57,22 @@ static volatile bool s_diag_muted = false;
 // dsp_task was genuinely blocked, and is the cost of the crosscore IPI
 // needed to wake a Core-0-pinned task from a Core-1 ISR. The structural
 // fix (co-locate the ISR and the task on one core) already crashed once
-// moving the TIMER onto Core 0, which had zero spare CPU. Before trying
-// the mirror option - moving dsp_task itself onto Core 1 instead - we
-// need to know whether Core 1 (currently hosting loop(), Serial/USB CDC,
-// adc_capture_service(), and the ADC's own on_conv_done ISR) has any
-// spare budget of its own, rather than guessing and risking the same
-// starvation/task_wdt failure on the other core.
+// moving the TIMER onto Core 0, which had zero spare CPU. This
+// measurement is what cleared the mirror option - moving dsp_task itself
+// onto Core 1 - as worth trying instead of guessing blind: once delay(10)
+// was correctly attributed (see diagnostics_record_core1_loop_timings()'s
+// header comment), Core 1 (hosting loop(), Serial/USB CDC,
+// adc_capture_service(), and the ADC's own on_conv_done ISR) turned out
+// to be sitting ~98-99% idle, not the ~3% the uncorrected idle-hook
+// reading suggested - comfortable headroom by the CPU-time math for
+// dsp_task's own ~45-75% duty cycle. TRIED anyway, REVERTED: real
+// hardware starved Serial completely (output AND commands, not just
+// delayed) despite that headroom - so CPU-time budget alone isn't the
+// whole story for whatever makes this core-sharing arrangement fail; see
+// the .ino's "TRIED, REVERTED" note on dsp_task's xTaskCreatePinnedToCore()
+// call. dsp_task is back on Core 0; this idle/breakdown reading is still
+// the right one to watch if that mirror option gets revisited once the
+// actual starvation mechanism is understood.
 //
 // esp_register_freertos_idle_hook_for_cpu() calls core1_idle_hook() every
 // time IDLE1 actually gets scheduled - i.e. only when Core 1 genuinely

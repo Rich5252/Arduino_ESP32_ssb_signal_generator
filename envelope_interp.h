@@ -76,6 +76,19 @@
  *       actual mistake in v3, not "task priority too high" - no priority
  *       tweak within v3's architecture could have fixed it).
  *
+ *       CORROBORATION, Fs-jitter-hunt: dsp_task was later TRIED on Core 1
+ *       (to eliminate gptimer's crosscore-IPI wake cost - see the .ino's
+ *       "TRIED, REVERTED" note on its xTaskCreatePinnedToCore() call) and
+ *       REVERTED after real hardware starved Serial completely (output
+ *       AND commands). Notably this happened with interp ('I') OFF, i.e.
+ *       WITHOUT the 4x wake rate this paragraph's v3 warning is about -
+ *       CPU-time budget alone said Core 1 had ample headroom (see
+ *       diagnostics.cpp's [core1] busy breakdown, ~98-99% idle) yet
+ *       loopTask still got starved outright, not just delayed. So
+ *       whatever actually broke v3 may be a harder structural problem
+ *       with sharing a core between dsp_task and loop() than "not enough
+ *       spare CPU time" - root cause not yet understood either time.
+ *
  * ---- v4 design ----
  * dsp_task (see the .ino) keeps a plain, single-threaded fast-tick counter
  * and treats tick (counter % ENVELOPE_INTERP_FACTOR == 0) as a "full"
@@ -189,7 +202,9 @@
  * trivial - a few FLOPs and the same plain PWM write the original code
  * always made), but worth watching on the existing '[timing]' diagnostic
  * overlay ('v') after enabling 'I', same as every other not-yet-bench-
- * confirmed feature here.
+ * confirmed feature here. (dsp_task stays on Core 0 for this - see this
+ * file's own "CORROBORATION, Fs-jitter-hunt" note above for why Core 1
+ * isn't a safe alternative home for it.)
  *
  * ---- v4.2: linear ramp -> Catmull-Rom / cubic Hermite curve ----
  * Motivated by a real question: is there a cheaper way to improve

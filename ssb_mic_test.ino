@@ -11,7 +11,10 @@
  *   dsp_task  (Core 0, high priority) - timer-notified, does the ADC read,
  *             DSP, and (when attached) the AD9851 SPI write. Never blocks
  *             on the DAC - it drops the computed envelope into a 1-deep
- *             "latest value wins" queue and moves straight on.
+ *             "latest value wins" queue and moves straight on. (Briefly
+ *             tried on Core 1 instead during the Fs jitter hunt - see
+ *             setup()'s "TRIED, REVERTED" note - real hardware starved
+ *             Serial entirely, reverted.)
  *   dac_task  (Core 1, lower priority) - blocks waiting for a new envelope
  *             value, then does the MCP4725 I2C fast-write (~70us at
  *             400kHz - far too slow to share a task with the phase-
@@ -477,6 +480,36 @@ static void init_sample_timer(void)
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
         .resolution_hz = 2000000UL * ENVELOPE_INTERP_FACTOR,
+        // Fs jitter hunt: intr_priority=3 (top of the commonly-usable
+        // range for a plain C interrupt handler on the S3, since level 4+
+        // requires special assembly-level handling this driver doesn't
+        // use). Previously left unset (0 = "IDF picks whatever's
+        // available"), which real hardware scope evidence pointed to as
+        // the actual jitter mechanism: pin5 (this timer's alarm ISR
+        // entry) occasionally had its ~15.625us nominal period stretch to
+        // ~19us, and those stretches correlated tightly with pin13 (the
+        // ADC continuous driver's own on_conv_done ISR, also Core 1)
+        // landing within a few us of pin5's edge - consistent with the
+        // two same-core ISRs occasionally colliding and one having to
+        // wait for the other, since same-priority interrupts on Xtensa
+        // don't nest/preempt each other. Xtensa DOES let a HIGHER-priority
+        // interrupt preempt a lower one mid-ISR, so this explicitly raises
+        // this timer's priority above the ADC driver's (still whatever
+        // default/unset priority IDF gives it - no public API found to
+        // lower it explicitly), letting gptimer's alarm cut in on an
+        // in-progress ADC ISR instead of queuing behind it.
+        //
+        // CONFIRMED WIN on real hardware: compiled clean (this project's
+        // IDF version does have this field, at this value), and pin5's
+        // period tightened from occasional ~19us excursions down to
+        // +/-0.5us around the 15.625us nominal - roughly a 7x reduction
+        // in the period jitter that started this whole investigation.
+        // Next to check: whether this also brings [timing]'s own
+        // wakeup-jitter max_gap_us down off its previous 75-80us range
+        // (nominal 62), and whether the audible/measured noise
+        // improves - pin5's period is upstream evidence, not the final
+        // verification.
+        .intr_priority = 3,
     };
     gptimer_new_timer(&timer_cfg, &timer);
 
@@ -570,6 +603,37 @@ void setup()
     envelope_interp_init();
 
     // dsp_task on Core 0, high priority - the phase-critical path.
+    //
+    // TRIED, REVERTED: pinned to Core 1 instead (matching gptimer's ISR
+    // core, to eliminate the crosscore-IPI wake cost identified by the Fs
+    // jitter hunt - see config.h's TIMING_DEBUG_GPIO_ADC comment and
+    // diagnostics.cpp's Core-1-headroom comment for the reasoning that led
+    // here, and envelope_interp.h's v4 notes for the v3 precedent this was
+    // known to risk). Real hardware result: Serial output AND command
+    // handling both went completely dead - not degraded, DEAD - meaning
+    // loopTask wasn't just delayed, it got starved of Core 1 entirely once
+    // dsp_task was also there. The actual RF/audio output stayed NORMAL
+    // throughout (confirmed - it was the scope trace on the TIMING_DEBUG_*
+    // pins that looked "messy", not the signal itself), so dsp_task's own
+    // real-time work was NOT visibly disrupted - this looks like a clean,
+    // one-sided starvation of loopTask specifically, not a general Core-1
+    // breakdown. Still a harder failure than the pure CPU-budget math
+    // predicted, though (dsp_task's own measured ~45-75% duty cycle should
+    // have left tens of us of genuinely idle time per tick for loopTask to
+    // run in) - exactly the v3 lesson repeating despite 'I' (envelope
+    // interp, the specific thing v3's warning was about) being OFF, which
+    // the CPU-budget reasoning didn't anticipate. Root cause NOT
+    // understood yet - reverted rather than guessing at a fix blind.
+    // Whatever mechanism actually starves loopTask here (scheduling
+    // artifact specific to same-core ISR+task colocation? something about
+    // how portYIELD_FROM_ISR interacts with a same-core notify vs a
+    // crosscore one? some other task's behavior changing as a side
+    // effect?) needs to be understood - ideally via a Guru Meditation/
+    // hang diagnosis or a scaled-down repro - before trying this
+    // direction again. The messy TIMING_DEBUG_* scope trace itself is a
+    // live, not-yet-followed-up lead worth revisiting too - which pin,
+    // and what "messy" actually looked like (irregular width vs period vs
+    // missing edges), could point straight at the mechanism.
     xTaskCreatePinnedToCore(dsp_task, "ssb_dsp_task", 4096, NULL,
                              configMAX_PRIORITIES - 2, &s_dsp_task, 0);
 

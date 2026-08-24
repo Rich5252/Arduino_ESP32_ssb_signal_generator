@@ -131,6 +131,16 @@ void envelope_output_init(void)
     // dac_task on Core 1 (with Arduino's own loop(), which is mostly idle
     // here) at low priority - keeps it fully off Core 0, no scheduling
     // interaction with dsp_task at all.
+    //
+    // Currently compiled out (dac_task_enabled). Note for whenever this
+    // is revisited: the Fs-jitter hunt briefly tried moving dsp_task
+    // itself onto Core 1 (see the .ino's "TRIED, REVERTED" note on its
+    // xTaskCreatePinnedToCore() call) and found real hardware starved
+    // Serial completely when dsp_task shared Core 1 with loop() - reverted,
+    // dsp_task is back on Core 0. So this comment's premise (dsp_task is
+    // on Core 0, dac_task on Core 1, no interaction) still holds today,
+    // but if dsp_task's core ever changes again, re-check dac_task's
+    // placement against it too rather than assuming this stays apart.
 #if dac_task_enabled
     xTaskCreatePinnedToCore(dac_task, "ssb_dac_task", 3072, NULL,
                            tskIDLE_PRIORITY + 1, &s_dac_task, 1);

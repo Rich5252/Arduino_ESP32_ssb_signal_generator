@@ -38,6 +38,21 @@ void diagnostics_init(void);
 // Called once per dsp_task tick, right after ulTaskNotifyTake() returns -
 // updates the tick counter and the wake-up jitter stats (gap since the
 // previous tick's t_start_us).
+//
+// REVERTED here to its pre-Fs-jitter-hunt-diagnostics signature (just
+// t_start_us) - a fuller version briefly existed that also correlated
+// this against ulTaskNotifyTake()'s elapsed-count return value (a
+// diagnostics_record_elapsed_fast_ticks() sibling function, called on
+// every wake to catch coalescing/missed wakes), but real hardware showed
+// a regression in pin5's own period/pulse-width after that diagnostics
+// work was added, and reverting the NEXT layer added on top of it
+// (a per-wake residual-lateness measurement) did NOT fix it - so this
+// whole layer is backed out down to the last confirmed-good checkpoint
+// (the intr_priority=3 fix on its own, before any of this) to test
+// whether ANY of it was the actual cause, rather than continuing to
+// guess which specific piece. If pin5 comes back clean at THIS
+// checkpoint, re-add the elapsed-count tracking piece by piece; if it's
+// STILL bad here, the cause isn't in this diagnostics code at all.
 void IRAM_ATTR diagnostics_record_tick_start(int64_t t_start_us);
 
 // Called once per dsp_task tick, after computing this tick's phase
