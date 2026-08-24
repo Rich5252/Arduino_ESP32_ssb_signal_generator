@@ -192,10 +192,10 @@ static const PersistentSettings settingsPresets[10] =
     { "AM-ButwGd", AUDIO_SRC_AMTEST, 2.96f, 0.08f, 0.84f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
 
     // Preset 5 -
-    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.43f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV, false, false, 1.0f, true, true, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false},  // was 1.55f @ 10000Hz; adc_lpf_bypass=true
+    { "V4 Microphone tuned", AUDIO_SRC_MIC, 3.48f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV, true, true, 21.3f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, true },  
 
         // Preset 6 -
-    { "TwoToneButwGD Env 1.6-2.9 DelayTuned", AUDIO_SRC_TWOTONE, 2.64f, 0.36f, 0.48f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false },  // was 1.65f @ 10000Hz; adc_lpf_bypass=true
+    { "V4 Two tone tuned", AUDIO_SRC_TWOTONE, 2.15f, 0.20f, 0.90f, false, ADC_LPF_MODE_OFF, false, false, 0.6f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, true },  
         // Preset 7 -
     { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.96f, 0.40f, 0.46f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
         // Preset 8 -
