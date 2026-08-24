@@ -11,6 +11,8 @@
 #include "ssb_dsp.h"
 #include "carrier_output.h"
 #include "esp_timer.h"
+#include "esp_err.h"
+#include "esp_freertos_hooks.h"   // esp_register_freertos_idle_hook_for_cpu() - see core1_idle_hook() below
 #include <Arduino.h>
 
 // Written by dsp_task, printed by diagnostics_service() on Core 1 at low
@@ -50,6 +52,86 @@ static volatile uint32_t s_dbg_dsp_tick_count = 0;  // incremented once per dsp_
 
 static volatile bool s_diag_muted = false;
 
+// Core 1 headroom - see the Fs jitter hunt's crosscore-wake finding: the
+// ~1us->6us stretch on gptimer's notify-from-ISR call only happens when
+// dsp_task was genuinely blocked, and is the cost of the crosscore IPI
+// needed to wake a Core-0-pinned task from a Core-1 ISR. The structural
+// fix (co-locate the ISR and the task on one core) already crashed once
+// moving the TIMER onto Core 0, which had zero spare CPU. Before trying
+// the mirror option - moving dsp_task itself onto Core 1 instead - we
+// need to know whether Core 1 (currently hosting loop(), Serial/USB CDC,
+// adc_capture_service(), and the ADC's own on_conv_done ISR) has any
+// spare budget of its own, rather than guessing and risking the same
+// starvation/task_wdt failure on the other core.
+//
+// esp_register_freertos_idle_hook_for_cpu() calls core1_idle_hook() every
+// time IDLE1 actually gets scheduled - i.e. only when Core 1 genuinely
+// has nothing else ready to run (idle priority is the lowest there is,
+// so nothing here can preempt real work). Delta-sum-with-threshold: the
+// gap between two consecutive calls is either IDLE1's own tight-loop
+// overhead (small, uninterrupted - genuine idle time, count it) or
+// something else ran on Core 1 in between (large gap - NOT idle, must be
+// excluded rather than mis-counted as spare budget). The threshold just
+// needs to sit comfortably above the hook's own call-to-call overhead
+// (expected well under 1us) and comfortably below any real task/ISR
+// activity worth caring about.
+//
+// Both statics are touched ONLY from Core 1 (the hook itself, and the
+// [core1] print/reset below, both run on Core 1 - the hook can never
+// preempt the print since idle is the lowest priority) - no lock needed,
+// same single-core-ownership reasoning as the ADC FIFO's head/tail split.
+#define CORE1_IDLE_GAP_THRESHOLD_US 10
+static uint64_t s_core1_idle_us_accum = 0;
+static int64_t  s_core1_idle_last_call_us = 0;
+static bool     s_core1_idle_hook_registered = false;
+
+// Threshold-free cross-check on the idle% accounting above: a plain
+// count of every hook call, no gap filtering at all. CORE1_IDLE_GAP_
+// THRESHOLD_US was a guess, not calibrated against this actual hardware/
+// IDF build - if idle% ever comes back suspiciously low (can't be
+// explained by the other measured categories), a call rate that's also
+// very low corroborates "Core 1 really is that busy"; a call rate that's
+// still substantial while idle_us reads low would instead point at the
+// threshold itself silently discarding real idle gaps that are just
+// wider than 10us (e.g. if IDLE1's own per-iteration housekeeping on
+// this IDF version costs more than assumed).
+static uint32_t s_core1_idle_hook_calls = 0;
+
+// Core 1 BREAKDOWN - "where does that ~96-97% busy time actually go".
+// Sums (not high-water marks - see diagnostics_record_core1_loop_timings()'s
+// own header comment for why), one per loop() sub-call, plus idle above.
+// Same single-core-ownership reasoning as the idle accumulator - only
+// ever touched from Core 1 (loop()'s own context), no lock needed.
+static uint64_t s_core1_busy_cmd_us     = 0;   // handle_serial_commands()
+static uint64_t s_core1_busy_adc_svc_us = 0;   // adc_capture_service()
+static uint64_t s_core1_busy_diag_us    = 0;   // diagnostics_service() itself (mostly the
+                                                // throttled [timing]/[adc]/[dsp] printf block)
+static uint64_t s_core1_busy_delay_us   = 0;   // loop()'s own delay(10) - see
+                                                // diagnostics_record_core1_loop_timings()'s
+                                                // header comment for why this one bucket
+                                                // turned out to explain the whole "other"
+                                                // mystery
+
+// esp_freertos_idle_cb_t is bool(*)(void), not void(*)(void) - confirmed
+// on real hardware (this project's exact esp32s3-libs build rejected the
+// void signature outright, -fpermissive error). Return value isn't ours
+// to interpret here - this hook is just accumulating a measurement, not
+// influencing idle-task behavior (light sleep, WDT feeding, etc., which
+// are handled elsewhere) - true is the safe, do-nothing-special choice.
+static bool IRAM_ATTR core1_idle_hook(void)
+{
+    s_core1_idle_hook_calls++;   // unconditional - the threshold-free cross-check, see its own comment
+    int64_t now = esp_timer_get_time();
+    if (s_core1_idle_last_call_us != 0) {
+        int64_t gap = now - s_core1_idle_last_call_us;
+        if (gap > 0 && gap <= CORE1_IDLE_GAP_THRESHOLD_US) {
+            s_core1_idle_us_accum += (uint64_t)gap;
+        }
+    }
+    s_core1_idle_last_call_us = now;
+    return true;
+}
+
 void IRAM_ATTR diagnostics_record_tick_start(int64_t t_start_us)
 {
     s_dbg_dsp_tick_count++;   // unconditional - counts real elapsed ticks regardless of mode
@@ -73,6 +155,15 @@ void IRAM_ATTR diagnostics_record_phase_timings(uint32_t adc_us, uint32_t dsp_us
     if (write_us > s_dbg_max_write_us) s_dbg_max_write_us = write_us;
     if (busy_us  > s_dbg_max_busy_us)  s_dbg_max_busy_us  = busy_us;
     if (busy_us  > k_sample_period_us) s_dbg_overrun_count++;
+}
+
+void diagnostics_record_core1_loop_timings(uint32_t cmd_us, uint32_t adc_svc_us,
+                                            uint32_t diag_us, uint32_t delay_us)
+{
+    s_core1_busy_cmd_us     += cmd_us;
+    s_core1_busy_adc_svc_us += adc_svc_us;
+    s_core1_busy_diag_us    += diag_us;
+    s_core1_busy_delay_us   += delay_us;
 }
 
 void IRAM_ATTR diagnostics_set_envelope_freqdev(float envelope, float freq_dev_hz)
@@ -113,6 +204,13 @@ void diagnostics_reset(void)
     s_last_samples_total = 0;
     s_last_callback_count = 0;
     s_last_rate_print_ms = millis();
+    s_core1_idle_us_accum = 0;
+    s_core1_idle_last_call_us = 0;
+    s_core1_idle_hook_calls = 0;
+    s_core1_busy_cmd_us = 0;
+    s_core1_busy_adc_svc_us = 0;
+    s_core1_busy_diag_us = 0;
+    s_core1_busy_delay_us = 0;
 }
 
 bool diagnostics_get_muted(void)
@@ -134,6 +232,23 @@ void diagnostics_toggle_muted(void)
 void diagnostics_init(void)
 {
     s_dsp_tick_start_us = esp_timer_get_time();
+
+    // Core 1 headroom measurement - see core1_idle_hook()'s own comment
+    // above. cpuid=1 is passed explicitly to the registration call, so
+    // it doesn't matter which core calls this function itself (setup()
+    // runs on Core 1 anyway, but that's incidental here).
+    esp_err_t err = esp_register_freertos_idle_hook_for_cpu(core1_idle_hook, 1);
+    if (err == ESP_OK) {
+        s_core1_idle_hook_registered = true;
+    } else {
+        // Non-fatal - just means the [core1] idle% line below will
+        // always read 0% instead of a real measurement. Printed once
+        // here rather than failing silently, since a 0% reading could
+        // otherwise be mistaken for "genuinely no spare CPU" instead of
+        // "hook never got registered".
+        Serial.printf("WARNING: Core 1 idle hook registration failed (err=%d) - "
+                      "[core1] idle%% will read as 0, not a real measurement\r\n", (int)err);
+    }
 }
 
 static void print_status_line(void)
@@ -214,6 +329,64 @@ static void print_timing_and_adc_block(uint32_t now)
                       actual_sps, ADC_CONT_SAMPLE_FREQ_HZ,
                       adc_diag.callback_count - s_last_callback_count, expected_cbs,
                       adc_diag.pool_ovf_count);
+
+        // Core 1 headroom over this SAME ~1s window - see core1_idle_hook()'s
+        // own comment. Snapshot-then-reset rather than a running total: a
+        // per-window reading is more useful here than a cumulative-since-
+        // boot average would be, since it stays responsive to whatever's
+        // currently happening on Core 1 (a Serial burst, a mode switch)
+        // instead of smoothing it away over the long run. Safe to read/
+        // reset without a lock - see the statics' own comment above for
+        // why (idle priority can never preempt this loop()-context code).
+        if (!s_core1_idle_hook_registered) {
+            Serial.printf("[core1] idle hook not registered - no measurement available\r\n");
+        } else {
+            double idle_pct = (double)s_core1_idle_us_accum * 100.0 / ((double)elapsed_ms * 1000.0);
+            uint32_t hook_calls_per_sec = (uint32_t)((uint64_t)s_core1_idle_hook_calls * 1000 / elapsed_ms);
+            Serial.printf("[core1] idle(hook)=%.1f%% over %ums (Core-1 idle hook reading - kept as a "
+                          "cross-check, but see [core1] busy breakdown's delay=%% below for the trustworthy "
+                          "number: this hook-based figure reads suspiciously low because a genuinely "
+                          "blocked task's idle-hook calls land ~1 OS tick apart, not microseconds apart, "
+                          "so CORE1_IDLE_GAP_THRESHOLD_US=10 excludes nearly all of a real long idle "
+                          "block instead of counting it)\r\n",
+                          idle_pct, elapsed_ms);
+            Serial.printf("[core1]   idle hook calls/s=%u (threshold-free cross-check on idle(hook)%% "
+                          "above - see CORE1_IDLE_GAP_THRESHOLD_US's comment)\r\n",
+                          hook_calls_per_sec);
+            s_core1_idle_us_accum = 0;
+            s_core1_idle_hook_calls = 0;
+
+            // Breakdown of the window - "where does Core 1's time actually
+            // go". cmd/adc_svc/diag/delay are the four loop() sub-calls we
+            // can measure directly (see diagnostics_record_
+            // core1_loop_timings()'s header comment - delay(10) used to go
+            // unmeasured and its time landed entirely in "other", which is
+            // what made "other" look like ~96% of Core 1 before this
+            // bucket was added). "other" here is deliberately NOT reduced
+            // by idle(hook)% above - that figure covers the same physical
+            // time as delay% but via the unreliable hook/threshold method,
+            // so subtracting both would double-count and mask real
+            // "other" cost under the clamp. What's left in "other" after
+            // cmd/adc_svc/diag/delay is genuinely unaccounted for: ISR
+            // time (chiefly the ADC's on_conv_done, which fires
+            // continuously regardless of mode) plus USB CDC driver
+            // overhead, neither of which loop() ever sees directly to
+            // time itself.
+            double window_us   = (double)elapsed_ms * 1000.0;
+            double cmd_pct     = (double)s_core1_busy_cmd_us     * 100.0 / window_us;
+            double adc_svc_pct = (double)s_core1_busy_adc_svc_us * 100.0 / window_us;
+            double diag_pct    = (double)s_core1_busy_diag_us    * 100.0 / window_us;
+            double delay_pct   = (double)s_core1_busy_delay_us   * 100.0 / window_us;
+            double other_pct   = 100.0 - cmd_pct - adc_svc_pct - diag_pct - delay_pct;
+            if (other_pct < 0.0) other_pct = 0.0;   // clamp - rounding/overlap across independently-measured windows, not a real negative cost
+            Serial.printf("[core1]   busy breakdown: cmd=%.1f%% adc_svc=%.1f%% diag=%.1f%% delay=%.1f%% "
+                          "other(ADC ISR + USB CDC + ...)=%.1f%%\r\n",
+                          cmd_pct, adc_svc_pct, diag_pct, delay_pct, other_pct);
+            s_core1_busy_cmd_us = 0;
+            s_core1_busy_adc_svc_us = 0;
+            s_core1_busy_diag_us = 0;
+            s_core1_busy_delay_us = 0;
+        }
 
         // Long-window average - much lower noise than the 1s figure
         // above, since averaging error shrinks with window length. This

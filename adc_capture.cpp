@@ -10,6 +10,7 @@
 #include "esp_adc/adc_continuous.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
+#include "soc/gpio_struct.h"   // GPIO.out_w1ts/w1tc - see adc_conv_done_cb()'s Fs jitter hunt toggle
 #include <Arduino.h>
 
 #define ADC_UNIT       ADC_UNIT_1
@@ -76,8 +77,31 @@ static bool IRAM_ATTR adc_conv_done_cb(adc_continuous_handle_t handle,
                                         const adc_continuous_evt_data_t *edata,
                                         void *user_data)
 {
+#if TIMING_DEBUG_ENABLED
+    // Fs jitter hunt - see config.h's TIMING_DEBUG_GPIO_ISR comment.
+    // Scope this against TIMING_DEBUG_GPIO_ISR to test whether THIS ISR
+    // (also Core 1, firing every ADC_CONT_FRAME_SAMPLES/
+    // ADC_CONT_SAMPLE_FREQ_HZ) is the thing delaying gptimer's alarm ISR
+    // from firing on time - i.e. ISR-to-ISR contention on Core 1.
+    //
+    // Falling edge here = true ISR entry instant, zero added latency -
+    // this is the edge to trigger/measure jitter off. The matching
+    // out_w1ts now sits at every return point below (see there) instead
+    // of immediately after this line, so the LOW pulse width becomes
+    // "however long this callback's own real work took" - free width for
+    // a 100MHz scope to resolve, using time that was already being spent
+    // here rather than adding any. Bonus: that width is itself a genuine
+    // per-firing ISR-execution-time measurement.
+    GPIO.out_w1tc = (1UL << TIMING_DEBUG_GPIO_ADC);
+#endif
+
     uint32_t n = edata->size / SOC_ADC_DIGI_DATA_BYTES_PER_CONV;
-    if (n == 0) return false;
+    if (n == 0) {
+#if TIMING_DEBUG_ENABLED
+        GPIO.out_w1ts = (1UL << TIMING_DEBUG_GPIO_ADC);   // close the pulse on this early-return path too
+#endif
+        return false;
+    }
     if (n > ADC_CONT_FRAME_SAMPLES) n = ADC_CONT_FRAME_SAMPLES;   // defensive - shouldn't happen
 
     s_dbg_adc_callback_count++;
@@ -111,6 +135,9 @@ static bool IRAM_ATTR adc_conv_done_cb(adc_continuous_handle_t handle,
         head = next_head;
     }
     s_adc_fifo_head = head;
+#if TIMING_DEBUG_ENABLED
+    GPIO.out_w1ts = (1UL << TIMING_DEBUG_GPIO_ADC);   // rising edge = this callback's real work is done
+#endif
     return false;   // no higher-priority task needs waking from this event
 }
 
@@ -127,6 +154,15 @@ static bool IRAM_ATTR adc_pool_ovf_cb(adc_continuous_handle_t handle,
 
 void adc_capture_init(void)
 {
+#if TIMING_DEBUG_ENABLED
+    // Fs jitter hunt - see config.h's TIMING_DEBUG_GPIO_ISR comment and
+    // adc_conv_done_cb()'s own toggle below. Set up here, before the
+    // driver starts (end of this function), so the pin is a valid OUTPUT
+    // before the ISR could possibly fire.
+    pinMode(TIMING_DEBUG_GPIO_ADC, OUTPUT);
+    digitalWrite(TIMING_DEBUG_GPIO_ADC, LOW);
+#endif
+
     adc_continuous_handle_cfg_t handle_cfg = {
         .max_store_buf_size = ADC_CONT_BUF_BYTES,
         .conv_frame_size = ADC_CONT_FRAME_BYTES,

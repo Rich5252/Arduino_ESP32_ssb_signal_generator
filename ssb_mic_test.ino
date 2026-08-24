@@ -100,6 +100,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
+#include "soc/gpio_struct.h"   // GPIO.out_w1ts/w1tc - see on_timer_alarm()'s Fs jitter hunt toggle
 
 // Shared compile-time configuration - must come before any other project
 // header (gates #if blocks in several of them, e.g. PWM_COMPARISON_ENABLED
@@ -134,8 +135,29 @@ static TaskHandle_t s_dsp_task;
 
 static bool IRAM_ATTR on_timer_alarm(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
+#if TIMING_DEBUG_ENABLED
+    // Fs jitter hunt - see config.h's TIMING_DEBUG_GPIO_ISR comment. Raw
+    // register toggle (not digitalWrite) - real ISR context, this MUST
+    // stay IRAM-safe with zero risk of calling into a non-IRAM-resident
+    // function. GPIO.out_w1ts/w1tc is a direct memory-mapped register
+    // write, no function call at all - the standard idiom for exactly
+    // this.
+    //
+    // Falling edge here = true ISR entry instant, zero added latency -
+    // trigger/measure jitter off THIS edge, not the rising one. The
+    // matching out_w1ts sits AFTER vTaskNotifyGiveFromISR() below instead
+    // of immediately after this line, so the LOW pulse width becomes
+    // "however long the notify call itself took" - free width for a
+    // 100MHz scope to resolve (using real work's own duration, not an
+    // added delay), instead of two back-to-back register writes that are
+    // over almost as soon as they start.
+    GPIO.out_w1tc = (1UL << TIMING_DEBUG_GPIO_ISR);
+#endif
     BaseType_t high_task_woken = pdFALSE;
     vTaskNotifyGiveFromISR(s_dsp_task, &high_task_woken);
+#if TIMING_DEBUG_ENABLED
+    GPIO.out_w1ts = (1UL << TIMING_DEBUG_GPIO_ISR);   // rising edge = notify call done, about to return
+#endif
     return high_task_woken == pdTRUE;
 }
 
@@ -490,6 +512,13 @@ void setup()
 #if TIMING_DEBUG_ENABLED
     pinMode(TIMING_DEBUG_GPIO, OUTPUT);
     digitalWrite(TIMING_DEBUG_GPIO, LOW);
+
+    // Fs jitter hunt - see config.h's TIMING_DEBUG_GPIO_ISR comment.
+    // GPIO_ADC's own pinMode/init lives in adc_capture_init() instead
+    // (adc_capture.cpp) since that's the module that owns the ISR that
+    // toggles it - kept together rather than split across files.
+    pinMode(TIMING_DEBUG_GPIO_ISR, OUTPUT);
+    digitalWrite(TIMING_DEBUG_GPIO_ISR, LOW);
 #endif
 
 #if AD9851_ATTACHED
@@ -508,9 +537,9 @@ void setup()
             .enable = AUDIO_FX_ENABLED,
             .hpf_freq_hz = 300.0f,
             .presence_freq_hz = 2200.0f,
-            .presence_gain_db = 4.0f,
+            .presence_gain_db = 2.0f,
             .presence_q = 1.0f,
-            .comp_threshold = 0.3f,
+            .comp_threshold = 0.1f,
             .comp_ratio = 3.5f,
             .comp_attack_ms = 3.0f,
             .comp_release_ms = 120.0f,
@@ -642,17 +671,41 @@ void setup()
 
 void loop()
 {
+    // Core 1 breakdown - "what is Core 1 actually doing" (see the
+    // [core1] idle% finding: both cores are essentially saturated, so
+    // this answers where that time goes). Each call bracketed with
+    // esp_timer_get_time(), summed into diagnostics.cpp's own
+    // accumulators via one combined recorder call at the end - see
+    // diagnostics_record_core1_loop_timings()'s header comment.
+    int64_t t_cmd0 = esp_timer_get_time();
     handle_serial_commands();
+    int64_t t_cmd1 = esp_timer_get_time();
 
     // Keep adc_continuous's internal pool from filling up - see
     // adc_capture.h. Low priority, not time-critical - fine to do here
     // alongside the other loop() work.
     adc_capture_service();
+    int64_t t_adcsvc1 = esp_timer_get_time();
 
     // Throttled status/timing/adc diagnostic prints - see diagnostics.h.
     // This task is lower priority than both real-time tasks, so it never
     // competes with either for CPU time or bus access.
     diagnostics_service();
+    int64_t t_diag1 = esp_timer_get_time();
 
+    // delay(10) below used to go completely unmeasured - it's loop()'s
+    // ONLY remaining code after the three calls above, so at a 10ms
+    // request it should be by far the biggest chunk of every iteration
+    // (idle/blocked, nothing else needs Core 1). It was landing entirely
+    // in the old "other" bucket instead - see diagnostics_record_
+    // core1_loop_timings()'s header comment for what that turned out to
+    // mean for the [core1] idle hook reading too.
+    int64_t t_delay0 = t_diag1;
     delay(10);
+    int64_t t_delay1 = esp_timer_get_time();
+
+    diagnostics_record_core1_loop_timings((uint32_t)(t_cmd1 - t_cmd0),
+                                           (uint32_t)(t_adcsvc1 - t_cmd1),
+                                           (uint32_t)(t_diag1 - t_adcsvc1),
+                                           (uint32_t)(t_delay1 - t_delay0));
 }

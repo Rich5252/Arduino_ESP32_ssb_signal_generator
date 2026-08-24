@@ -22,6 +22,8 @@
 #include <Arduino.h>
 #include <cstdarg>
 #include <cstring>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"   // vTaskList() - see the 'L' handler below
 
 // Every command reply in this file is sent through serial_reply() below,
 // rather than calling Serial.print()/println()/printf() directly - this
@@ -343,6 +345,49 @@ void handle_serial_commands(void)
             carrier_output_set_rf_enabled(now_on);
             serial_reply("-> AD9851 RF output %s\r\n", now_on ? "ON" : "off (powered down)");
 #endif
+        } else if (c == 'L') {
+            // One-shot FreeRTOS task list - added to directly settle the
+            // "Events"/"Arduino" IDE core-affinity question (both showing
+            // Core 1 in the board menu) instead of continuing to reason
+            // from uncertain memory of what Arduino-ESP32's boot glue
+            // actually creates. See the [core1] busy breakdown's 96.2%
+            // unexplained "other" bucket - this either shows an
+            // unaccounted-for task (e.g. an "arduino_events" task) sitting
+            // on Core 1, or shows only the tasks we already know about, in
+            // which case the "other" bucket points back at the ADC ISR (or
+            // this module's own idle-hook threshold) instead.
+            //
+            // vTaskList() requires configUSE_TRACE_FACILITY=1 AND
+            // configUSE_STATS_FORMATTING_FUNCTIONS=1 in this board's
+            // FreeRTOSConfig.h - NOT verified from here, since this
+            // environment has no ESP-IDF/Arduino-ESP32 checkout to check
+            // against (only this project's own source files are available
+            // to read). If either is off, this line simply won't compile -
+            // same situation as the esp_freertos_idle_cb_t signature
+            // mismatch earlier this session, where the real compiler error
+            // was more reliable than guessing from memory. If that
+            // happens, the fix is to switch to uxTaskGetSystemState()
+            // instead (needs only configUSE_TRACE_FACILITY, not the
+            // formatting half) and format each TaskStatus_t field by hand.
+            //
+            // The exact column layout (whether a per-task core/affinity
+            // column is present) is also an ESP-IDF FreeRTOS-port
+            // extension whose default here isn't verified - but even
+            // without it, the task NAME list alone is enough to confirm or
+            // rule out an extra Arduino-created task existing at all.
+            //
+            // Buffer budgeted per FreeRTOS docs (~40 bytes/task) for up to
+            // ~20 tasks - this project's known tasks are dsp_task,
+            // dac_task, loopTask, IDLE0, IDLE1, ipc0, ipc1, Tmr Svc, plus
+            // headroom for whatever Arduino-ESP32's boot glue adds (the
+            // very thing this command exists to check for).
+            static char task_list_buf[900];
+            serial_reply("-> FreeRTOS task list (columns per vTaskList(): name, state "
+                          "B/R/D/S/X, priority, stack high-water mark, task number, then "
+                          "core/affinity IF this board's FreeRTOSConfig.h includes it):\r\n");
+            vTaskList(task_list_buf);
+            Serial.write((const uint8_t *)task_list_buf, strlen(task_list_buf));
+            serial_reply("-> end task list\r\n");
         } else if (c == 'P') {
             // Prints every current lever as a single comma-separated line,
             // in exactly PersistentSettings's field order (name,

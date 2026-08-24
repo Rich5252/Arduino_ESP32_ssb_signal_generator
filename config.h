@@ -75,6 +75,49 @@
 #define TIMING_DEBUG_ENABLED 1
 #define TIMING_DEBUG_GPIO     4   // within the board's easy-access GPIO1-13 range; not otherwise used
 
+// ---- Fs jitter hunt: two ADDITIONAL debug pins, both raw hardware-
+// register toggles (GPIO.out_w1ts/w1tc, not digitalWrite - see the .ino's
+// on_timer_alarm() and adc_capture.cpp's adc_conv_done_cb for why: these
+// fire from REAL ISR context, unlike TIMING_DEBUG_GPIO above which only
+// ever toggles from dsp_task, a task context) - purely diagnostic,
+// intended to be scoped ALONGSIDE TIMING_DEBUG_GPIO to localize where the
+// [timing] wakeup-jitter figure actually originates:
+//   - rock-solid periodic on GPIO_ISR, jitter only shows up on
+//     TIMING_DEBUG_GPIO -> the jitter is purely in the cross-core
+//     notify/hand-off from gptimer's ISR (Core 1) to dsp_task (Core 0).
+//   - GPIO_ISR itself already jitters -> something on Core 1 is delaying
+//     gptimer's alarm ISR from firing promptly in the first place, and
+//     GPIO_ADC is there to test the leading suspect: adc_continuous's own
+//     on_conv_done ISR (also Core 1, firing every ADC_CONT_FRAME_SAMPLES/
+//     ADC_CONT_SAMPLE_FREQ_HZ = 16/80000 = 200us = 5000Hz right now) -
+//     correlate its edges against GPIO_ISR's jitter to test ISR-to-ISR
+//     contention on Core 1 as the root cause.
+// Both pulse LOW-then-HIGH once per ISR firing (clear, then immediately
+// set - not a toggle/flip) so every single ISR call produces the same
+// falling-then-rising edge pair and a scope triggering on either edge
+// catches every firing, not just every other one. It's the EDGE timing
+// that matters here, not the pulse width (which is just however long the
+// two back-to-back register writes take - negligible, sub-100ns).
+#define TIMING_DEBUG_GPIO_ISR  5   // toggled every gptimer alarm ISR fire (on_timer_alarm(), Core 1)
+#define TIMING_DEBUG_GPIO_ADC  13  // toggled every ADC conv_done ISR fire (adc_conv_done_cb(), Core 1).
+                                   // TRIED GPIO3 FIRST, REVERTED: real hardware confirmed the ADC
+                                   // continuous driver produced ZERO conversions the moment this pin's
+                                   // toggling was enabled (actual sps=0, callbacks=0, both mic and
+                                   // two-tone mode) - setting TIMING_DEBUG_ENABLED to 0 (disabling all
+                                   // three debug pins) immediately restored real ADC data, and pins 4/5
+                                   // were already proven safe from earlier captures this same session,
+                                   // isolating GPIO3 as the cause by elimination. No confirmed mechanism
+                                   // for WHY - GPIO3 is ADC1_CH2 on the S3, a DIFFERENT channel from the
+                                   // mic's ADC1_CH5 (GPIO6), so driving it digitally shouldn't in theory
+                                   // disturb a different channel's sampling - but the correlation was
+                                   // clean enough not to trust that theory over the real hardware result.
+                                   // Moved off the whole ADC1 channel range (GPIO1-10) instead of
+                                   // re-testing GPIO3 specifically or picking another ADC1 pin - GPIO13
+                                   // is ADC2 (never initialized by this project at all), which rules out
+                                   // channel-adjacency as a question entirely rather than hoping GPIO3
+                                   // was uniquely bad. If GPIO13 turns out inconvenient to probe, pick
+                                   // any other GPIO11+ instead, just stay off 1-10.
+
 #define SAMPLE_RATE_HZ     16000u  // was 9600 (see below), then 10000 for a long stretch, now
                                     // raised to 16000 once the AD9851 write path (bit-bang +
                                     // fast register writes, see AD9851.c) freed up enough

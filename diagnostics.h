@@ -46,6 +46,36 @@ void IRAM_ATTR diagnostics_record_tick_start(int64_t t_start_us);
 void IRAM_ATTR diagnostics_record_phase_timings(uint32_t adc_us, uint32_t dsp_us,
                                                  uint32_t write_us, uint32_t busy_us);
 
+// Core 1 breakdown - "where does Core 1's time actually go". Called
+// once per loop() iteration (Core 1, NOT a hot real-time path - safe to
+// be a plain function, no IRAM_ATTR needed), right after
+// handle_serial_commands()/adc_capture_service()/diagnostics_service()/
+// delay(10) have all run, with each one's own wall-clock duration this
+// iteration. Unlike diagnostics_record_phase_timings() above (worst-case
+// high-water marks), these accumulate as SUMS over the reporting window
+// - the question here is which of these is eating the most total time,
+// not what any single call's worst case was.
+//
+// delay_us matters more than it looks: the very first version of this
+// breakdown didn't bracket delay(10) at all, and the numbers it produced
+// (idle=3.0-3.7% via the Core-1 idle hook, cmd/adc_svc/diag all under
+// 1%, "other"=96.2%) looked like Core 1 was almost completely saturated
+// by something unaccounted-for. Adding this bucket was the fix, not a
+// vTaskList()-found rogue task (there wasn't one - see the 'L' serial
+// command's task list, which came back with exactly the expected 8
+// tasks and nothing resembling an Arduino "events" task, since this
+// project never touches WiFi/BT and that task is only ever created
+// lazily by the code paths that do). delay(10) SHOULD dominate every
+// loop() iteration - it's the only other thing loop() does - so
+// bracketing it directly should collapse "other" down near zero and
+// show that the real idle time was there all along; the [core1] idle
+// hook reading just wasn't seeing most of it (see core1_idle_hook()'s
+// CORE1_IDLE_GAP_THRESHOLD_US comment - a real blocked wait's idle-hook
+// calls are spaced by the OS tick period, not microseconds apart, so a
+// 10us gap threshold excludes nearly all of a genuine 10ms block).
+void diagnostics_record_core1_loop_timings(uint32_t cmd_us, uint32_t adc_svc_us,
+                                            uint32_t diag_us, uint32_t delay_us);
+
 // Called once per dsp_task tick with the final (post-gdeq, post-PWM-
 // mapping) envelope and the pre-delay freq_dev_hz - same values the
 // original stored in s_dbg_envelope/s_dbg_freq_dev.
