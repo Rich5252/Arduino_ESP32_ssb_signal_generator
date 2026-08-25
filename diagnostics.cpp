@@ -41,6 +41,45 @@ static const uint32_t k_sample_period_us = SSB_SAMPLE_PERIOD_US;
 static volatile uint32_t s_dbg_max_tick_gap_us = 0;      // worst observed inter-tick gap
 static volatile uint32_t s_dbg_late_tick_count = 0;      // ticks where the gap exceeded 1.5x nominal
 
+// "Is that long [core1]/[timing]/[adc]/[dsp] print block sent in one go?"
+// - yes, from the CPU's side: print_timing_and_adc_block() below is ~10
+// back-to-back Serial.printf() calls with no yield in between, so it's one
+// uninterrupted burst of loop()-context code every ~1s. Whether that maps
+// to one blocking USB-CDC transaction depends on driver/buffer internals
+// we can't see from here (and if Serial.printf's underlying write ever
+// takes a portENTER_CRITICAL-style path while the buffer's full, that
+// would mask interrupts up to gptimer's own intr_priority=3 level for
+// however long it blocks - structurally the same contention mechanism the
+// ADC ISR fix addressed, just via USB/Serial instead of the ADC driver).
+// s_core1_busy_diag_us (below) already sums this block's cost, but only
+// as a percentage of a 1s window - an occasional multi-ms stall could be
+// hiding inside a small-looking average. This tracks the WORST single
+// call instead, to catch that directly. Same single-writer-from-Core-1
+// reasoning as the other diag statics - only ever touched from
+// diagnostics_service()'s own context (print, measure, and reset all run
+// on Core 1), no lock needed.
+static volatile uint32_t s_dbg_max_diag_block_us = 0;   // worst single print_timing_and_adc_block() call
+
+// CONFIRMED on real hardware: max_single_call_us came back at 5041 - a
+// 5ms+ stall, once/sec, on Core 1 (the same core gptimer's alarm ISR runs
+// on). That's ~80 sample periods' worth of time in one call - more than
+// enough on its own to explain the observed pin5 bad edges, whether the
+// mechanism is literal interrupt masking during a blocked USB-CDC write,
+// or something else in that path. Root cause of the block itself (why
+// Serial.printf() would stall that long) is presumably the host not
+// draining the USB-CDC endpoint promptly - plausibly WORSE while you're
+// actively typing (terminal app busy handling keystrokes/redraws instead
+// of servicing the port), which fits the "correlates with serial
+// activity" observation even though this specific block fires on a timer,
+// not on keypresses. Fix: never let a diagnostic print block for that
+// long - see diag_room_for() (just above print_status_line()) for the
+// per-line guard this settled on, after a first attempt (one upfront
+// check for the whole ~1.5KB block) turned out to be miscalibrated - real
+// hardware showed availableForWrite() never reporting anywhere near that
+// much free even at rest (avail=162 observed), so that version skipped
+// EVERY cycle rather than just genuinely backlogged ones.
+static volatile uint32_t s_dbg_diag_block_skip_count = 0;   // individual lines skipped by diag_room_for()
+
 // Phase breakdown of the same total: which part of dsp_task's work is
 // actually costing the most.
 static volatile uint32_t s_dbg_max_adc_us = 0;
@@ -209,6 +248,8 @@ void diagnostics_reset(void)
     s_dbg_max_write_us = 0;
     s_dbg_max_tick_gap_us = 0;
     s_dbg_late_tick_count = 0;
+    s_dbg_max_diag_block_us = 0;
+    s_dbg_diag_block_skip_count = 0;
     s_dbg_dsp_tick_count = 0;
     s_dsp_tick_start_us = esp_timer_get_time();
     s_last_samples_total = 0;
@@ -261,8 +302,41 @@ void diagnostics_init(void)
     }
 }
 
+// Real hardware measurement (max_single_call_us=5041, and separately
+// availableForWrite() reported avail=162 at what appears to be this
+// board's normal RESTING/drained state) showed the original all-or-
+// nothing "does the WHOLE ~1.5KB block fit right now" guard was wrong on
+// two counts: 2048 bytes turned out to be more than this board's USB-CDC
+// TX buffer ever reports free even when idle (so the guard tripped on
+// EVERY cycle, not just genuinely backlogged ones - the block "never
+// printing" was this threshold being unreachable, not the host actually
+// falling behind), and even a lower whole-block threshold couldn't
+// guarantee no blocking anyway: with a total capacity well under the
+// block's ~1.5KB, filling the buffer partway through a printf still has
+// to wait for the driver to drain more before the rest of that same call
+// can queue - a single upfront check can't protect against that.
+//
+// Fix: guard EVERY individual Serial.printf() call separately, each
+// against a conservative estimate of THAT line's own worst-case length -
+// never asking any single call to queue more than what's already free, so
+// none of them can block, regardless of how small the buffer actually is.
+// The cost is a patchier print (an individual line can go missing on a
+// tight cycle) rather than an all-or-nothing block - a straightforwardly
+// better trade once "guarantee we can't block" is the actual goal.
+static bool diag_room_for(uint32_t min_bytes)
+{
+    if ((uint32_t)Serial.availableForWrite() >= min_bytes) {
+        return true;
+    }
+    s_dbg_diag_block_skip_count++;
+    return false;
+}
+
 static void print_status_line(void)
 {
+    if (!diag_room_for(130)) {
+        return;
+    }
 #if AD9851_ATTACHED
     Serial.printf("envelope=,%.3f  ,freq_dev=,%.1f,Hz  dac_code=,%u  ,delayed=,%.1f,Hz  tx_freq=,%u,Hz\r\n",
                   s_dbg_envelope, s_dbg_freq_dev, envelope_output_get_last_dac_code(),
@@ -275,26 +349,50 @@ static void print_status_line(void)
 
 static void print_timing_and_adc_block(uint32_t now)
 {
+    // See diag_room_for()'s header comment above (just before
+    // print_status_line()) for why this is checked per-line rather than
+    // once for the whole block.
+
     // mode= goes through audio_source_name() - correctly identifies
     // ENVSTEP/FMTEST/AMTEST, not just TWOTONE/SINGLETONE/mic (see
     // dsp_state.cpp's audio_source_name()). gdeq= tells you whether the
     // group-delay equalizer was on during this measurement window.
-    Serial.printf("[timing] mode=%s gdeq=%s max_busy_us=%u (adc=%u dsp=%u write=%u) period_us=%u overruns=%u\r\n",
-                  audio_source_name(dsp_state_get_audio_source()),
-                  envelope_gdeq_get_enabled() ? "ON" : "off",
-                  s_dbg_max_busy_us, s_dbg_max_adc_us, s_dbg_max_dsp_us, s_dbg_max_write_us,
-                  k_sample_period_us, s_dbg_overrun_count);
-    Serial.printf("[timing]   wakeup jitter: max_gap_us=%u (nominal=%u) late_ticks_total=%u\r\n",
-                  s_dbg_max_tick_gap_us, k_sample_period_us, s_dbg_late_tick_count);
+    if (diag_room_for(160)) {
+        Serial.printf("[timing] mode=%s gdeq=%s max_busy_us=%u (adc=%u dsp=%u write=%u) period_us=%u overruns=%u\r\n",
+                      audio_source_name(dsp_state_get_audio_source()),
+                      envelope_gdeq_get_enabled() ? "ON" : "off",
+                      s_dbg_max_busy_us, s_dbg_max_adc_us, s_dbg_max_dsp_us, s_dbg_max_write_us,
+                      k_sample_period_us, s_dbg_overrun_count);
+    }
+    if (diag_room_for(100)) {
+        Serial.printf("[timing]   wakeup jitter: max_gap_us=%u (nominal=%u) late_ticks_total=%u\r\n",
+                      s_dbg_max_tick_gap_us, k_sample_period_us, s_dbg_late_tick_count);
+    }
+    // Worst single print_timing_and_adc_block() call since last reset -
+    // see s_dbg_max_diag_block_us's own comment (near its declaration)
+    // for the real hardware measurement (5041us) that motivated this
+    // whole per-line-guard rework, and diag_room_for()'s comment for why
+    // it's checked per-line now. Kept deliberately short here - this
+    // exact line used to carry a long explanation INLINE in the printf
+    // string itself, which meant transmitting ~220 extra bytes every
+    // single cycle - a real, self-inflicted contributor to the buffer
+    // pressure this whole rework exists to fix. The explanation belongs
+    // in comments (here and at the static's declaration), not on the wire.
+    if (diag_room_for(90)) {
+        Serial.printf("[core1]   diag print block: max_single_call_us=%u (worst since last reset)\r\n",
+                      s_dbg_max_diag_block_us);
+    }
 
     // Sub-phase breakdown of dsp_us itself, from ssb_dsp's internal
     // profiling - lets us see which part of the DSP call (audio_fx, the
     // Hilbert FIR, or atan2f/sqrtf) is actually costing time, rather than
     // guessing again.
-    ssb_dsp_profile_t prof;
-    ssb_dsp_get_profile(dsp_state_get_ssb(), &prof);
-    Serial.printf("[timing]   dsp breakdown: audio_fx=%u fir=%u atan2=%u sqrt=%u\r\n",
-                  prof.max_audio_fx_us, prof.max_fir_us, prof.max_atan2_us, prof.max_sqrt_us);
+    if (diag_room_for(90)) {
+        ssb_dsp_profile_t prof;
+        ssb_dsp_get_profile(dsp_state_get_ssb(), &prof);
+        Serial.printf("[timing]   dsp breakdown: audio_fx=%u fir=%u atan2=%u sqrt=%u\r\n",
+                      prof.max_audio_fx_us, prof.max_fir_us, prof.max_atan2_us, prof.max_sqrt_us);
+    }
 
 #if AD9851_ATTACHED
     // Splits the [timing] line's write_us (dominated by the AD9851 SPI
@@ -302,19 +400,21 @@ static void print_timing_and_adc_block(uint32_t now)
     // spi_device_polling_transmit() call itself - see ad9851_profile_t
     // (AD9851.h) and the bus-acquire-once change in ad9851_init() this
     // is meant to validate the effect of.
-    ad9851_profile_t ad_prof;
-    carrier_output_get_profile(&ad_prof);
-    Serial.printf("[timing]   ad9851 breakdown: prep_us=%u spi_us=%u (prep+spi=%u vs. write_us=%u "
-                  "above - gap is remaining driver/call overhead)\r\n",
-                  ad_prof.max_prep_us, ad_prof.max_spi_us,
-                  ad_prof.max_prep_us + ad_prof.max_spi_us, s_dbg_max_write_us);
+    if (diag_room_for(150)) {
+        ad9851_profile_t ad_prof;
+        carrier_output_get_profile(&ad_prof);
+        Serial.printf("[timing]   ad9851 breakdown: prep_us=%u spi_us=%u (prep+spi=%u vs. write_us=%u "
+                      "above - gap is remaining driver/call overhead)\r\n",
+                      ad_prof.max_prep_us, ad_prof.max_spi_us,
+                      ad_prof.max_prep_us + ad_prof.max_spi_us, s_dbg_max_write_us);
+    }
 #endif
 
     // Evidence for setting MAX_FREQ_DEV_HZ from real data instead of
     // guessing again - max_unclamped is the TRUE peak deviation the
     // signal actually reaches (before any clamping), clip_count is how
     // many samples the clamp has actually had to intervene on.
-    {
+    if (diag_room_for(110)) {
         ssb_dsp_freq_dev_stats_t fd_stats;
         ssb_dsp_get_freq_dev_stats(dsp_state_get_ssb(), &fd_stats);
         Serial.printf("[dsp]   freq_dev: max_unclamped=%.0fHz (limit=%.0fHz) clip_count=%u\r\n",
@@ -335,10 +435,12 @@ static void print_timing_and_adc_block(uint32_t now)
         uint32_t actual_sps   = (uint32_t)((uint64_t)(adc_diag.samples_total - s_last_samples_total) * 1000 / elapsed_ms);
         uint32_t expected_cbs = (uint32_t)((uint64_t)ADC_CONT_SAMPLE_FREQ_HZ * elapsed_ms
                                             / 1000 / ADC_CONT_FRAME_SAMPLES);
-        Serial.printf("[adc] actual=%u sps (expected=%u) callbacks=%u (expected~%u) pool_ovf_total=%u\r\n",
-                      actual_sps, ADC_CONT_SAMPLE_FREQ_HZ,
-                      adc_diag.callback_count - s_last_callback_count, expected_cbs,
-                      adc_diag.pool_ovf_count);
+        if (diag_room_for(110)) {
+            Serial.printf("[adc] actual=%u sps (expected=%u) callbacks=%u (expected~%u) pool_ovf_total=%u\r\n",
+                          actual_sps, ADC_CONT_SAMPLE_FREQ_HZ,
+                          adc_diag.callback_count - s_last_callback_count, expected_cbs,
+                          adc_diag.pool_ovf_count);
+        }
 
         // Core 1 headroom over this SAME ~1s window - see core1_idle_hook()'s
         // own comment. Snapshot-then-reset rather than a running total: a
@@ -349,20 +451,25 @@ static void print_timing_and_adc_block(uint32_t now)
         // reset without a lock - see the statics' own comment above for
         // why (idle priority can never preempt this loop()-context code).
         if (!s_core1_idle_hook_registered) {
-            Serial.printf("[core1] idle hook not registered - no measurement available\r\n");
+            if (diag_room_for(70)) {
+                Serial.printf("[core1] idle hook not registered - no measurement available\r\n");
+            }
         } else {
             double idle_pct = (double)s_core1_idle_us_accum * 100.0 / ((double)elapsed_ms * 1000.0);
             uint32_t hook_calls_per_sec = (uint32_t)((uint64_t)s_core1_idle_hook_calls * 1000 / elapsed_ms);
-            Serial.printf("[core1] idle(hook)=%.1f%% over %ums (Core-1 idle hook reading - kept as a "
-                          "cross-check, but see [core1] busy breakdown's delay=%% below for the trustworthy "
-                          "number: this hook-based figure reads suspiciously low because a genuinely "
-                          "blocked task's idle-hook calls land ~1 OS tick apart, not microseconds apart, "
-                          "so CORE1_IDLE_GAP_THRESHOLD_US=10 excludes nearly all of a real long idle "
-                          "block instead of counting it)\r\n",
-                          idle_pct, elapsed_ms);
-            Serial.printf("[core1]   idle hook calls/s=%u (threshold-free cross-check on idle(hook)%% "
-                          "above - see CORE1_IDLE_GAP_THRESHOLD_US's comment)\r\n",
-                          hook_calls_per_sec);
+            // Full rationale for why this hook-based figure reads low (and
+            // [core1] busy breakdown's delay=% below is the trustworthy
+            // number) lives in CORE1_IDLE_GAP_THRESHOLD_US's own comment
+            // now, not on the wire every second - same "don't transmit an
+            // essay every cycle" fix as the diag-block line above.
+            if (diag_room_for(90)) {
+                Serial.printf("[core1] idle(hook)=%.1f%% over %ums (cross-check only - see busy "
+                              "breakdown's delay%% below)\r\n",
+                              idle_pct, elapsed_ms);
+            }
+            if (diag_room_for(60)) {
+                Serial.printf("[core1]   idle hook calls/s=%u (cross-check)\r\n", hook_calls_per_sec);
+            }
             s_core1_idle_us_accum = 0;
             s_core1_idle_hook_calls = 0;
 
@@ -389,9 +496,11 @@ static void print_timing_and_adc_block(uint32_t now)
             double delay_pct   = (double)s_core1_busy_delay_us   * 100.0 / window_us;
             double other_pct   = 100.0 - cmd_pct - adc_svc_pct - diag_pct - delay_pct;
             if (other_pct < 0.0) other_pct = 0.0;   // clamp - rounding/overlap across independently-measured windows, not a real negative cost
-            Serial.printf("[core1]   busy breakdown: cmd=%.1f%% adc_svc=%.1f%% diag=%.1f%% delay=%.1f%% "
-                          "other(ADC ISR + USB CDC + ...)=%.1f%%\r\n",
-                          cmd_pct, adc_svc_pct, diag_pct, delay_pct, other_pct);
+            if (diag_room_for(140)) {
+                Serial.printf("[core1]   busy breakdown: cmd=%.1f%% adc_svc=%.1f%% diag=%.1f%% delay=%.1f%% "
+                              "other(ADC ISR + USB CDC + ...)=%.1f%%\r\n",
+                              cmd_pct, adc_svc_pct, diag_pct, delay_pct, other_pct);
+            }
             s_core1_busy_cmd_us = 0;
             s_core1_busy_adc_svc_us = 0;
             s_core1_busy_diag_us = 0;
@@ -407,9 +516,11 @@ static void print_timing_and_adc_block(uint32_t now)
             double long_avg_sps = (double)adc_diag.samples_total * 1000000.0 / (double)elapsed_since_start_us;
             double error_pct = (long_avg_sps - (double)ADC_CONT_SAMPLE_FREQ_HZ)
                                 * 100.0 / (double)ADC_CONT_SAMPLE_FREQ_HZ;
-            Serial.printf("[adc]   long-window avg=%.2f sps over %.1fs (%.3f%% vs nominal %uHz)\r\n",
-                          long_avg_sps, elapsed_since_start_us / 1000000.0,
-                          error_pct, ADC_CONT_SAMPLE_FREQ_HZ);
+            if (diag_room_for(110)) {
+                Serial.printf("[adc]   long-window avg=%.2f sps over %.1fs (%.3f%% vs nominal %uHz)\r\n",
+                              long_avg_sps, elapsed_since_start_us / 1000000.0,
+                              error_pct, ADC_CONT_SAMPLE_FREQ_HZ);
+            }
 
             // Same measurement for dsp_task's own tick rate (gptimer) -
             // only ever measured the ADC side precisely before. Chronic
@@ -428,19 +539,31 @@ static void print_timing_and_adc_block(uint32_t now)
                 // not either clock's error in isolation - is the real
                 // cause of sustained starvation or backlog.
                 double true_ratio = long_avg_sps / long_avg_tps;
-                Serial.printf("[dsp]   long-window avg=%.2f ticks/s (%.3f%% vs nominal %uHz) true_ratio=%.4f (nominal=%u)\r\n",
-                              long_avg_tps, tick_error_pct, SAMPLE_RATE_HZ,
-                              true_ratio, ADC_SAMPLES_PER_TICK);
+                if (diag_room_for(130)) {
+                    Serial.printf("[dsp]   long-window avg=%.2f ticks/s (%.3f%% vs nominal %uHz) true_ratio=%.4f (nominal=%u)\r\n",
+                                  long_avg_tps, tick_error_pct, SAMPLE_RATE_HZ,
+                                  true_ratio, ADC_SAMPLES_PER_TICK);
+                }
             }
         }
-        Serial.printf("[adc]   fifo: available now min=%u max=%u (want>=%u,<%u) starve_ticks_total=%u drop_total=%u\r\n",
-                      adc_diag.fifo_min_available, adc_diag.fifo_max_available,
-                      ADC_SAMPLES_PER_TICK, ADC_FIFO_SIZE,
-                      adc_diag.fifo_starve_count, adc_diag.fifo_drop_count);
+        if (diag_room_for(130)) {
+            Serial.printf("[adc]   fifo: available now min=%u max=%u (want>=%u,<%u) starve_ticks_total=%u drop_total=%u\r\n",
+                          adc_diag.fifo_min_available, adc_diag.fifo_max_available,
+                          ADC_SAMPLES_PER_TICK, ADC_FIFO_SIZE,
+                          adc_diag.fifo_starve_count, adc_diag.fifo_drop_count);
+        }
     }
     s_last_samples_total  = adc_diag.samples_total;
     s_last_callback_count = adc_diag.callback_count;
     s_last_rate_print_ms  = now;
+
+    // Visibility for the per-line guards above - deliberately last (least
+    // important to preserve) and itself guarded, so a tight cycle just
+    // drops this too rather than blocking to force it out.
+    if (diag_room_for(70)) {
+        Serial.printf("[diag]   skip_total=%u (lines dropped by the per-line TX-buffer guards above)\r\n",
+                      s_dbg_diag_block_skip_count);
+    }
 }
 
 void diagnostics_service(void)
@@ -455,6 +578,14 @@ void diagnostics_service(void)
     static uint32_t last_timing_print_ms = 0;
     if (!s_diag_muted && now - last_timing_print_ms >= 1000) {
         last_timing_print_ms = now;
+        // See s_dbg_max_diag_block_us's own comment - measuring this
+        // call's own wall-clock cost directly, not just relying on the
+        // existing summed diag_us bucket, to check whether a single
+        // occurrence of this print burst is ever long enough to matter.
+        int64_t t_diagblock0 = esp_timer_get_time();
         print_timing_and_adc_block(now);
+        int64_t t_diagblock1 = esp_timer_get_time();
+        uint32_t diagblock_us = (uint32_t)(t_diagblock1 - t_diagblock0);
+        if (diagblock_us > s_dbg_max_diag_block_us) s_dbg_max_diag_block_us = diagblock_us;
     }
 }
