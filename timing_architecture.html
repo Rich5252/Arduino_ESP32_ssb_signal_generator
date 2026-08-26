@@ -1,0 +1,464 @@
+<title>Dual-Core Exciter Timing</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+  :root{
+    --bg:#F3F5F7;
+    --surface:#FFFFFF;
+    --surface-2:#EAEEF1;
+    --border:#D3DBE1;
+    --border-strong:#B7C2CA;
+    --text:#16202A;
+    --text-muted:#5C6B78;
+    --core0:#B5722A;
+    --core0-soft:#F1E2CE;
+    --core1:#1D7C8C;
+    --core1-soft:#DCEEF1;
+    --signal:#C43F31;
+    --fix:#2F8F5B;
+    --fix-soft:#E3F2E9;
+    --shadow: 0 1px 2px rgba(22,32,42,0.06), 0 8px 24px rgba(22,32,42,0.06);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#10161C;
+      --surface:#171F27;
+      --surface-2:#1D2630;
+      --border:#2B3742;
+      --border-strong:#3B4A56;
+      --text:#E7EDF2;
+      --text-muted:#8FA1AF;
+      --core0:#E8A33D;
+      --core0-soft:#3A2E1A;
+      --core1:#4FC3D9;
+      --core1-soft:#183238;
+      --signal:#F2665A;
+      --fix:#6FCF97;
+      --fix-soft:#1B3327;
+      --shadow: 0 1px 2px rgba(0,0,0,0.35), 0 12px 32px rgba(0,0,0,0.35);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#10161C;
+    --surface:#171F27;
+    --surface-2:#1D2630;
+    --border:#2B3742;
+    --border-strong:#3B4A56;
+    --text:#E7EDF2;
+    --text-muted:#8FA1AF;
+    --core0:#E8A33D;
+    --core0-soft:#3A2E1A;
+    --core1:#4FC3D9;
+    --core1-soft:#183238;
+    --signal:#F2665A;
+    --fix:#6FCF97;
+    --fix-soft:#1B3327;
+    --shadow: 0 1px 2px rgba(0,0,0,0.35), 0 12px 32px rgba(0,0,0,0.35);
+  }
+
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:"IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .page{
+    max-width:1180px;
+    margin:0 auto;
+    padding:56px 28px 80px;
+  }
+  .eyebrow{
+    font-family:"IBM Plex Mono", ui-monospace, monospace;
+    font-size:12px;
+    letter-spacing:0.08em;
+    text-transform:uppercase;
+    color:var(--core1);
+    margin:0 0 10px;
+  }
+  h1{
+    font-size:clamp(28px,4vw,38px);
+    font-weight:700;
+    line-height:1.15;
+    letter-spacing:-0.01em;
+    margin:0 0 14px;
+    text-wrap:balance;
+  }
+  .intro{
+    max-width:66ch;
+    font-size:16px;
+    line-height:1.6;
+    color:var(--text-muted);
+    margin:0 0 40px;
+  }
+  .intro code{
+    font-family:"IBM Plex Mono", ui-monospace, monospace;
+    font-size:0.92em;
+    color:var(--text);
+    background:var(--surface-2);
+    padding:0.1em 0.4em;
+    border-radius:4px;
+  }
+
+  figure{
+    margin:0 0 48px;
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:14px;
+    box-shadow:var(--shadow);
+    padding:8px 8px 4px;
+  }
+  .diagram-scroll{ overflow-x:auto; }
+  svg{ display:block; width:100%; height:auto; min-width:900px; }
+  figcaption{
+    padding:14px 20px 18px;
+    font-size:13px;
+    line-height:1.55;
+    color:var(--text-muted);
+    border-top:1px solid var(--border);
+    margin-top:6px;
+  }
+  figcaption b{ color:var(--text); font-weight:600; }
+
+  section.rates{ margin-bottom:44px; }
+  h2{
+    font-size:13px;
+    font-weight:600;
+    letter-spacing:0.06em;
+    text-transform:uppercase;
+    color:var(--text-muted);
+    margin:0 0 16px;
+  }
+  .table-wrap{
+    overflow-x:auto;
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:14px;
+    box-shadow:var(--shadow);
+  }
+  table{
+    width:100%;
+    border-collapse:collapse;
+    font-size:14px;
+    min-width:640px;
+  }
+  thead th{
+    text-align:left;
+    font-family:"IBM Plex Mono", ui-monospace, monospace;
+    font-size:11px;
+    letter-spacing:0.05em;
+    text-transform:uppercase;
+    color:var(--text-muted);
+    font-weight:500;
+    padding:14px 20px;
+    border-bottom:1px solid var(--border-strong);
+  }
+  tbody td{
+    padding:13px 20px;
+    border-bottom:1px solid var(--border);
+    vertical-align:middle;
+  }
+  tbody tr:last-child td{ border-bottom:none; }
+  td.event{ font-weight:500; }
+  td.event .core-tag{
+    display:inline-block;
+    font-family:"IBM Plex Mono", ui-monospace, monospace;
+    font-size:10px;
+    font-weight:600;
+    letter-spacing:0.03em;
+    padding:2px 7px;
+    border-radius:5px;
+    margin-right:9px;
+    transform:translateY(-1px);
+  }
+  .tag-c0{ background:var(--core0-soft); color:var(--core0); }
+  .tag-c1{ background:var(--core1-soft); color:var(--core1); }
+  td.num{
+    font-family:"IBM Plex Mono", ui-monospace, monospace;
+    font-variant-numeric:tabular-nums;
+    text-align:right;
+    color:var(--text);
+  }
+  td.num.rate{ color:var(--text-muted); }
+  td.note{ color:var(--text-muted); font-size:13px; }
+
+  footer{
+    font-size:12.5px;
+    color:var(--text-muted);
+    border-top:1px solid var(--border);
+    padding-top:18px;
+    display:flex;
+    justify-content:space-between;
+    gap:16px;
+    flex-wrap:wrap;
+  }
+  footer .fix-key{ display:flex; gap:18px; flex-wrap:wrap; }
+  footer .fix-key span{ display:inline-flex; align-items:center; gap:6px; }
+  footer .dot{ width:8px; height:8px; border-radius:50%; display:inline-block; }
+  footer .dot.fix{ background:var(--fix); }
+  footer .dot.signal{ background:var(--signal); }
+
+  @media (prefers-reduced-motion: no-preference){
+    figure{ transition:box-shadow 0.2s ease; }
+  }
+</style>
+
+<div class="page">
+
+  <p class="eyebrow">ESP32-S3 &middot; Polar EER SSB Exciter &middot; Firmware Reference</p>
+  <h1>How the two cores divide real-time work</h1>
+  <p class="intro">
+    <code>gptimer</code> drives a 64&nbsp;kHz fast-tick interrupt on Core&nbsp;1 that wakes
+    <code>dsp_task</code> on Core&nbsp;0 for every sample. Only one wake in four does the real
+    DSP/RF work &mdash; that's the 16&nbsp;kHz sample rate, F<tspan>s</tspan>. Everything else on
+    Core&nbsp;1 (the ADC, <code>loop()</code>, serial, diagnostics) exists to stay out of that
+    interrupt's way.
+  </p>
+
+  <figure>
+    <div class="diagram-scroll">
+      <svg viewBox="0 0 1280 840" role="img" aria-label="Block diagram of the ESP32-S3 dual-core timing architecture: Core 0 runs dsp_task, woken at 64 kHz by Core 1's gptimer alarm ISR, doing full DSP/RF work on 1 of every 4 wakes (16 kHz, the sample rate Fs); Core 1 also runs the free-running 80 kHz ADC and the loop() housekeeping task, with two fixes marked — gptimer's raised interrupt priority, and a non-blocking guard on the diagnostics print path.">
+
+        <defs>
+          <marker id="arrow-muted" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--text-muted)"></path>
+          </marker>
+          <marker id="arrow-signal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--signal)"></path>
+          </marker>
+          <marker id="arrow-border" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--border-strong)"></path>
+          </marker>
+        </defs>
+
+        <!-- ============ column headers ============ -->
+        <text x="300" y="34" text-anchor="middle" font-size="15" font-weight="700" fill="var(--core0)">CORE 0</text>
+        <text x="300" y="52" text-anchor="middle" font-size="11.5" fill="var(--text-muted)">dsp_task &mdash; real-time DSP / RF</text>
+
+        <text x="960" y="34" text-anchor="middle" font-size="15" font-weight="700" fill="var(--core1)">CORE 1</text>
+        <text x="960" y="52" text-anchor="middle" font-size="11.5" fill="var(--text-muted)">hardware timer &middot; ADC ISR &middot; loop()</text>
+
+        <!-- ============ core boundary ============ -->
+        <line x1="630" y1="64" x2="630" y2="818" stroke="var(--border-strong)" stroke-width="1.5" stroke-dasharray="2 6"></line>
+        <text x="630" y="440" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" letter-spacing="0.08em" fill="var(--text-muted)" transform="rotate(-90 630 440)">CROSS-CORE BOUNDARY</text>
+
+        <!-- ============ CORE 0 : dsp_task ============ -->
+        <rect x="120" y="70" width="360" height="72" rx="10" fill="var(--surface-2)" stroke="var(--core0)" stroke-width="1.5"></rect>
+        <text x="300" y="97" text-anchor="middle" font-size="13.5" font-weight="600" fill="var(--text)">dsp_task</text>
+        <text x="300" y="113" text-anchor="middle" font-size="10.5" fill="var(--text-muted)">Core 0 &middot; priority configMAX_PRIORITIES&minus;2</text>
+        <text x="300" y="130" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--text-muted)">ulTaskNotifyTake(pdTRUE, portMAX_DELAY)</text>
+
+        <!-- branch stem -->
+        <line x1="300" y1="142" x2="300" y2="176" stroke="var(--border-strong)" stroke-width="1.5"></line>
+        <!-- to interp path -->
+        <path d="M300,176 H190 V196" fill="none" stroke="var(--border-strong)" stroke-width="1.5" marker-end="url(#arrow-border)"></path>
+        <!-- to full-tick path -->
+        <path d="M300,176 H445 V198" fill="none" stroke="var(--border-strong)" stroke-width="1.5" marker-end="url(#arrow-border)"></path>
+
+        <text x="300" y="190" text-anchor="middle" font-size="10.5" font-weight="500" fill="var(--text-muted)">every wake &middot; 64 kHz / 15.625 &micro;s</text>
+
+        <!-- interp box -->
+        <rect x="90" y="196" width="210" height="92" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"></rect>
+        <text x="195" y="219" text-anchor="middle" font-size="11.5" font-weight="600" fill="var(--text)">interp tick &mdash; 3 of 4 wakes</text>
+        <text x="195" y="238" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--text-muted)">envelope_interp_on_interp_tick()</text>
+        <text x="195" y="256" text-anchor="middle" font-size="10.5" fill="var(--text-muted)">continue &mdash; no ADC / DSP / write</text>
+        <text x="195" y="278" text-anchor="middle" font-size="10" fill="var(--text-muted)">next wake in 15.625 &micro;s</text>
+
+        <!-- full tick label -->
+        <text x="445" y="190" text-anchor="middle" font-size="11" font-weight="600" fill="var(--core0)">full tick &mdash; 1 of 4 wakes &rarr; Fs = 16 kHz / 62.5 &micro;s</text>
+
+        <!-- ADC read box -->
+        <rect x="330" y="200" width="230" height="52" rx="9" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"></rect>
+        <text x="345" y="222" font-size="11.5" font-weight="600" fill="var(--text)">ADC read</text>
+        <text x="545" y="222" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--text-muted)">~2&ndash;6 &micro;s</text>
+        <text x="345" y="240" font-size="10" fill="var(--text-muted)">from software ring FIFO (5 samples)</text>
+
+        <line x1="445" y1="252" x2="445" y2="270" stroke="var(--border-strong)" stroke-width="1.5" marker-end="url(#arrow-border)"></line>
+
+        <!-- DSP box -->
+        <rect x="330" y="270" width="230" height="66" rx="9" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"></rect>
+        <text x="345" y="292" font-size="11.5" font-weight="600" fill="var(--text)">DSP</text>
+        <text x="545" y="292" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--text-muted)">~2&ndash;22 &micro;s</text>
+        <text x="345" y="309" font-size="10" fill="var(--text-muted)">audio_fx + Hilbert FIR</text>
+        <text x="345" y="323" font-size="10" fill="var(--text-muted)">+ atan2f / sqrtf</text>
+
+        <line x1="445" y1="336" x2="445" y2="354" stroke="var(--border-strong)" stroke-width="1.5" marker-end="url(#arrow-border)"></line>
+
+        <!-- Write box -->
+        <rect x="330" y="354" width="230" height="60" rx="9" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"></rect>
+        <text x="345" y="376" font-size="11.5" font-weight="600" fill="var(--text)">write outputs</text>
+        <text x="545" y="376" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--text-muted)">~24&ndash;29 &micro;s</text>
+        <text x="345" y="394" font-size="10" fill="var(--text-muted)">AD9851 SPI (dominant) + PWM / DAC</text>
+        <text x="345" y="407" font-size="10" fill="var(--text-muted)">envelope</text>
+
+        <!-- pin4 bracket -->
+        <path d="M575,200 h8 v214 h-8" fill="none" stroke="var(--core0)" stroke-width="1.25"></path>
+        <text x="592" y="310" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--core0)" transform="rotate(90 592 310)" text-anchor="middle">&#9670; pin4 &mdash; busy window (task ctx)</text>
+
+        <!-- busy budget note -->
+        <text x="330" y="435" font-size="10.5" fill="var(--text-muted)">busy_us total &le; 62.5 &micro;s budget</text>
+        <text x="330" y="450" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--text)">measured 26&ndash;49 &micro;s across modes</text>
+
+        <!-- relationship note box -->
+        <rect x="120" y="500" width="360" height="72" rx="10" fill="var(--surface-2)" stroke="var(--border)" stroke-width="1"></rect>
+        <text x="140" y="524" font-size="10.5" fill="var(--text-muted)">the fixed relationship behind both rates:</text>
+        <text x="140" y="546" font-family="IBM Plex Mono, monospace" font-size="12" font-weight="600" fill="var(--text)">4 fast ticks &times; 15.625 &micro;s = 62.5 &micro;s = 1 / Fs</text>
+        <text x="140" y="562" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--text-muted)">ENVELOPE_INTERP_FACTOR = 4 &middot; SAMPLE_RATE_HZ = 16000</text>
+
+        <!-- ============ CORE 1 : gptimer lane ============ -->
+        <rect x="760" y="70" width="220" height="52" rx="9" fill="var(--surface-2)" stroke="var(--core1)" stroke-width="1.25"></rect>
+        <text x="775" y="92" font-size="11.5" font-weight="600" fill="var(--text)">gptimer hardware</text>
+        <text x="775" y="109" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--text-muted)">auto-reload &middot; 64 kHz (15.625 &micro;s)</text>
+
+        <line x1="870" y1="122" x2="870" y2="142" stroke="var(--border-strong)" stroke-width="1.5" marker-end="url(#arrow-border)"></line>
+
+        <rect x="740" y="142" width="260" height="66" rx="10" fill="var(--surface)" stroke="var(--core1)" stroke-width="1.5"></rect>
+        <text x="758" y="165" font-family="IBM Plex Mono, monospace" font-size="12" font-weight="600" fill="var(--text)">on_timer_alarm()</text>
+        <text x="758" y="182" font-size="10.5" fill="var(--text-muted)">Core 1 ISR &middot; intr_priority = 3</text>
+        <text x="758" y="198" font-size="10" fill="var(--text-muted)">GPIO.out_w1tc / w1ts &middot; IRAM_ATTR</text>
+
+        <!-- fix badge: intr_priority -->
+        <rect x="1020" y="140" width="220" height="60" rx="10" fill="var(--fix-soft)" stroke="var(--fix)" stroke-width="1.25"></rect>
+        <text x="1130" y="160" text-anchor="middle" font-size="11" font-weight="700" fill="var(--fix)">FIX &#10003; preempts ADC ISR</text>
+        <text x="1130" y="177" text-anchor="middle" font-size="10" fill="var(--fix)">confirmed on scope:</text>
+        <text x="1130" y="191" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600" fill="var(--fix)">~19 &micro;s stretches &rarr; &plusmn;0.5 &micro;s</text>
+
+        <text x="758" y="225" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--core1)">&#9670; pin5 &mdash; entry&rarr;notify pulse, 1&ndash;6 &micro;s low</text>
+
+        <!-- ============ crosscore notify arrow (the hop) ============ -->
+        <path d="M740,178 H650 Q630,178 615,158 L490,108" fill="none" stroke="var(--signal)" stroke-width="3" marker-end="url(#arrow-signal)"></path>
+        <rect x="500" y="128" width="220" height="42" rx="8" fill="var(--surface)" stroke="var(--signal)" stroke-width="1.25"></rect>
+        <text x="610" y="145" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" font-weight="600" fill="var(--signal)">vTaskNotifyGiveFromISR()</text>
+        <text x="610" y="160" text-anchor="middle" font-size="10" fill="var(--signal)">crosscore notify &middot; 64 kHz</text>
+
+        <!-- ============ CORE 1 : ADC lane ============ -->
+        <rect x="760" y="250" width="220" height="52" rx="9" fill="var(--surface-2)" stroke="var(--core1)" stroke-width="1.25"></rect>
+        <text x="775" y="272" font-size="11.5" font-weight="600" fill="var(--text)">adc_continuous driver</text>
+        <text x="775" y="289" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--text-muted)">free-running &middot; 80 kHz (12.5 &micro;s/conv)</text>
+
+        <line x1="870" y1="302" x2="870" y2="322" stroke="var(--border-strong)" stroke-width="1.5" marker-end="url(#arrow-border)"></line>
+
+        <rect x="740" y="322" width="260" height="60" rx="10" fill="var(--surface)" stroke="var(--core1)" stroke-width="1.5"></rect>
+        <text x="758" y="345" font-family="IBM Plex Mono, monospace" font-size="12" font-weight="600" fill="var(--text)">adc_conv_done_cb()</text>
+        <text x="758" y="362" font-size="10.5" fill="var(--text-muted)">Core 1 ISR &middot; 5 kHz</text>
+        <text x="758" y="376" font-size="10" fill="var(--text-muted)">16-sample frame &middot; 200 &micro;s</text>
+
+        <text x="758" y="400" font-size="10" font-style="italic" fill="var(--text-muted)">pin13 (ADC-ISR pulse): disabled &mdash; see loop() lane below</text>
+
+        <!-- dashed FIFO arrow into ADC read box -->
+        <path d="M740,352 H660 Q640,352 630,335 L560,235" fill="none" stroke="var(--text-muted)" stroke-width="1.5" stroke-dasharray="4 4" marker-end="url(#arrow-muted)"></path>
+        <text x="605" y="270" text-anchor="middle" font-size="9.5" fill="var(--text-muted)">ADC FIFO</text>
+        <text x="605" y="282" text-anchor="middle" font-size="9.5" fill="var(--text-muted)">(ring buffer)</text>
+
+        <!-- ============ CORE 1 : loop() lane ============ -->
+        <text x="960" y="440" text-anchor="middle" font-size="12.5" font-weight="600" fill="var(--text)">loop() &mdash; Arduino main task, Core 1</text>
+        <text x="960" y="456" text-anchor="middle" font-size="10.5" fill="var(--text-muted)">~10 ms cycle &middot; delay(10)-dominated</text>
+
+        <rect x="740" y="470" width="440" height="280" rx="12" fill="var(--surface)" stroke="var(--border-strong)" stroke-width="1.5"></rect>
+        <line x1="740" y1="540" x2="1180" y2="540" stroke="var(--border)" stroke-width="1"></line>
+        <line x1="740" y1="610" x2="1180" y2="610" stroke="var(--border)" stroke-width="1"></line>
+        <line x1="740" y1="680" x2="1180" y2="680" stroke="var(--border)" stroke-width="1"></line>
+
+        <text x="760" y="510" font-family="IBM Plex Mono, monospace" font-size="12" fill="var(--text)">1&nbsp;&nbsp;handle_serial_commands()</text>
+        <text x="1160" y="510" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="10.5" font-weight="600" fill="var(--core1)">&#9670; pin13</text>
+
+        <text x="760" y="580" font-family="IBM Plex Mono, monospace" font-size="12" fill="var(--text)">2&nbsp;&nbsp;adc_capture_service()</text>
+        <text x="760" y="597" font-size="10" fill="var(--text-muted)">drains adc_continuous's internal pool</text>
+
+        <text x="760" y="650" font-family="IBM Plex Mono, monospace" font-size="12" fill="var(--text)">3&nbsp;&nbsp;diagnostics_service()</text>
+        <text x="760" y="667" font-size="10" fill="var(--text-muted)">status line 45 ms &middot; full block ~1000 ms</text>
+
+        <text x="760" y="720" font-family="IBM Plex Mono, monospace" font-size="12" fill="var(--text)">4&nbsp;&nbsp;delay(10)</text>
+        <text x="760" y="737" font-size="10" fill="var(--text-muted)">~98% of Core-1 idle time lands here</text>
+
+        <!-- loop-back arrow -->
+        <path d="M1195,715 Q1225,715 1225,610 Q1225,495 1195,495" fill="none" stroke="var(--border-strong)" stroke-width="1.5" marker-end="url(#arrow-border)"></path>
+        <text x="1234" y="608" font-size="10" fill="var(--text-muted)" transform="rotate(90 1234 608)" text-anchor="middle">repeat ~every 10 ms</text>
+
+        <!-- fix badge: diagnostics guard -->
+        <rect x="740" y="768" width="440" height="52" rx="10" fill="var(--fix-soft)" stroke="var(--fix)" stroke-width="1.25"></rect>
+        <text x="760" y="789" font-size="11" font-weight="700" fill="var(--fix)">FIX &#10003; per-line TX-buffer guard on diagnostics_service()</text>
+        <text x="760" y="806" font-size="10" fill="var(--fix)">killed a confirmed 5 ms Core-1 stall that was disrupting gptimer's own ISR timing</text>
+
+      </svg>
+    </div>
+    <figcaption>
+      <b>Every gray arrow is FreeRTOS/driver plumbing; the one in <span style="color:var(--signal)">coral</span> is the single hop that actually crosses cores</b> &mdash;
+      <code>vTaskNotifyGiveFromISR()</code>, fired from Core 1's gptimer ISR 64,000 times a second to wake <code>dsp_task</code> on Core 0.
+      Everything else Core 1 does (ADC, serial, diagnostics) exists to avoid delaying that one interrupt. The two
+      <span style="color:var(--fix)">green</span> badges mark the fixes confirmed on real hardware this session.
+    </figcaption>
+  </figure>
+
+  <section class="rates">
+    <h2>Key rates &amp; periods</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Signal / event</th>
+            <th style="text-align:right;">Rate</th>
+            <th style="text-align:right;">Period</th>
+            <th>Note</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="event"><span class="core-tag tag-c1">C1&rarr;C0</span>gptimer fast tick</td>
+            <td class="num">64&nbsp;kHz</td>
+            <td class="num">15.625&nbsp;&micro;s</td>
+            <td class="note">wakes dsp_task every firing; only 1 of 4 does full work</td>
+          </tr>
+          <tr>
+            <td class="event"><span class="core-tag tag-c0">C0</span>DSP full tick (F<span style="font-size:0.8em;">s</span>)</td>
+            <td class="num">16&nbsp;kHz</td>
+            <td class="num">62.5&nbsp;&micro;s</td>
+            <td class="note">SAMPLE_RATE_HZ &mdash; the real sample rate of the signal chain</td>
+          </tr>
+          <tr>
+            <td class="event"><span class="core-tag tag-c1">C1</span>ADC conversion</td>
+            <td class="num">80&nbsp;kHz</td>
+            <td class="num">12.5&nbsp;&micro;s</td>
+            <td class="note">free-running always, regardless of audio source mode</td>
+          </tr>
+          <tr>
+            <td class="event"><span class="core-tag tag-c1">C1</span>ADC callback (conv_done)</td>
+            <td class="num">5&nbsp;kHz</td>
+            <td class="num">200&nbsp;&micro;s</td>
+            <td class="note">16-sample frames &middot; ADC_CONT_FRAME_SAMPLES</td>
+          </tr>
+          <tr>
+            <td class="event"><span class="core-tag tag-c1">C1</span>loop() cycle</td>
+            <td class="num rate">~100&nbsp;Hz</td>
+            <td class="num">~10&nbsp;ms</td>
+            <td class="note">delay(10)-dominated &mdash; ~98% of the cycle</td>
+          </tr>
+          <tr>
+            <td class="event"><span class="core-tag tag-c1">C1</span>diagnostics status line</td>
+            <td class="num rate">~22&nbsp;Hz</td>
+            <td class="num">45&nbsp;ms</td>
+            <td class="note">envelope / freq_dev / dac_code, one line</td>
+          </tr>
+          <tr>
+            <td class="event"><span class="core-tag tag-c1">C1</span>diagnostics full block</td>
+            <td class="num rate">~1&nbsp;Hz</td>
+            <td class="num">~1000&nbsp;ms</td>
+            <td class="note">[timing]/[adc]/[dsp]/[core1] &mdash; now per-line TX-guarded</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    <span>ESP32-S3 &middot; ssb_mic_test firmware &middot; timing checkpoint as of this session</span>
+    <span class="fix-key">
+      <span><i class="dot signal"></i>cross-core hop</span>
+      <span><i class="dot fix"></i>confirmed fix</span>
+    </span>
+  </footer>
+
+</div>
