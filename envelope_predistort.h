@@ -98,7 +98,7 @@
  * straight segment; a few bins through the turn-on-to-plateau transition
  * (roughly 22-44% envelope) showed 6-10 counts.
  *
- * REVISION 4 (current): built from the 'd'/'>'/'<'/'N'/'B' direct duty
+ * REVISION 4 (superseded): built from the 'd'/'>'/'<'/'N'/'B' direct duty
  * override commands (envelope_output.h), sweeping every single raw LEDC
  * duty count 1-1023 one at a time and reading dBm directly at each -
  * 1023 exact points, denser even than REVISION 3's 363, and for the
@@ -150,7 +150,65 @@
  * and comparing LUT[0] against one particular dense-data duty in that
  * range isn't a real resolution shortfall.
  *
- * PCHIP specifically (not a plain cubic spline), all three revisions, to
+ * REVISION 5 (current): same methodology and same exhaustive duty=1..1023
+ * direct sweep as REVISION 4 (dBm -> linear amplitude via 10^(dBm/20),
+ * isotonic-regression/PAVA smoothing to enforce monotonicity while
+ * removing single-count measurement noise, normalize to [0,1], PCHIP
+ * inversion sampled at 65 even envelope points), but measured against the
+ * REBUILT RSET/PWM filter hardware - the fixed-bias PNP first stage that
+ * replaced the original design after the low-output bias-starvation
+ * finding (see project history: the original transistor lost bias current
+ * at low duty, collapsing the filter's own 78.125kHz notch depth exactly
+ * when the fixed-amplitude PWM ripple mattered most relative to signal).
+ * This table doesn't touch that notch/carrier-rejection question at all -
+ * it's a baseband, DC-to-low-kHz static AM curve exactly like REVISIONS
+ * 1-4 - but it's the first real-hardware evidence of whether the redesign
+ * changed the envelope path's overall shape, and it did, substantially, at
+ * both ends:
+ *
+ * Bottom end - dead zone shrank by roughly 20x: the isotonic-pooled floor
+ * block (electrically-indistinguishable output, same degeneracy as
+ * REVISION 4's dead zone) now runs only duty 1-9, not REVISION 4's
+ * duty~200-226. Turn-on is correspondingly much earlier - measurable
+ * output growth is already visible by duty~20-30 in the raw sweep. This
+ * is a direct, positive confirmation that giving the first transistor its
+ * own fixed bias (rather than one that collapsed at low PWM drive) fixed
+ * the thing it was meant to fix: LUT[0] is still duty=1 by the same
+ * "lowest duty in the tied floor block" convention as REVISION 4, but the
+ * floor block itself is now a sliver of what it was.
+ *
+ * Top end - the new weak spot, and it's a bigger one than anything
+ * REVISION 4 flagged: roughly the last third of the ENTIRE duty range
+ * (duty ~653 through 1023, ~370 of 1023 counts) reads within about 0.3dB
+ * of the measured maximum (-40.22dBm at duty 600 vs. -39.89dBm at
+ * duty 1023). Against a ~53dB total floor-to-ceiling span, that 0.3dB
+ * sliver is a tiny fraction of the table's normalized envelope axis, so
+ * PCHIP inversion at even 65-point spacing collapses essentially all of
+ * it into the table's SINGLE LAST BIN: LUT[63]=0.6387 (duty~653) to
+ * LUT[64]=1.0000 (duty=1023) spans 370 duty counts in one linear segment.
+ * REVISION 4's own top-plateau error was documented as "up to ~12 counts"
+ * across its whole 95-100% region - this is over an order of magnitude
+ * more compression, concentrated in one bin, on the new hardware. A
+ * commanded envelope anywhere in [0.984, 1.0) will interpolate LINEARLY
+ * across that 370-count span, which will under-drive duty (and therefore
+ * under-shoot the intended RF amplitude) through most of that bin, since
+ * the true curve is flat-then-a-late-knee, not a straight line. Whether
+ * this matters in practice depends on how close to envelope=1.0 real
+ * operation actually commands (master gain headroom may keep typical
+ * drive well clear of it) - flagged here rather than silently absorbed,
+ * same as REVISION 4's own known limitations were. If it turns out to
+ * matter on real hardware, the fix is more resolution specifically in
+ * that last bin (a non-uniform envelope grid, or simply more than 65
+ * points), not a different fitting method - the underlying data and
+ * derivation are otherwise sound.
+ *
+ * NOT YET VALIDATED on real hardware beyond the measurement itself, same
+ * status every revision has carried at introduction - see REVISION 4's
+ * own not-yet-validated note below, which now applies doubly here since
+ * the duty axis has moved again, more this time at the top than the
+ * bottom.
+ *
+ * PCHIP specifically (not a plain cubic spline), all revisions, to
  * avoid overshoot/ringing through the steep BS170 turn-on region, which
  * would break the monotonicity a pre-distortion table depends on to be
  * invertible at all.
@@ -203,6 +261,12 @@
  * more here than it did for REVISION 3's more modest refinement. Off by
  * default so existing tuning isn't disturbed until deliberately opted
  * into, same convention as envelope_gdeq.h's 'g'.
+ *
+ * REVISION 5 NOT YET VALIDATED ON REAL HARDWARE beyond the measurement
+ * itself either - see REVISION 5's own notes above, in particular the
+ * last-bin top-end compression, which is the thing most worth watching
+ * for on a real two-tone/IMD re-check before trusting this table anywhere
+ * near full envelope drive. Still off by default, same convention.
  */
 
 #include <stdbool.h>

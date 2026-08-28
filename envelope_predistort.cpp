@@ -5,31 +5,30 @@
 #include "envelope_predistort.h"
 
 // Desired linear envelope [0,1] -> commanded PWM duty [0,1], 65 points
-// (64 equal bins). REVISION 4 - see envelope_predistort.h for the full
-// derivation. Built directly from the 'd'/'>'/'<'/'N'/'B' direct duty
-// override commands (envelope_output.h) sweeping every single raw LEDC
-// count 1-1023 against a measured dBm reading - no gate-voltage inference
-// anywhere in this table, unlike REVISIONS 1-3. LUT[0] is 0.001 (duty=1,
-// essentially fully off) - REVISION 4's exhaustive sweep found the whole
-// path reads as noise floor from duty=1 clear through duty~200-226, so
-// "envelope=0" is mapped to the LOWEST duty in that dead range rather
-// than holding the gate open any further than necessary (REVISIONS 1-3
-// assumed the dead zone ran to duty~0.30-0.32 instead - see
-// envelope_predistort.h's REVISION 4 notes for why that turned out to be
-// wrong by a wide margin, not just at this floor point but through most
-// of the table). LUT[64] is a clean 1.0 - this sweep's own top point
-// (duty=1023, literal 100%) IS the measured maximum, so unlike REVISIONS
-// 2-3 there's no inference needed to find where output actually finishes
-// saturating.
+// (64 equal bins). REVISION 5 - see envelope_predistort.h for the full
+// derivation and how this compares to REVISION 4. Built the same way as
+// REVISION 4 (direct duty sweep 1-1023 via 'd'/'>'/'<'/'N'/'B', dBm read
+// at every count, isotonic-regression-smoothed then PCHIP-inverted) but
+// against the REBUILT RSET/PWM filter hardware (fixed-bias PNP stage,
+// see project history) rather than the original filter REVISION 4
+// characterized. LUT[0]=0.0010 (duty=1) same convention as REVISION 4 -
+// lowest duty in the pooled floor block, which this time is only
+// duty 1-9 (vs REVISION 4's duty~200-226) - the bias-starvation fix
+// visibly shrank the dead zone by roughly 20x. LUT[64]=1.0000 (duty=1023,
+// the measured maximum) also matches REVISION 4's convention. The new
+// filter's OWN weak spot is the opposite end: roughly the last third of
+// the whole duty range (duty ~653-1023) reads within 0.3dB of full
+// saturation, which collapses into this table's single last bin far more
+// severely than REVISION 4's top-plateau ever did - see envelope_predistort.h.
 static const float ENV_PREDISTORT_LUT[65] = {
-    0.0010f, 0.2998f, 0.3267f, 0.3442f, 0.3606f, 0.3727f, 0.3848f, 0.3955f,
-    0.4088f, 0.4187f, 0.4273f, 0.4372f, 0.4463f, 0.4540f, 0.4639f, 0.4777f,
-    0.4868f, 0.4949f, 0.5038f, 0.5103f, 0.5189f, 0.5277f, 0.5361f, 0.5438f,
-    0.5522f, 0.5606f, 0.5664f, 0.5758f, 0.5841f, 0.5923f, 0.6005f, 0.6087f,
-    0.6169f, 0.6250f, 0.6332f, 0.6413f, 0.6494f, 0.6575f, 0.6656f, 0.6738f,
-    0.6819f, 0.6901f, 0.6983f, 0.7065f, 0.7148f, 0.7230f, 0.7313f, 0.7395f,
-    0.7479f, 0.7563f, 0.7648f, 0.7734f, 0.7820f, 0.7907f, 0.7997f, 0.8089f,
-    0.8182f, 0.8281f, 0.8382f, 0.8494f, 0.8617f, 0.8765f, 0.8956f, 0.9264f,
+    0.0010f, 0.0652f, 0.0863f, 0.1008f, 0.1146f, 0.1245f, 0.1353f, 0.1448f,
+    0.1533f, 0.1636f, 0.1723f, 0.1801f, 0.1884f, 0.1934f, 0.2044f, 0.2117f,
+    0.2195f, 0.2308f, 0.2378f, 0.2454f, 0.2531f, 0.2586f, 0.2660f, 0.2705f,
+    0.2812f, 0.2886f, 0.2922f, 0.3024f, 0.3097f, 0.3133f, 0.3230f, 0.3302f,
+    0.3443f, 0.3518f, 0.3587f, 0.3662f, 0.3735f, 0.3812f, 0.3887f, 0.3962f,
+    0.4036f, 0.4061f, 0.4139f, 0.4214f, 0.4288f, 0.4363f, 0.4443f, 0.4516f,
+    0.4590f, 0.4666f, 0.4741f, 0.4812f, 0.4885f, 0.4964f, 0.5046f, 0.5128f,
+    0.5215f, 0.5307f, 0.5323f, 0.5476f, 0.5599f, 0.5747f, 0.5967f, 0.6387f,
     1.0000f,
 };
 #define ENV_PREDISTORT_LUT_LAST_IDX 64   // ENV_PREDISTORT_LUT's last valid index
