@@ -150,7 +150,7 @@
  * and comparing LUT[0] against one particular dense-data duty in that
  * range isn't a real resolution shortfall.
  *
- * REVISION 5 (current): same methodology and same exhaustive duty=1..1023
+ * REVISION 5 (superseded): same methodology and same exhaustive duty=1..1023
  * direct sweep as REVISION 4 (dBm -> linear amplitude via 10^(dBm/20),
  * isotonic-regression/PAVA smoothing to enforce monotonicity while
  * removing single-count measurement noise, normalize to [0,1], PCHIP
@@ -207,6 +207,101 @@
  * own not-yet-validated note below, which now applies doubly here since
  * the duty axis has moved again, more this time at the top than the
  * bottom.
+ *
+ * REVISION 6 (current): same exhaustive duty=1..1023 direct-sweep
+ * methodology as REVISIONS 4-5 (dBm -> linear amplitude via 10^(dBm/20),
+ * isotonic-regression/PAVA smoothing to enforce monotonicity while
+ * removing single-count measurement noise, normalize to [0,1], PCHIP
+ * inversion sampled at 65 even envelope points). This sweep included
+ * three repeated readings at duty=1023 (-28.796722, -28.794726,
+ * -28.794479 dBm - all within 0.002dB of each other, the tightest
+ * same-count repeatability check yet taken on this table); their mean
+ * (-28.795309dBm) is what's stored as the single duty=1023 point so the
+ * sweep keeps the one-row-per-duty shape the rest of this pipeline
+ * expects.
+ *
+ * Both ends of the curve moved again versus REVISION 5, this time from
+ * two DIFFERENT, both now-confirmed causes stacked together - unlike
+ * REVISION 4->5's single mechanism (the PNP bias-current fix), this
+ * revision's shift is a measurement-chain change plus a real hardware
+ * change, and untangling which effect explains which part of the curve
+ * matters for reading this table correctly:
+ *
+ * (1) RX attenuation was reduced 10dB for this sweep (30dB pad vs.
+ * REVISION 5's 40dB pad, for better low-end sensitivity). This alone
+ * predicts every reading should read ~10dB higher. It lines up almost
+ * exactly at the top: ceiling (duty=1023) is -28.80dBm here vs.
+ * REVISION 5's -39.89dBm, an 11.1dB rise. But the isotonic floor
+ * (duty=1, pooled) only rose 5.6dB (-87.24dBm vs. -92.86dBm) - proof the
+ * attenuation change alone doesn't explain the whole curve, since a
+ * uniform pad change would shift every point by the same amount.
+ *
+ * (2) The RSET/PWM DC path's gate-drive range was deliberately widened:
+ * the MOSFET gate now sees 0.94V at duty=0 up to 3.38V at duty=1023,
+ * engineered specifically to NOT compromise the BJT's fixed bias or the
+ * filter's group-delay stability across that wider range (the two things
+ * REVISION 4->5's redesign was protecting). This is a real gain-per-duty-
+ * count reduction - the "scale down PWM/RSET gain to use more of the
+ * 1024-count range" idea from project history, now actually built.
+ *
+ * Separating the two: correcting every REVISION 6 reading by the 11.1dB
+ * ceiling-anchored offset (both curves are genuinely flat/saturated
+ * there, so it's a valid calibration point) and comparing duty-for-duty
+ * against REVISION 5 isolates cause (2) on its own. The residual is large
+ * and duty-dependent, which a pad change cannot produce: at duty=100,
+ * REVISION 6's attenuation-corrected output is ~27.9dB BELOW REVISION 5's
+ * output at the same duty; at duty=300 the gap is ~10.0dB; by duty=900
+ * it's under 0.2dB; by duty=1023 it's zero by construction. That
+ * converging-to-zero-at-full-duty shape is exactly what a reduced gate-
+ * drive gain looks like: same eventual ceiling, much more duty needed to
+ * get partway there. This is direct, real-hardware confirmation that the
+ * DC-path redesign is doing what it was meant to do, not a normalization
+ * artifact of the attenuation change.
+ *
+ * Bottom end - the strictly-pooled dead zone (isotonic-tied to the exact
+ * floor value) is now just duty=1 alone, down from REVISION 5's duty
+ * 1-9. That's mostly a pooling-boundary artifact, not a turn-on
+ * improvement: per the attenuation-corrected comparison above, this
+ * revision's real output at low duty is substantially BELOW REVISION 5's
+ * at the same duty (cause (2)'s gain reduction, working as intended), so
+ * almost nothing pools to an exact tie even though very little happens
+ * for a long stretch afterward. Normalized amplitude reaches 1% of its
+ * full swing at duty=166 here vs. duty=56 in REVISION 5 - a real,
+ * hardware-driven lengthening of the practical dead zone, not a
+ * normalization artifact of the wider floor-to-ceiling span. LUT[0]=0.0010
+ * (duty=1) by the same convention as every prior revision; LUT[1] alone
+ * (envelope=1/64) already commands duty=181, vs. REVISION 5's duty=67.
+ *
+ * Top end - REVISION 6 is genuinely, not just apparently, better resolved
+ * than REVISION 5 here, confirmed by the attenuation-corrected comparison
+ * above converging to near-zero well before duty=1023: the near-
+ * saturation compression that ate REVISION 5's entire last bin is much
+ * smaller. Only duty 870-1023 (154 of 1023 counts, ~15% of the range)
+ * sits within 0.3dB of the measured maximum, versus REVISION 5's duty
+ * 653-1023 (370 counts, ~36%) - well under half as much duty range wasted
+ * on electrically-indistinguishable near-ceiling output. LUT[63]=0.8957
+ * (duty~916) to LUT[64]=1.0000 (duty=1023) spans 107 duty counts in the
+ * table's final linear segment, versus REVISION 5's 370-count final
+ * segment - over 3x tighter. By the "active duty range" measure used in
+ * the REVISION 4/5 comparison (from the end of the pooled floor to
+ * LUT[63]'s duty), this table uses duty 2->916 (914 of 1023 counts,
+ * ~89%) productively, versus REVISION 5's duty 9->653 (644 counts,
+ * ~63%) - this table's 65-point piecewise-linear grid is doing
+ * meaningfully less approximating-by-straight-line than REVISION 5's
+ * did, and this time it's confirmed to be because the DC-path redesign
+ * genuinely spread the real transfer function across more of the duty
+ * range, not an artifact of normalizing over a wider dB span.
+ *
+ * NOT YET VALIDATED on real hardware beyond the measurement itself, same
+ * status every revision has carried at introduction - but this time both
+ * causes behind the curve's movement are identified and understood
+ * (unlike this note's earlier draft, written before the RX-attenuation
+ * and DC-path changes above were confirmed). A two-tone/IMD re-check
+ * still matters, for the same reason it mattered at REVISION 4->5: a
+ * gate-drive range this different changes where BS170 turn-on and any
+ * bias-adjacent nonlinearity actually sit in duty terms, and that's
+ * exactly the kind of shift a static AM table can't tell you about on
+ * its own. Still off by default, same convention.
  *
  * PCHIP specifically (not a plain cubic spline), all revisions, to
  * avoid overshoot/ringing through the steep BS170 turn-on region, which
@@ -267,6 +362,18 @@
  * last-bin top-end compression, which is the thing most worth watching
  * for on a real two-tone/IMD re-check before trusting this table anywhere
  * near full envelope drive. Still off by default, same convention.
+ *
+ * REVISION 6 NOT YET VALIDATED ON REAL HARDWARE beyond the measurement
+ * itself either - see REVISION 6's own notes above. This revision's
+ * shift versus REVISION 5 turned out to be two stacked, now-confirmed
+ * causes (a 10dB RX attenuation reduction plus a deliberate RSET/PWM
+ * gate-drive redesign, 0.94V-3.38V across duty 0-1023, that spreads real
+ * output across far more of the duty range without compromising BJT bias
+ * or filter/group-delay stability). A two-tone/IMD re-check still matters
+ * for the same reason REVISION 4->5's did: a gate-drive range this
+ * different moves where turn-on and any bias-adjacent nonlinearity sit
+ * in duty terms, which this static AM table can't confirm on its own.
+ * Still off by default, same convention.
  */
 
 #include <stdbool.h>
