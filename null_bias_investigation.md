@@ -2,7 +2,11 @@
 
 **Status: characterized, NOT fixed. Parked 2026-08-31** — picking up the TF
 (transfer function) measurement system and group-delay re-tuning first. See
-"Where to resume" at the bottom.
+"Where to resume" at the bottom. **Late addition, same day: user reports the
+current `I` (x4 envelope interpolation) algorithm makes two-tone stability
+audibly worse, not just subtly worse — see item 5 under "Open, un-actioned
+next steps" below. Treat that as higher priority than the null-bias fix
+itself when this is picked back up.**
 
 ## Symptom that started this
 
@@ -170,14 +174,37 @@ thread. Not verified against real speech/mic input.
    timescale of typing a sentence, so much of what looked like an `I`-caused
    shift may simply have been that independent drift being sampled at
    different moments — never isolated with a controlled dwell test.
+5. **UPDATE 2026-08-31, end of session**: user's direct assessment is that
+   the current x4 envelope-interpolation algorithm (`I`, `envelope_interp.h`/
+   `.cpp`) makes two-tone stability *much worse* — a clearly audible
+   instability, not just the subtle few-Hz effect item 4 above was framed
+   as. This reads as stronger/more definitive than item 4's framing and
+   should take priority over it when this is picked back up: before
+   spending more time on the null-crossing bias mechanism above (which is
+   independent of `I` — provably doesn't touch `freq_dev_hz`), first
+   characterize what `I` itself is doing to produce an audible instability.
+   `envelope_interp.h`'s own header comment documents four earlier
+   real-hardware failure modes (v1-v4, all fixed) before landing on the
+   current implementation — worth re-reading that history first in case
+   this is a fifth, not-yet-identified failure mode of the same kind,
+   rather than assuming it's connected to the null-bias work above. Not
+   investigated further this session — parked here as the more urgent of
+   the two open `I`-related threads.
 
 ## Where to resume
 
-Nothing here is broken or urgent — the mechanism is well-characterized and,
-per the "likely real-world significance" assessment above, may matter more
-for trusting two-tone/IMD test data than for actual on-air voice quality.
-When picking this back up: start from "Confirmed measurement table" above to
-refresh context, then decide between the two fix directions in "Open,
-un-actioned next steps" #1. The instrumentation (`null_bias`/`null_bias2`/
+The null-crossing bias itself is well-characterized and, per the "likely
+real-world significance" assessment above, may matter more for trusting
+two-tone/IMD test data than for actual on-air voice quality — nothing there
+is urgent. **Higher priority: item 5 above (`I` making two-tone stability
+audibly worse)** — that's a clear, user-confirmed regression, not just a
+measurement subtlety, and should be looked at before returning to the
+null-bias fix directions. When picking this back up: start with item 5
+(re-read `envelope_interp.h`'s v1-v4 failure history, then characterize what
+changes with `I` on vs off on a two-tone signal specifically), then, once
+that's resolved or understood, come back to "Confirmed measurement table"
+above to refresh context on the null-bias mechanism and decide between the
+two fix directions in "Open, un-actioned next steps" #1. The instrumentation
+(`null_bias`/`null_bias2`/
 `null_bias3`, the `n` command) is already in place and doesn't need to be
 rebuilt — just `r` and read.
