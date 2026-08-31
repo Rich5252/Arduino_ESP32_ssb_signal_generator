@@ -133,6 +133,21 @@ Master gain scales the *whole* chain (phase + envelope together, inside `ssb_dsp
 | `f` | Cycle the ADC anti-alias low-pass filter: off → Butterworth → Chebyshev → off. Both are 4th-order (two cascaded biquads), same 3kHz -3dB point; Chebyshev trades a small in-band ripple (~1.4dB) for noticeably more stopband rejection above cutoff — see `adc_capture.h`/`ssb_adc_filter.h`. For A/B testing whether an artifact comes from the filter, and which filter family/order helps most |
 | `v` | Mute/unmute the once-per-second `[timing]`/`[adc]`/`[dsp]` diagnostic block — mute this before adjusting other settings if you want to actually see the confirmation lines |
 | `r` | Reset all diagnostic counters/watermarks for a clean measurement window (doesn't touch any of the settings above, only the stats) |
+| `n` | Cycle the null-bias diagnostic's near-null envelope threshold through `{0.02, 0.05, 0.10, 0.20}` (starts at 0.05) — see the section below |
+
+### Null-crossing frequency bias diagnostic (`[dsp] null_bias*`)
+
+Added 2026-08-31 while chasing a two-tone "poor tone"/slow-drift/FM-noise complaint. Full derivation, method, and the confirmed measurement table live in **`null_bias_investigation.md`** — short version: `wrap_pi()`'s resolution of the ±π phase jump at each two-tone envelope null carries a small, deterministic, tone-pair-specific bias, and it's now measurable directly from firmware, no SDR needed.
+
+Three lines print alongside `[dsp] freq_dev`, same ~1s cadence, gated the same way:
+
+| Line | Fields | Use |
+|---|---|---|
+| `null_bias` | `f1`, `f2`, `expected_center` (`(f1+f2)/2`), `plain_mean`, `plain_bias` | `plain_bias` is a plain unweighted average — **confirmed wrong**, overstates the real effect by 2-3 orders of magnitude (100s of Hz vs. the real few-to-tens-of-Hz effect). Kept only for the mechanistic breakdown in `null_bias3`. |
+| `null_bias2` | `weighted_mean`, `weighted_bias` | **The one that matches reality.** Envelope²-weighted average instantaneous frequency — the physically correct quantity (equals the power spectrum's centroid, a standard identity), confirmed against the SDR to within a few Hz across all six `TWOTONE_BAND_PRESETS` pairs. |
+| `null_bias3` | `near_null_samples%`, `near_null_contrib`, `rest`, `threshold` | Diagnostic-only: how much of `plain_bias` comes from the small fraction of samples sitting right at a null (`envelope < threshold`) vs. everywhere else. Confirms the effect is localized to null crossings. |
+
+Workflow to reproduce a reading: `T` to a tone-pair preset, confirm `e`/`c` (EQ/compressor) are off, confirm threshold reads 0.050 (press `n` to cycle back if not), `r`, wait ~1-2s, read the three lines. Counters reset via `ssb_dsp_reset_freq_dev_stats()` — same call `r` already makes, alongside `[dsp] freq_dev`'s `max_unclamped`/`clip_count`.
 
 ## Presets
 
@@ -150,7 +165,7 @@ Edit the `settingsPresets` array in `settings.h` to change them, or dial in leve
 - Master gain: -2dB
 - Relative delay: 0 samples
 - Envelope group-delay equalizer: off
-- `MAX_FREQ_DEV_HZ`: 8000Hz. Originally raised from 2800Hz just to measure the real unclamped two-tone peak deviation (`[dsp] max_unclamped`, see `diagnostics.cpp`) while chasing a ~+100Hz two-tone frequency offset; that measurement came back ~4800-4900Hz — well above the old 2800Hz ceiling, meaning that clamp was routinely engaging on real signal peaks, not just as an edge-case safety limit. Whether that clamping was actually the *cause* of the +100Hz offset was never confirmed either way. Separately, real-hardware mic white-noise testing showed the freq-dev clamp performs better set higher, so **8000Hz is being kept for now** rather than reverted to 2800Hz — not yet landed on a final permanent value.
+- `MAX_FREQ_DEV_HZ`: 8000Hz. Originally raised from 2800Hz just to measure the real unclamped two-tone peak deviation (`[dsp] max_unclamped`, see `diagnostics.cpp`) while chasing a ~+100Hz two-tone frequency offset; that measurement came back ~4800-4900Hz — well above the old 2800Hz ceiling, meaning that clamp was routinely engaging on real signal peaks, not just as an edge-case safety limit. Separately, real-hardware mic white-noise testing showed the freq-dev clamp performs better set higher, so **8000Hz is being kept for now** rather than reverted to 2800Hz — not yet landed on a final permanent value. UPDATE 2026-08-31: `clip_count` reads 0 at every tone-pair/spacing tested at this clamp setting, which rules clamp-asymmetry out as the cause of the (much smaller, current-firmware) two-tone offset seen now — see `null_bias_investigation.md` for the mechanism that replaced this as the leading explanation.
 
 ## Quick workflow reminders
 

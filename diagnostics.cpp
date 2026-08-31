@@ -10,6 +10,7 @@
 #include "envelope_output.h"
 #include "ssb_dsp.h"
 #include "carrier_output.h"
+#include "test_signals.h"
 #include "esp_timer.h"
 #include "esp_err.h"
 #include "esp_freertos_hooks.h"   // esp_register_freertos_idle_hook_for_cpu() - see core1_idle_hook() below
@@ -419,6 +420,78 @@ static void print_timing_and_adc_block(uint32_t now)
         ssb_dsp_get_freq_dev_stats(dsp_state_get_ssb(), &fd_stats);
         Serial.printf("[dsp]   freq_dev: max_unclamped=%.0fHz (limit=%.0fHz) clip_count=%u\r\n",
                       fd_stats.max_unclamped_freq_dev_hz, MAX_FREQ_DEV_HZ, fd_stats.clip_count);
+    }
+
+    // Null-bias diagnostic - see ssb_dsp_get_null_bias_stats() in
+    // ssb_dsp.h. plain_mean is the UNWEIGHTED average freq_dev - CONFIRMED
+    // on real hardware NOT to match what an SDR reads (deviations of Hz,
+    // not the 100s of Hz plain_mean showed) - kept only so near_null_% /
+    // near_null_contrib below can still localize the mechanism (do the
+    // near-null samples account for most of plain_mean's nonzero value?).
+    // weighted_mean is the physically meaningful one: the envelope^2-
+    // weighted average instantaneous frequency, which is what actually
+    // equals the transmitted power spectrum's centroid (a standard
+    // identity - see ssb_dsp.h) - this is the number to compare against a
+    // real spectrum measurement.
+    {
+        ssb_dsp_null_bias_stats_t nb_stats;
+        ssb_dsp_get_null_bias_stats(dsp_state_get_ssb(), &nb_stats);
+        const float k_two_pi = 6.28318530718f;
+        float plain_mean_hz = (nb_stats.dphi_sample_count > 0)
+            ? (nb_stats.dphi_sum / (float)nb_stats.dphi_sample_count) * SAMPLE_RATE_HZ / k_two_pi
+            : 0.0f;
+        float weighted_mean_hz = (nb_stats.env2_sum > 0.0f)
+            ? (nb_stats.env2_dphi_sum / nb_stats.env2_sum) * SAMPLE_RATE_HZ / k_two_pi
+            : 0.0f;
+        float near_null_pct = (nb_stats.dphi_sample_count > 0)
+            ? 100.0f * (float)nb_stats.near_null_sample_count / (float)nb_stats.dphi_sample_count
+            : 0.0f;
+        float near_null_contrib_hz = (nb_stats.dphi_sample_count > 0)
+            ? (nb_stats.near_null_dphi_sum / (float)nb_stats.dphi_sample_count) * SAMPLE_RATE_HZ / k_two_pi
+            : 0.0f;
+
+        // Expected baseline: for an equal-amplitude two-tone signal, the
+        // analytic-signal instantaneous frequency AWAY from envelope nulls
+        // is the CONSTANT (f1+f2)/2, not ~0 - that's the actual mechanism
+        // this Hilbert/EER technique uses to place two tones (shift the
+        // carrier by their average, let the envelope's own harmonic
+        // content produce the +-spacing/2 sidebands). dphi_sum/env2_dphi_sum
+        // are accumulated BEFORE the LSB sign flip at the end of
+        // ssb_dsp_process_sample(), so both always compare against the
+        // USB-convention +(f1+f2)/2 regardless of the sideband currently
+        // selected. weighted_bias is the number that should actually
+        // predict/match a real spectrum measurement; plain_bias is kept
+        // only for the mechanistic (near-null) breakdown below.
+        float f1 = test_signals_get_twotone_f1_hz();
+        float f2 = test_signals_get_twotone_f2_hz();
+        float expected_center_hz = 0.5f * (f1 + f2);
+        float plain_bias_hz = plain_mean_hz - expected_center_hz;
+        float weighted_bias_hz = weighted_mean_hz - expected_center_hz;
+
+        // Three short calls, each comfortably under this board's usual
+        // free-buffer headroom (see diag_room_for()'s header comment,
+        // citing a real ~162-byte resting measurement) - a single combined
+        // printf here previously needed ~200+ bytes and silently lost its
+        // diag_room_for() gate on every cycle, so it never printed at all.
+        // Matches every other block in this file's own established
+        // per-call granularity.
+        if (diag_room_for(140)) {
+            Serial.printf("[dsp]   null_bias: f1=%.0f f2=%.0f expected_center=%.2fHz "
+                          "plain_mean=%.2fHz plain_bias=%.2fHz\r\n",
+                          f1, f2, expected_center_hz, plain_mean_hz, plain_bias_hz);
+        }
+        if (diag_room_for(120)) {
+            Serial.printf("[dsp]   null_bias2: weighted_mean=%.2fHz weighted_bias=%.2fHz "
+                          "(this is the one to compare against the SDR)\r\n",
+                          weighted_mean_hz, weighted_bias_hz);
+        }
+        if (diag_room_for(150)) {
+            Serial.printf("[dsp]   null_bias3: near_null_samples=%.2f%% near_null_contrib=%.2fHz "
+                          "(rest=%.2fHz) threshold=%.3f\r\n",
+                          near_null_pct, near_null_contrib_hz,
+                          plain_mean_hz - near_null_contrib_hz,
+                          ssb_dsp_get_null_bias_threshold(dsp_state_get_ssb()));
+        }
     }
 
     // ADC continuity check: actual samples/callbacks seen in this ~1s

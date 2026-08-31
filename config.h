@@ -103,6 +103,24 @@
 // that matters here, not the pulse width (which is just however long the
 // two back-to-back register writes take - negligible, sub-100ns).
 #define TIMING_DEBUG_GPIO_ISR  5   // toggled every gptimer alarm ISR fire (on_timer_alarm(), Core 1)
+
+// ADC_ISR_DEBUG_PIN_ENABLED gates adc_conv_done_cb()'s own toggle of
+// TIMING_DEBUG_GPIO_ADC (adc_capture.cpp) - set to 0 here because pin13 is
+// being TEMPORARILY REPURPOSED for the serial-activity-correlation test
+// (TIMING_DEBUG_GPIO_CMD below) instead: the ADC-ISR-vs-gptimer-alarm-ISR
+// contention question this pin was originally added to test is already
+// answered and fixed (intr_priority=3), and the board only has GPIO1-13
+// easily accessible - GPIO9-12 are taken by the AD9851, GPIO8 was
+// considered but rejected (still ADC1, like GPIO3 which broke the ADC
+// outright when toggled digitally - see the "TRIED GPIO3 FIRST" note
+// below), and GPIO1-7 are ADC1 or already spoken for (2=RSET PWM, 4/5=the
+// other two debug pins, 6=mic input). Two ISRs (adc_conv_done_cb() and
+// the new loop()-context command-window marker) must never drive the same
+// physical pin at once - that would corrupt both signals - so this flag
+// keeps them mutually exclusive. Flip back to 1 (and TIMING_DEBUG_GPIO_CMD
+// back to its own pin, once one becomes available) if the ADC-ISR
+// contention question ever needs re-checking directly.
+#define ADC_ISR_DEBUG_PIN_ENABLED 0
 #define TIMING_DEBUG_GPIO_ADC  13  // toggled every ADC conv_done ISR fire (adc_conv_done_cb(), Core 1).
                                    // TRIED GPIO3 FIRST, REVERTED: real hardware confirmed the ADC
                                    // continuous driver produced ZERO conversions the moment this pin's
@@ -121,6 +139,38 @@
                                    // channel-adjacency as a question entirely rather than hoping GPIO3
                                    // was uniquely bad. If GPIO13 turns out inconvenient to probe, pick
                                    // any other GPIO11+ instead, just stay off 1-10.
+
+// New leading suspect for the [timing] wakeup-jitter residual and the
+// pin5-bad-edge sightings that showed up even at the intr_priority=3-only
+// checkpoint (no elapsed_fast_ticks/coalescing/residual diagnostic code
+// present at all): real hardware now shows pin5 running clean for minutes
+// at a stretch, then throwing an occasional bad edge mid-period right
+// around when something happens on the serial interface (typing a
+// command), then going quiet again once the serial activity stops - a
+// strong hint this was there all along and just wasn't sampled during the
+// short post-fix checkpoint window, not something the diagnostics code
+// caused or something that regressed. Mechanism theory, unconfirmed:
+// same ISR-to-ISR contention pattern that intr_priority=3 fixed against
+// the ADC's on_conv_done ISR, but this time against USB-CDC/UART RX
+// interrupt activity (and/or a Serial.printf command-confirmation write)
+// on Core 1 - either delaying gptimer's alarm ISR entry directly, or
+// (more likely, since intr_priority=3 should already preempt a lower/
+// equal-priority interrupt) briefly holding interrupts masked in a
+// driver-level critical section that blocks even a higher-priority ISR
+// from firing until it's released. Bracketing handle_serial_commands()
+// with its own debug pin gives a precise "command being processed right
+// now" window to scope alongside pin5, instead of relying on "roughly
+// when I typed" - see the .ino's loop() and setup().
+//
+// Reuses TIMING_DEBUG_GPIO_ADC's physical pin (13) rather than a new one -
+// GPIO9-12 are taken by the AD9851 and GPIO8 was rejected as still-ADC1
+// (see ADC_ISR_DEBUG_PIN_ENABLED's comment above for the full reasoning).
+// ADC_ISR_DEBUG_PIN_ENABLED=0 keeps adc_conv_done_cb() off this pin while
+// it's doing this job, so the two signals never collide on the wire.
+#define TIMING_DEBUG_GPIO_CMD  TIMING_DEBUG_GPIO_ADC   // toggled HIGH for the duration of
+                                    // handle_serial_commands() each loop() iteration (Core 1,
+                                    // task context - digitalWrite is fine here, same as
+                                    // TIMING_DEBUG_GPIO).
 
 #define SAMPLE_RATE_HZ     16000u  // was 9600 (see below), then 10000 for a long stretch, now
                                     // raised to 16000 once the AD9851 write path (bit-bang +

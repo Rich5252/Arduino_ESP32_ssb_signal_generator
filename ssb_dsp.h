@@ -185,6 +185,77 @@ void ssb_dsp_get_freq_dev_stats(ssb_dsp_handle_t handle, ssb_dsp_freq_dev_stats_
 void ssb_dsp_reset_freq_dev_stats(ssb_dsp_handle_t handle);
 
 /**
+ * @brief Diagnostic-only: direct firmware-side measurement of the mean
+ *        per-sample phase delta (dphi, radians) computed by wrap_pi() in
+ *        ssb_dsp_process_sample() - BEFORE slew-limiting or the
+ *        max_freq_dev_hz clamp, i.e. the true output of the atan2/
+ *        null-crossing phase math itself.
+ *
+ *        dphi_sum/dphi_sample_count is a PLAIN unweighted average, scaled
+ *        to Hz (dphi_sum/dphi_sample_count * sample_rate_hz / 2*pi).
+ *        CONFIRMED AGAINST REAL HARDWARE NOT to be what an SDR reads as
+ *        the carrier's average frequency offset - real two-tone tests
+ *        measured near their correct frequency (deviations of Hz, not the
+ *        100s of Hz this plain average showed for various tone-pair
+ *        sweeps). Kept only as a mechanistic diagnostic (see near_null_*
+ *        below) - use env2_dphi_sum/env2_sum instead for anything meant
+ *        to predict/match a real spectrum measurement.
+ *
+ *        env2_dphi_sum/env2_sum give the ENVELOPE^2-WEIGHTED average
+ *        instead: (env2_dphi_sum/env2_sum) * sample_rate_hz / 2*pi. This
+ *        IS the physically meaningful quantity - for an analytic signal
+ *        A(t)e^{jphi(t)}, the power spectrum's centroid equals the
+ *        energy-weighted (A(t)^2-weighted) average instantaneous
+ *        frequency, a standard identity, not the plain time-average. The
+ *        near-null samples that dominate dphi_sum's plain average sit
+ *        exactly where envelope (and so envelope^2) is smallest, so this
+ *        weighting suppresses almost all of their contribution - matching
+ *        why the plain average overstated the real effect so badly.
+ *
+ *        near_null_dphi_sum/near_null_sample_count restrict the PLAIN
+ *        (unweighted) sum to samples where envelope < null_bias_threshold
+ *        (see ssb_dsp_set_null_bias_threshold() below) - i.e. samples at
+ *        or near a two-tone destructive-interference null. Comparing this
+ *        subset's contribution to dphi_sum's overall total is what
+ *        localizes the mechanism (confirms it's concentrated at null
+ *        crossings) - it does NOT predict on-air impact by itself; for
+ *        that, use env2_dphi_sum/env2_sum above.
+ *
+ *        All four sums reset together, along with
+ *        max_unclamped_freq_dev_hz/clip_count, via
+ *        ssb_dsp_reset_freq_dev_stats() - same call the 'r' serial command
+ *        already makes, so no new wiring needed to start a clean
+ *        measurement window.
+ */
+typedef struct {
+    float dphi_sum;                    ///< Sum of dphi (radians) over every sample since last reset.
+    uint32_t dphi_sample_count;
+    float near_null_dphi_sum;          ///< Same sum, restricted to envelope < null_bias_threshold samples.
+    uint32_t near_null_sample_count;
+    float env2_dphi_sum;               ///< Sum of envelope^2 * dphi - the physically meaningful,
+                                        ///< energy-weighted numerator. Divide by env2_sum for the mean.
+    float env2_sum;                    ///< Sum of envelope^2 - the energy-weighted average's denominator.
+} ssb_dsp_null_bias_stats_t;
+
+void ssb_dsp_get_null_bias_stats(ssb_dsp_handle_t handle, ssb_dsp_null_bias_stats_t *out);
+
+/**
+ * @brief Envelope threshold (roughly [0,1] units, same convention as
+ *        out_envelope) below which a sample counts as "near a null" for
+ *        ssb_dsp_get_null_bias_stats()'s near_null_* fields. Default
+ *        0.05f (~5% of full scale) at init - IRAM_ATTR/volatile-backed
+ *        for the same reason as freq_dev_slew_limit_hz: occasional writes
+ *        from a command handler, read every sample in the real-time path.
+ *        Tune live if near_null_sample_count comes back 0 (threshold too
+ *        tight for this signal's actual peak envelope - lower gain or a
+ *        two-tone test won't reach a clean I=Q=0 at every discrete sample)
+ *        or implausibly large (threshold catching ordinary low-envelope
+ *        content, not just genuine nulls).
+ */
+void IRAM_ATTR ssb_dsp_set_null_bias_threshold(ssb_dsp_handle_t handle, float threshold);
+float ssb_dsp_get_null_bias_threshold(ssb_dsp_handle_t handle);
+
+/**
  * @brief Optional per-sample SLEW-RATE limit on freq_dev_hz - distinct
  *        from max_freq_dev_hz above, which limits the VALUE. This limits
  *        how much freq_dev is allowed to CHANGE from one sample to the

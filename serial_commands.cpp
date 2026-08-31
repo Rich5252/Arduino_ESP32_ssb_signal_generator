@@ -256,6 +256,21 @@ void handle_serial_commands(void)
             mode = (adc_lpf_mode_t)((mode + 1) % 3);
             adc_capture_set_lpf_mode(mode);
             serial_reply("-> ADC LPF: %s\r\n", adc_capture_lpf_mode_name(mode));
+        } else if (c == 'n') {
+            // Cycles the null-bias diagnostic's envelope threshold - see
+            // ssb_dsp_set_null_bias_threshold() in ssb_dsp.h and the
+            // '[dsp] null_bias' line in the periodic diagnostics block.
+            // Tune this if near_null_samples% comes back 0 (threshold too
+            // tight for this signal's actual peak envelope) or looks like
+            // it's catching ordinary low-envelope content, not just
+            // genuine two-tone nulls. Default (0.05f) is index 1 here, so
+            // this starts by loosening it on the first press.
+            static const float k_null_thresholds[] = {0.02f, 0.05f, 0.10f, 0.20f};
+            static int s_null_threshold_idx = 1;
+            s_null_threshold_idx = (s_null_threshold_idx + 1) % 4;
+            float thr = k_null_thresholds[s_null_threshold_idx];
+            ssb_dsp_set_null_bias_threshold(dsp_state_get_ssb(), thr);
+            serial_reply("-> null_bias threshold=%.2f (see '[dsp] null_bias' diagnostic line)\r\n", thr);
         } else if (c == 'v') {
             diagnostics_toggle_muted();
         } else if (c == 'r') {

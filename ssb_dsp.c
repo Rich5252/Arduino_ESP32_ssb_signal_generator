@@ -244,6 +244,38 @@ struct ssb_dsp_s {
     float max_unclamped_freq_dev_hz;
     uint32_t freq_dev_clip_count;
 
+    // Null-bias diagnostic - see ssb_dsp_get_null_bias_stats() in
+    // ssb_dsp.h. dphi_sum/dphi_sample_count let the mean per-sample phase
+    // delta (hence mean carrier frequency offset) be read directly off
+    // the firmware, no SDR needed, to cross-check against real-hardware
+    // spectrum measurements. near_null_* restricts the same sum to
+    // samples where envelope < null_bias_threshold, to test whether the
+    // offset is concentrated at two-tone destructive-interference nulls
+    // specifically (as the "offset scales with tone spacing, i.e. with
+    // null rate" real-hardware evidence suggests) rather than spread
+    // uniformly across the signal.
+    float dphi_sum;
+    uint32_t dphi_sample_count;
+    float near_null_dphi_sum;
+    uint32_t near_null_sample_count;
+    volatile float null_bias_threshold;
+
+    // Envelope^2-weighted companion to dphi_sum above - see
+    // ssb_dsp_null_bias_stats_t's env2_dphi_sum/env2_sum doc comment in
+    // ssb_dsp.h. This is the quantity that actually corresponds to where
+    // an SDR/spectrum analyzer sees the signal's energy centered: for an
+    // analytic signal A(t)e^{jphi(t)}, the energy-weighted average of
+    // instantaneous frequency equals the power spectrum's centroid - a
+    // standard identity, NOT the same thing as dphi_sum's plain unweighted
+    // average. Real hardware confirmed the plain average (100s of Hz) does
+    // NOT show up as a same-size on-air shift (tones measured near their
+    // correct frequency, deviations in Hz not 100s) - exactly what this
+    // predicts, since the huge near-null dphi excursions get suppressed by
+    // their own near-zero envelope^2 weight here, where they dominated the
+    // unweighted sum.
+    float env2_dphi_sum;
+    float env2_sum;
+
     // See ssb_dsp_set_freq_dev_slew_limit_hz()'s doc comment in ssb_dsp.h.
     // freq_dev_slew_limit_hz is the configured limit (SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ
     // = off), written occasionally from a command handler hence volatile,
@@ -337,6 +369,16 @@ esp_err_t ssb_dsp_init(const ssb_dsp_config_t *cfg, ssb_dsp_handle_t *out_handle
     h->max_freq_dev_hz = cfg->max_freq_dev_hz > 0.0f ? cfg->max_freq_dev_hz : 3000.0f;
     h->max_unclamped_freq_dev_hz = 0.0f;
     h->freq_dev_clip_count = 0;
+    h->dphi_sum = 0.0f;
+    h->dphi_sample_count = 0;
+    h->near_null_dphi_sum = 0.0f;
+    h->near_null_sample_count = 0;
+    h->env2_dphi_sum = 0.0f;
+    h->env2_sum = 0.0f;
+    h->null_bias_threshold = 0.05f;   // see ssb_dsp_set_null_bias_threshold() - envelope is
+                                        // roughly [0,1] for full-scale input, so this starts at
+                                        // ~5% of full scale; tune live if it catches too few/many
+                                        // samples for a given signal's actual peak envelope.
     h->have_prev_phase = false;
     h->prev_phase = 0.0f;
     h->delay_head = 0;
@@ -458,6 +500,44 @@ void ssb_dsp_reset_freq_dev_stats(ssb_dsp_handle_t handle)
     if (!handle) return;
     handle->max_unclamped_freq_dev_hz = 0.0f;
     handle->freq_dev_clip_count = 0;
+    handle->dphi_sum = 0.0f;
+    handle->dphi_sample_count = 0;
+    handle->near_null_dphi_sum = 0.0f;
+    handle->near_null_sample_count = 0;
+    handle->env2_dphi_sum = 0.0f;
+    handle->env2_sum = 0.0f;
+}
+
+void ssb_dsp_get_null_bias_stats(ssb_dsp_handle_t handle, ssb_dsp_null_bias_stats_t *out)
+{
+    if (!out) return;
+    if (!handle) {
+        out->dphi_sum = 0.0f;
+        out->dphi_sample_count = 0;
+        out->near_null_dphi_sum = 0.0f;
+        out->near_null_sample_count = 0;
+        out->env2_dphi_sum = 0.0f;
+        out->env2_sum = 0.0f;
+        return;
+    }
+    out->dphi_sum = handle->dphi_sum;
+    out->dphi_sample_count = handle->dphi_sample_count;
+    out->near_null_dphi_sum = handle->near_null_dphi_sum;
+    out->near_null_sample_count = handle->near_null_sample_count;
+    out->env2_dphi_sum = handle->env2_dphi_sum;
+    out->env2_sum = handle->env2_sum;
+}
+
+void IRAM_ATTR ssb_dsp_set_null_bias_threshold(ssb_dsp_handle_t handle, float threshold)
+{
+    if (!handle) return;
+    if (threshold < 0.0f) threshold = 0.0f;
+    handle->null_bias_threshold = threshold;
+}
+
+float ssb_dsp_get_null_bias_threshold(ssb_dsp_handle_t handle)
+{
+    return handle ? handle->null_bias_threshold : 0.05f;
 }
 
 // Step size and bounds for '{'/'}' - see ssb_dsp.h's doc comment. Step
@@ -643,6 +723,39 @@ void IRAM_ATTR ssb_dsp_process_sample(ssb_dsp_handle_t handle,
     float dphi = 0.0f;
     if (handle->have_prev_phase) {
         dphi = wrap_pi(phase - handle->prev_phase);
+
+        // Null-bias diagnostic accumulator (see ssb_dsp_get_null_bias_stats()
+        // in ssb_dsp.h) - deliberately BEFORE slew/clamp below, same as
+        // max_unclamped_freq_dev_hz, so this reflects the true wrap_pi output
+        // exactly as fast_atan2/atan2f and this file's own null-crossing
+        // phase disambiguation produced it.
+        //
+        // CORRECTION (confirmed against real hardware): dphi_sum's plain
+        // unweighted mean is NOT what an SDR reads as the carrier's average
+        // frequency offset - real two-tone transmissions measured near
+        // their correct frequency (deviations in Hz, not the 100s of Hz
+        // this plain average predicted). The physically correct quantity is
+        // the ENVELOPE^2-WEIGHTED average of instantaneous frequency - a
+        // standard identity (for an analytic signal A(t)e^{jphi(t)}, the
+        // power spectrum's centroid equals the energy-weighted average of
+        // (1/2pi)dphi/dt, NOT the plain time-average). env2_dphi_sum/
+        // env2_sum below accumulate exactly that. The near-null samples
+        // that dominated dphi_sum's plain average happen to be exactly
+        // where envelope (and so envelope^2) is smallest - the correct
+        // weighting suppresses their contribution almost entirely, which is
+        // exactly why the plain average overstated things so badly.
+        // dphi_sum/near_null_dphi_sum are kept for mechanistic diagnosis
+        // (which samples the effect concentrates at) - see
+        // ssb_dsp_null_bias_stats_t in ssb_dsp.h for both.
+        handle->dphi_sum += dphi;
+        handle->dphi_sample_count++;
+        if (envelope < handle->null_bias_threshold) {
+            handle->near_null_dphi_sum += dphi;
+            handle->near_null_sample_count++;
+        }
+        float env2 = envelope * envelope;
+        handle->env2_dphi_sum += env2 * dphi;
+        handle->env2_sum += env2;
     }
     handle->prev_phase = phase;
     handle->have_prev_phase = true;

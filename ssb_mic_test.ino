@@ -552,6 +552,11 @@ void setup()
     // toggles it - kept together rather than split across files.
     pinMode(TIMING_DEBUG_GPIO_ISR, OUTPUT);
     digitalWrite(TIMING_DEBUG_GPIO_ISR, LOW);
+
+    // New serial-activity-correlation pin - see config.h's
+    // TIMING_DEBUG_GPIO_CMD comment.
+    pinMode(TIMING_DEBUG_GPIO_CMD, OUTPUT);
+    digitalWrite(TIMING_DEBUG_GPIO_CMD, LOW);
 #endif
 
 #if AD9851_ATTACHED
@@ -662,7 +667,7 @@ void setup()
              AD9851_ATTACHED ? "attached" : "not attached (stubbed)",
              MCP4725_I2C_ADDR,
              PWM_COMPARISON_ENABLED ? "on" : "off");
-    Serial.println("Send 't' for two-tone test signal, 's' for single-tone test signal, 'm' for live mic input, 'p' for envelope step test, 'y' for FM isolation test, 'h' for AM isolation test, 'f' to cycle the ADC LPF off/Butterworth/Chebyshev, 'r' to reset diagnostics, 'v' to mute periodic diagnostics.");
+    Serial.println("Send 't' for two-tone test signal, 's' for single-tone test signal, 'm' for live mic input, 'p' for envelope step test, 'y' for FM isolation test, 'h' for AM isolation test, 'f' to cycle the ADC LPF off/Butterworth/Chebyshev, 'r' to reset diagnostics, 'v' to mute periodic diagnostics, 'n' to cycle the null_bias diagnostic's envelope threshold (see '[dsp] null_bias' line).");
     Serial.printf("Send 'T' to step the two-tone pair through a spread of bands (currently f1=%.0fHz f2=%.0fHz) - "
                   "for mapping envelope/phase delay mismatch vs. frequency without a recompile per band.\r\n",
                   test_signals_get_twotone_f1_hz(), test_signals_get_twotone_f2_hz());
@@ -742,7 +747,17 @@ void loop()
     // accumulators via one combined recorder call at the end - see
     // diagnostics_record_core1_loop_timings()'s header comment.
     int64_t t_cmd0 = esp_timer_get_time();
+#if TIMING_DEBUG_ENABLED
+    // See config.h's TIMING_DEBUG_GPIO_CMD comment - marks the exact
+    // window handle_serial_commands() is running, to scope alongside
+    // pin5 and test the "serial activity delays/disrupts gptimer's
+    // alarm ISR" theory directly, rather than relying on manual timing.
+    digitalWrite(TIMING_DEBUG_GPIO_CMD, HIGH);
+#endif
     handle_serial_commands();
+#if TIMING_DEBUG_ENABLED
+    digitalWrite(TIMING_DEBUG_GPIO_CMD, LOW);
+#endif
     int64_t t_cmd1 = esp_timer_get_time();
 
     // Keep adc_continuous's internal pool from filling up - see

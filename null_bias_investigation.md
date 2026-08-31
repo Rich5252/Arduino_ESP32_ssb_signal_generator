@@ -1,0 +1,183 @@
+# Two-tone null-crossing frequency bias — investigation notes
+
+**Status: characterized, NOT fixed. Parked 2026-08-31** — picking up the TF
+(transfer function) measurement system and group-delay re-tuning first. See
+"Where to resume" at the bottom.
+
+## Symptom that started this
+
+Poor perceived audio quality on two-tone tests: pitch wandering ~10Hz on a
+slow timescale, plus a faster few-Hz FM noise riding on top. Both worse with
+envelope interpolation (`I`) on, present at a lower level with `I` off.
+Single-tone always tested spot-on to 1-2Hz.
+
+## Ruled out, in order
+
+1. **Digital scheduling/wakeup jitter.** `[timing] max_gap_us` essentially
+   unchanged between `I` off/on across three separate measurement pairs
+   (75→80us, `late_ticks_total=0` both ways). Not the mechanism.
+2. **Analog AM-to-PM via envelope activity alone.** `AMTEST` (envelope swept
+   through a full sine sweep, `freq_dev_hz` pinned to 0, bypasses
+   `ssb_dsp_process_sample()` entirely) showed tone stability "close to
+   perfect" regardless of `I`. Not the mechanism.
+3. **`fast_atan2`/`fast_sqrt` approximation error.** Already ruled out in
+   earlier project history (see `ssb_dsp.c`'s `SSB_DSP_FAST_TRIG` comment) —
+   a direct A/B against real `atan2f`/`sqrtf` on real hardware showed no
+   change to a similar historical two-tone offset.
+4. **`max_freq_dev_hz` clamp asymmetry.** `clip_count` reads 0 at every
+   tone-pair/spacing tested in this session at the current 8000Hz clamp —
+   the clamp never engages, so it cannot be biasing anything right now. This
+   *closes* the long-open thread in `config.h`'s `MAX_FREQ_DEV_HZ` comment
+   ("whether that clamping was actually the cause... was never confirmed
+   either way") for the current configuration.
+
+## Root mechanism identified
+
+At each two-tone destructive-interference null (envelope → 0, i.e. I≈Q≈0 in
+`ssb_dsp_process_sample()`), the analytic-signal phase is mathematically
+required to jump by exactly ±π — this is genuine signal content, not noise
+(see `envelope_floor.cpp`'s own historical postmortem making the same point
+about the phase side). The discrete-time `dphi = wrap_pi(phase -
+prev_phase)` computation (`ssb_dsp.c`) resolves that jump with a small bias
+that is **deterministic and specific to the exact tone pair**, not random —
+because these test tones are generated as exact phase-accumulator multiples
+of the sample rate, every null in a given test recurs at an *identical*
+alignment to the sample grid, so whatever bias one null produces, every null
+in that run produces identically. It accumulates coherently instead of
+averaging out.
+
+## Two different averages — only one of them is physically real
+
+- **Plain (unweighted) time-average** of `dphi * Fs / 2π` ("`plain_mean`" /
+  "`plain_bias`" in the diagnostic): dominated by the tiny fraction of
+  samples sitting at a null, where `|dphi|` swings hugely for one sample.
+  Measured 95-600Hz "bias" across the sweep below.
+  **CONFIRMED WRONG as a predictor of on-air effect** — direct real-hardware
+  check (700/1900Hz pair) showed the transmitted tones sitting close to
+  their nominal frequencies, not shifted by the ~600Hz this predicted.
+- **Envelope²-weighted average** instantaneous frequency ("`weighted_mean`"
+  / "`weighted_bias`"): the physically correct quantity. For an analytic
+  signal `A(t)e^{jφ(t)}`, the power spectrum's centroid equals the
+  energy-weighted (`A(t)²`-weighted) average instantaneous frequency — a
+  standard identity, not the plain time-average. The near-null samples that
+  dominate the plain average sit exactly where envelope (and so envelope²)
+  is smallest, so this weighting suppresses almost all of their
+  contribution — which is exactly why the plain average overstated things
+  so badly.
+
+## Confirmed measurement table
+
+All six `TWOTONE_BAND_PRESETS` pairs (`test_signals.cpp`), EQ and compressor
+off, `null_bias_threshold` fixed at 0.050, freshly reset (`r`) before each
+reading:
+
+| pair | spacing (Δf) | plain_bias | weighted_bias | SDR-observed |
+|---|---|---|---|---|
+| 300/500 | 200Hz | +100.36Hz | **+4.03Hz** | ~3Hz |
+| 700/900 | 200Hz | −101.11Hz | **−0.70Hz** | ~2Hz |
+| 1500/1700 | 200Hz | −99.60Hz | **+0.11Hz** | <1Hz |
+| 2500/2700 | 200Hz | −95.05Hz | **+0.33Hz** | <1Hz |
+| 3500/3700 | 200Hz | −99.75Hz | **+0.16Hz** | <1Hz |
+| 700/1900 | 1200Hz | −607.69Hz | **−20.72Hz** | ~8Hz |
+
+`weighted_bias` matches the real, SDR-observed deviation to within a few Hz
+every time (6/6) — this is the confirmed, working predictor.
+`plain_bias` is wrong by 2-3 orders of magnitude and must not be used to
+reason about on-air/perceptual effects — kept only so `near_null_contrib`
+(see instrumentation below) can localize the mechanism.
+
+## Key finding: NOT simply proportional to tone spacing
+
+The very first data point taken at each spacing (300/500 at 200Hz, 700/1900
+at 1200Hz) fit a clean "proportional to Δf" story (≈3Hz and ≈18Hz, ratio 6,
+matching the spacing ratio) — but that was coincidental. 700/900 has the
+*same* 200Hz spacing as 300/500 yet gives a `weighted_bias` of opposite sign
+and ~6x smaller magnitude. **The bias is a function of the specific absolute
+tone pair, not spacing (Δf) alone.** Likely contributors: the Hilbert FIR's
+amplitude/phase response isn't perfectly flat across the audio band, and/or
+the exact sample-grid alignment through each null depends on the specific
+frequencies involved, not just their difference.
+
+## Likely real-world significance (reasoned, not yet verified)
+
+Two-tone test tones are perfectly periodic, so every null lands at the
+identical relative sample-grid position every cycle — the per-event bias
+accumulates coherently rather than averaging out. Real voice content's
+envelope nulls occur at essentially unpredictable times relative to the
+sample clock, so the same per-event bias would likely land with effectively
+random sign from one occurrence to the next and mostly cancel over time.
+**Working assessment: this is probably substantially a two-tone-test
+artifact rather than a significant real-voice-quality problem** — still
+worth fixing since it undermines trusting the IMD/linearity test signal
+itself, but likely lower priority than it looked at the start of this
+thread. Not verified against real speech/mic input.
+
+## Instrumentation added this session (live in the tree)
+
+- **`ssb_dsp.c`/`.h`**: `ssb_dsp_null_bias_stats_t` — `dphi_sum` /
+  `dphi_sample_count` (plain), `near_null_dphi_sum` / `near_null_sample_count`
+  (plain, restricted to `envelope < null_bias_threshold`), `env2_dphi_sum` /
+  `env2_sum` (the weighted numerator/denominator). Accumulated in
+  `ssb_dsp_process_sample()` right where `dphi` is computed, BEFORE
+  slew-limiting or the `max_freq_dev_hz` clamp. `ssb_dsp_get_null_bias_stats()`
+  reads it; `ssb_dsp_set/get_null_bias_threshold()` tune the near-null
+  envelope cutoff (default 0.05). Everything resets via the existing
+  `ssb_dsp_reset_freq_dev_stats()` (the `r` command already calls this).
+- **`diagnostics.cpp`**: three print lines per ~1s cycle —
+  `[dsp] null_bias` (f1/f2/expected_center/plain_mean/plain_bias),
+  `[dsp] null_bias2` (weighted_mean/weighted_bias — **the one to trust**),
+  `[dsp] null_bias3` (near_null_samples%/near_null_contrib/rest/threshold).
+  Each is its own short `Serial.printf()` behind its own `diag_room_for()`
+  call — a single combined line was tried first and silently never printed
+  (needed ~200 bytes against this board's ~162-byte typical free buffer);
+  splitting fixed it. Worth remembering if a future diagnostic line "goes
+  missing" for no apparent reason — check its `diag_room_for()` size first.
+- **`serial_commands.cpp`**: `n` cycles `null_bias_threshold` through
+  `{0.02, 0.05, 0.10, 0.20}`.
+- **Reproduce a reading**: `T` to a preset → confirm `e`/`c` off → confirm
+  threshold=0.050 (`n` to cycle back if not) → `r` → wait ~1-2s → read the
+  three `null_bias*` lines. See `ssb_mic_test_commands.md`'s "Null-crossing
+  frequency bias diagnostic" section for the quick-reference version of all
+  of this.
+
+## Open, un-actioned next steps
+
+1. **Two candidate fix directions identified, neither implemented.** This
+   codebase has a documented history of two abandoned null-handling
+   attempts (`envelope_floor.cpp`'s NOTE 1/NOTE 2) — be deliberate here,
+   validate incrementally on real hardware.
+   - **Targeted**: for samples flagged near-null (same test used above),
+     replace the raw `atan2`/`wrap_pi` resolution of the ±π direction with
+     something less numerically fragile than the instantaneous Q/I ratio
+     at a near-zero point.
+   - **Principled** (matches the forward note already left in
+     `envelope_floor.cpp`: "track/pre-warp the phase trajectory through the
+     null, not freeze it"): extrapolate the phase trajectory through the
+     null from the clean, well-defined phase rate on either side, rather
+     than trusting `atan2`'s read for the 1-2 samples actually at the
+     crossing.
+2. Map the bias-vs-absolute-frequency relationship more finely than the 6
+   fixed `TWOTONE_BAND_PRESETS` points (would help confirm/deny the
+   Hilbert-filter-response explanation above).
+3. Verify (or refute) the "mostly a test-artifact, not a real voice problem"
+   assessment against actual speech/mic input — not done this session.
+4. The still-separately-unexplained puzzle from earlier in this
+   investigation: why toggling `I` (envelope interpolation, which provably
+   never touches `freq_dev_hz`) appeared to shift the *measured* center
+   frequency in some earlier observations. Leading candidate explanation
+   reached at the time: the `I`-on/`I`-off shifts observed were smaller
+   (~couple Hz) than a separately-observed ~15Hz baseline drift on the
+   timescale of typing a sentence, so much of what looked like an `I`-caused
+   shift may simply have been that independent drift being sampled at
+   different moments — never isolated with a controlled dwell test.
+
+## Where to resume
+
+Nothing here is broken or urgent — the mechanism is well-characterized and,
+per the "likely real-world significance" assessment above, may matter more
+for trusting two-tone/IMD test data than for actual on-air voice quality.
+When picking this back up: start from "Confirmed measurement table" above to
+refresh context, then decide between the two fix directions in "Open,
+un-actioned next steps" #1. The instrumentation (`null_bias`/`null_bias2`/
+`null_bias3`, the `n` command) is already in place and doesn't need to be
+rebuilt — just `r` and read.
