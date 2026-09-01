@@ -777,6 +777,11 @@ void setup()
                   "out past the analog filter's stopband (per QMX's own amplitude-interpolation "
                   "trick), not yet validated on real hardware.\r\n",
                   ENVELOPE_INTERP_FACTOR, envelope_interp_get_enabled() ? "ON" : "off");
+    Serial.printf("Send 'C' to switch the 'I' interpolation curve (currently %s) - Catmull-Rom is "
+                  "smoother in general but can't represent a two-tone null's sharp fold and rounds "
+                  "it off; linear is the opposite tradeoff. Only affects output while 'I' is ON.\r\n",
+                  envelope_interp_get_curve() == ENVELOPE_INTERP_CURVE_LINEAR
+                      ? "LINEAR" : "Catmull-Rom");
     Serial.printf("Send 'x'/'z' to raise/lower the envelope-null floor (currently %.2f) - smoothly "
                   "compresses envelope's [0,1] range into [floor,1], to keep two-tone nulls out "
                   "of the predistort LUT's steepest region; 0.00 = off.\r\n",

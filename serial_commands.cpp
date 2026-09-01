@@ -268,6 +268,21 @@ void handle_serial_commands(void)
             envelope_interp_set_enabled(now_on);   // internally seeds prev/target on an off->on transition
             serial_reply("-> %dx envelope output interpolation %s (see envelope_interp.h)\r\n",
                           ENVELOPE_INTERP_FACTOR, now_on ? "ON" : "off");
+        } else if (c == 'C') {
+            // v4.3: direct A/B between the two interp curves, independent
+            // of 'I' itself - see envelope_interp.h's "v4.3" header note.
+            // Only affects rendered output while 'I' is ON; harmless (and
+            // remembered) to toggle with 'I' off.
+            envelope_interp_curve_t cur = envelope_interp_get_curve();
+            envelope_interp_curve_t next = (cur == ENVELOPE_INTERP_CURVE_CATMULL_ROM)
+                                            ? ENVELOPE_INTERP_CURVE_LINEAR
+                                            : ENVELOPE_INTERP_CURVE_CATMULL_ROM;
+            envelope_interp_set_curve(next);
+            serial_reply("-> envelope interp curve: %s%s (see envelope_interp.h v4.3 note)\r\n",
+                          next == ENVELOPE_INTERP_CURVE_LINEAR
+                              ? "LINEAR (v4 straight-line ramp)"
+                              : "Catmull-Rom (v4.2 cubic Hermite, default)",
+                          envelope_interp_get_enabled() ? "" : " - no effect until 'I' is ON");
         } else if (c == 'f') {
             // Cycles off -> Butterworth -> Chebyshev -> off. See
             // adc_capture.h's adc_lpf_mode_t / ADC_LPF_CUTOFF_HZ /
@@ -430,7 +445,7 @@ void handle_serial_commands(void)
             // env_pwm_scale, env_gdeq_enable, adc_lpf_mode, eq_enable,
             // compressor_enable, master_gain_db, ad9851_output_enable,
             // env_predistort_enable, env_floor, freq_dev_slew_limit_hz,
-            // envelope_interp_enable) -
+            // envelope_interp_enable, envelope_interp_curve) -
             // wrapped in braces with a trailing comma so the whole line
             // can be pasted directly into settingsPresets[] in settings.h
             // as a new preset entry.
@@ -449,6 +464,11 @@ void handle_serial_commands(void)
             // is overriding them) - they'll only take effect again on
             // whichever of the two (env_predistort_enable=false, or 'D'
             // toggled off live) happens first.
+            //
+            // envelope_interp_curve ('C', envelope_interp.h v4.3) is the
+            // newest trailing field - prints as the enum constant name
+            // (ENVELOPE_INTERP_CURVE_CATMULL_ROM/_LINEAR), same convention
+            // as adc_lpf_mode below, so the pasted line compiles directly.
 #if AD9851_ATTACHED
             float rel_delay = relative_delay_get_samples();
             bool rf_enabled = carrier_output_get_rf_enabled();
@@ -479,8 +499,11 @@ void handle_serial_commands(void)
             } else {
                 snprintf(slew_str, sizeof(slew_str), "%.0ff", slew_limit);
             }
+            static const char *k_interp_curve_enum_name[2] = {
+                "ENVELOPE_INTERP_CURVE_CATMULL_ROM", "ENVELOPE_INTERP_CURVE_LINEAR"
+            };
             serial_reply("-> settings line (paste into settingsPresets[] in settings.h, then rename \"Live\"):\r\n");
-            serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s },\r\n",
+            serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s, %s },\r\n",
                           audio_source_enum_name(dsp_state_get_audio_source()),
                           rel_delay,
                           envelope_output_get_pwm_offset(),
@@ -494,7 +517,8 @@ void handle_serial_commands(void)
                           envelope_predistort_get_enabled() ? "true" : "false",
                           envelope_floor_get(),
                           slew_str,
-                          envelope_interp_get_enabled() ? "true" : "false");
+                          envelope_interp_get_enabled() ? "true" : "false",
+                          k_interp_curve_enum_name[envelope_interp_get_curve()]);
         } else if (c >= '0' && c <= '9') {
             int preset = c - '0';
             const PersistentSettings& p = settingsPresets[preset];
@@ -545,6 +569,12 @@ void handle_serial_commands(void)
             // off->on transition on preset load seeds prev/target cleanly
             // too, not just when toggled live.
             envelope_interp_set_enabled(p.envelope_interp_enable);
+
+            // v4.3: plain store, no reset-on-transition concern (see
+            // envelope_interp_set_curve()'s own comment) - safe to call
+            // unconditionally on every preset load, same as adc_lpf_mode
+            // above.
+            envelope_interp_set_curve(p.envelope_interp_curve);
 
             serial_reply("-> preset %d: %s\r\n", preset, p.name);
         }

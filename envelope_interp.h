@@ -274,6 +274,49 @@
  * this change (linear 'I' x4, current 'D' predistort table) via the
  * user's own logger, specifically so this change has a direct before/
  * after to compare against once flashed.
+ *
+ * ---- v4.3: curve made runtime-switchable (linear vs. Catmull-Rom) ----
+ * Added for a direct A/B, prompted by the group-delay-equalizer/new-filter
+ * investigation (see group_delay_fit_notes.md's 2026-09-01 entries):
+ * v4.2's own validation already showed a smooth cubic structurally cannot
+ * reproduce a two-tone null's hard fold (a genuine derivative
+ * discontinuity - see the v4.2 note above) the way a straight-line ramp
+ * naturally can, and there was no way to test that on real hardware
+ * without a rebuild/reflash between the two curves. compute_ramp_value()
+ * now branches on envelope_interp_get_curve(): ENVELOPE_INTERP_CURVE_
+ * CATMULL_ROM (=0, the v4.2 behavior, unchanged) or ENVELOPE_INTERP_CURVE_
+ * LINEAR (=1, a straight line from s_p1 to s_p2).
+ *
+ * Deliberately does NOT restore v4's original 2-point/1-tick-latency
+ * history - both curve choices still evaluate over the SAME [s_p1,s_p2]
+ * segment from the existing v4.2 4-point/2-tick-latency pipeline
+ * (s_p0..s_p3/s_m1/s_m2 unchanged either way; linear mode simply doesn't
+ * use s_m1/s_m2). That's an intentional choice, not laziness: reverting to
+ * v4's narrower window for "linear" mode would confound the comparison
+ * with a one-tick group-delay difference between the two curves, on top of
+ * whatever the curve SHAPE itself does - exactly the kind of extra
+ * variable this project has had to tease apart before (see gdeq's own
+ * fit-window-vs-wideband-excitation confusion). Holding the data window
+ * and timing identical between LINEAR and CATMULL_ROM isolates curve shape
+ * alone, so a straight before/after comparison at a FIXED relative_delay
+ * is meaningful without needing to also re-tune delay between the two
+ * curve choices - matching the project's actual purpose here (a direct
+ * A/B), not a literal restoration of v4's original zero-look-ahead
+ * implementation.
+ *
+ * Runtime toggle via 'C' (serial_commands.cpp) - cycles CATMULL_ROM <->
+ * LINEAR, independent of 'I' itself (the enable/disable toggle); only
+ * affects rendered output while 'I' is ON (envelope_interp_get_enabled()
+ * true) - with 'I' off, on_full_tick() takes its early-return plain-ZOH
+ * path regardless of curve selection. No reseed needed on a curve switch
+ * (unlike 'I' itself) - it only changes which formula reads the existing
+ * s_p0..s_p3/s_m1/s_m2 state, not the state itself, so a mid-ramp switch
+ * just changes the shape of the segment currently being rendered, not its
+ * endpoints. Persisted in PersistentSettings as envelope_interp_curve
+ * (settings.h), appended at the struct's end same as every other lever
+ * added after presets already existed - defaults to ENVELOPE_INTERP_CURVE_
+ * CATMULL_ROM (=0) so every existing preset keeps today's live behavior
+ * unless explicitly set otherwise.
  */
 
 #include <stdbool.h>
@@ -285,6 +328,17 @@
 // tunable the way the slew limiter is; revisit as a live '<'/'>'-style
 // step if/once a fixed 4x is confirmed worthwhile on real hardware.
 #define ENVELOPE_INTERP_FACTOR 4
+
+// v4.3: which curve compute_ramp_value() evaluates over the [s_p1,s_p2]
+// segment - see the "v4.3" header note above for the full rationale.
+// CATMULL_ROM is 0 (not LINEAR) specifically so a PersistentSettings preset
+// that doesn't explicitly set envelope_interp_curve (relying on C's
+// zero-fill of trailing struct initializers) keeps today's actual live
+// behavior, not v4's older one.
+typedef enum {
+    ENVELOPE_INTERP_CURVE_CATMULL_ROM = 0,  // v4.2 (current default) - smooth cubic Hermite
+    ENVELOPE_INTERP_CURVE_LINEAR      = 1,  // v4's original straight-line ramp, for direct A/B
+} envelope_interp_curve_t;
 
 // Resets the ramp state. Call once from setup(), after envelope_output_
 // init() (harmless either order now that there's no LEDC/gptimer setup
@@ -317,3 +371,13 @@ bool envelope_interp_get_enabled(void);
 // transition (already in the requested state) does nothing, same
 // convention as envelope_gdeq_set_enabled().
 void envelope_interp_set_enabled(bool enable);
+
+// v4.3: which curve is currently selected - see the "v4.3" header note
+// above. Only affects rendered output while envelope_interp_get_enabled()
+// is true.
+envelope_interp_curve_t envelope_interp_get_curve(void);
+
+// v4.3: switch curves live. No reseed/transient handling needed (unlike
+// envelope_interp_set_enabled()) - see header note for why a mid-ramp
+// switch is safe as a plain store.
+void envelope_interp_set_curve(envelope_interp_curve_t curve);

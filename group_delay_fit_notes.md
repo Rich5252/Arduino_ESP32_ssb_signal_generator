@@ -1,8 +1,17 @@
 # Envelope group-delay equalizer — fitting notes
 
-Source data: `SallenKey_LP_filter_BC337.txt` (LTspice AC sweep of the actual
-original 2-pole Sallen-Key RSET reconstruction filter circuit, including the
-BC337 buffer stage — not an idealized 2-pole formula).
+**2026-09-01: now covers TWO analog filter hardware variants** — see the
+"2026-09-01 refit" section below for the new PNP BC327 + gate-attenuator
+filter's fit, how it compares to the original BC337 filter this document
+started with, and an open question about whether its extra insertion loss
+could hurt IMD3/IMD5 despite the improved delay flatness. Also see the
+final section for a related (separate) finding: this filter's TF itself
+shifts with DC operating point.
+
+Source data (original entry below): `SallenKey_LP_filter_BC337.txt`
+(LTspice AC sweep of the actual original 2-pole Sallen-Key RSET
+reconstruction filter circuit, including the BC337 buffer stage — not an
+idealized 2-pole formula).
 
 ## Method
 
@@ -98,3 +107,424 @@ approximation when this change went in, but that rescale doesn't know
 about this ~102us shift in the digital filter's own contribution — see
 that file's header note for the expected direction of the residual
 re-tuning error.
+
+## 2026-09-01 refit: new PNP BC327 + gate-attenuator filter
+
+The RSET analog output stage was redesigned — PNP BC327 driver with a gate
+attenuator, replacing the original BC337 NPN buffer. New source data:
+`SallenKey_LP_filter_PNP_BC327__RSET_Driver__Gate_Attn.txt`. Same method as
+above (steps 1-3, unchanged), same 100-4300Hz fit grid, Fs=16000 only so
+far (10000Hz not refit for this filter — not needed, `SAMPLE_RATE_HZ` is
+16000 in the current build). Global optimum confirmed via grid scan +
+Nelder-Mead polish, same cross-check discipline as the 16000Hz BC337 refit.
+Both filters now live side by side in `envelope_gdeq.h`, selected at
+compile time by `ENV_FILTER_VARIANT` (`config.h`) — currently set to the
+new filter, since that's what's on the bench.
+
+### Analog filter comparison (LTspice, 100-4300Hz)
+
+| | BC337 (old) | PNP BC327 + attn (new) | Delta |
+|---|---|---|---|
+| Group delay, mean | 68.8us | 93.4us | +24.6us |
+| Group delay, peak-to-peak | 29.8us | 41.1us | +11.3us |
+| Insertion loss @ 200Hz | -0.84dB | -2.53dB | -1.7dB |
+| Insertion loss @ 4300Hz | -6.33dB | -10.42dB | -4.1dB |
+| Insertion loss @ 8000Hz | -15.72dB | -22.65dB | -6.9dB |
+
+The new filter is both slower and lossier than the old one — the gate
+attenuator is adding delay and loss on top of what the buffer alone cost.
+The loss grows with frequency, so it bites hardest exactly where the
+equalizer below can't help (see the all-pass caveat further down).
+
+### Digital equalizer fit result
+
+| | Peak-to-peak dispersion, 100-4300Hz |
+|---|---|
+| Analog filter alone (PNP BC327 + attn) | 41.1us |
+| **Two** sections @ 16000Hz, `a1=a2=0.622515` | **13.7us** |
+| (for reference: BC337's own 16000Hz fit, above) | 14.7us |
+
+`a1=a2` is a genuine optimum here, not a stuck/degenerate Nelder-Mead
+result — a coarse (a1,a2) grid scan independently converges to the same
+point (13.69us at the grid resolution, 13.67us after polishing), same
+discipline as the BC337 16000Hz refit above. Two IDENTICAL cascaded
+sections happen to flatten this filter's particular dispersion shape
+better than any opposite-sign pair does — worth remembering as a real
+possible outcome of this fit method, not a bug, if it recurs on a future
+filter revision.
+
+Mean combined delay after equalization: ~131.6us (2.105 samples @
+16000Hz) — LESS than the BC337 filter's 163.2us/2.611 samples, despite
+this filter's analog stage being slower to start with, because `a1=a2`
+here needs less cumulative added delay to flatten this particular
+dispersion shape. `relative_delay_samples` needs re-tuning from roughly
+**+2.105 samples** for this filter (a different regime from BOTH the
+Bessel filter's -0.20 to -0.25 samples AND the BC337 Sallen-Key fit's
++2.611 samples) — the presets in `settings.h` still reflect the BC337
+filter's by-ear/scope tuning and have not been re-tuned for this hardware
+change; expect to redo that tuning pass on the bench, not just carry the
+old numbers over.
+
+### Open question: does the extra insertion loss hurt IMD3/IMD5?
+
+An all-pass equalizer is unity-magnitude by construction — the digital fit
+above flattens DELAY only and does nothing whatsoever about the amplitude
+loss in the table above. For the 700/1900Hz two-tone pair specifically,
+the IMD3 offsets are 2f1-f2=500Hz and 2f2-f1=3100Hz, and the IMD5 offsets
+are 3f1-2f2=1700Hz and 3f2-2f1=4300Hz (the latter being the same 4300Hz
+the fit grid's upper bound was originally chosen around).
+
+**Correction, 2026-09-01:** the raw old-vs-new dB gap includes the new
+design's own resistive gate attenuator (~2.5dB nominal), which shows up in
+the LTspice sim as a flat ~-1.68dB offset already present at 100-300Hz,
+well below the filter's own corner. A flat, frequency-independent loss
+like that is just headroom/gain to trim back with master gain — it isn't
+a filter-shape effect and isn't relevant to edge-rounding/IMD. The number
+that actually matters here is the *excess above that flat baseline* —
+extra loss minus ~-1.68dB:
+
+| Offset | Product | BC337 | PNP+attn | Raw extra | **Excess (shape only)** |
+|---|---|---|---|---|---|
+| 500Hz | IMD3 | -0.85dB | -2.56dB | -1.7dB | **-0.03dB (negligible)** |
+| 1700Hz | IMD5 | -1.17dB | -3.27dB | -2.1dB | **-0.42dB** |
+| 3100Hz | IMD3 | -3.19dB | -6.29dB | -3.1dB | **-1.41dB** |
+| 4300Hz | IMD5 | -6.33dB | -10.42dB | -4.1dB | **-2.41dB** |
+
+So the genuine frequency-shape penalty is roughly half what the raw
+numbers suggested, and at the IMD3 lower offset (500Hz) it's essentially
+zero — the two filters track almost identically there. The concern
+doesn't disappear (3100/4300Hz still show 1.4-2.4dB of real extra
+roll-off past what the attenuator alone accounts for), but it's smaller
+and more concentrated above ~3kHz than first framed, so this leg of the
+"why doesn't the equalizer help IMD" argument (see Status below) should
+be weighted accordingly — a real but secondary factor, not the dominant
+one.
+
+Physical concern, not yet confirmed either way: the same envelope-null
+events that drive `freq_dev_hz` toward the `MAX_FREQ_DEV_HZ` (8000Hz)
+clamp (see `null_bias_investigation.md`) also produce the envelope's own
+fastest, most broadband transient — content that plausibly extends well up
+into the range where this filter now attenuates harder. Flattening delay
+doesn't stop that transient from being rounded off by the extra loss up
+there, and edge-rounding at a null is exactly the kind of envelope-domain
+distortion that shows up as IMD. Whether this matters in practice hasn't
+been measured — the direct check is a real two-tone IMD3/IMD5
+spectrum-analyzer comparison, BC337 vs. PNP+attn, each with its OWN
+properly-retuned `relative_delay_samples`, using the project's existing
+`imd_comparison_spectrum.png`/`imd_comparison_table.csv` workflow. Not run
+yet — parked here alongside the null-bias and `I`-regression items as
+something to chase once the group-delay retune itself is validated on
+the bench.
+
+### Simulated (mid-DC) vs. measured hardware (mid-DC) — sanity check
+
+Comparing this LTspice run's phase shape (zeroed at 200Hz, since the sim's
+reference node isn't the same point as the full measured chain — offset/
+scale mapping, PWM, etc. aren't in the sim) against the real `EnvFilterTF_
+mid_DC.txt` hardware sweep taken with the sine-chirp test mode: the two
+track reasonably well but aren't identical. The sim over-predicts phase
+lag by up to ~11° around 2-4kHz, closing to within a few degrees by
+6-8kHz — a decent guide, not an exact match, consistent with real
+component tolerances the sim doesn't model. Only the mid-DC bias point has
+been simulated so far; the DC-operating-point-dependence itself (measured
+on real hardware — see below) hasn't been independently checked against
+LTspice at the Lo/Hi bias points yet.
+
+### Status
+
+**2026-09-01, real-hardware result: far from decisive — leans toward "off."**
+`p` step test with `g` toggled: a slight steepening of the edge as
+predicted, but the lead-in is slower and the lead-out shows noticeable
+ripple. Two-tone and mic/white-noise IMD testing: with `[`/`]` re-tuned by
+ear in both states, comp-off gives similar or slightly *better* IMD than
+comp-on. This directly contradicts the narrowband delay-flatness
+prediction above, so it's worth being explicit about why, not just
+recording the result:
+
+**Quantified, same day — but confounded with `'I'`.** Two logged `Live`
+presets, delay re-tuned in each to minimize 3rd-order IMD: `relative_delay=
+1.00, env_gdeq_enable=false, envelope_interp_enable=false` gave Low 3rd IMD
+-41.41dB / High 3rd IMD -34.17dB; `relative_delay=3.00, env_gdeq_enable=
+true, envelope_interp_enable=true` gave -34.50dB / -29.97dB — a real
+4.2-6.9dB degradation, reference levels matched to within 0.5dB so it isn't
+a normalization artifact. **But `envelope_interp_enable` flipped ON
+together with `env_gdeq_enable` between these two runs** (see the
+Catmull-Rom/null-flattening cross-reference two sections up), so this pair
+does not isolate the equalizer's own effect — it measures "gdeq+`I`
+together" vs "neither." The +2.0 sample delay swing between the two runs
+is a good sanity check (matches the fitted equalizer's own +2.105 sample
+mean delay closely), but doesn't help separate the two enabled features.
+**Still needed: `env_gdeq_enable=true` with `envelope_interp_enable=false`
+(delay re-tuned) vs. the Run-1 baseline, and the reverse
+(`env_gdeq_enable=false`, `envelope_interp_enable=true`)**, to find out
+whether the ~4-7dB hit is coming from the equalizer, from `'I'`'s
+already-known null-rounding issue, or both. Until that decomposition is
+run, don't treat this pair as a decisive indictment of the equalizer
+specifically.
+
+**Decomposition, same day — first isolating run in.**
+`env_gdeq_enable=true`, `envelope_interp_enable=false`, delay re-tuned for
+min 3rd IMD, landed at **relative_delay=1.10**: Low 3rd IMD -30.90dB, High
+3rd IMD -27.17dB (ref levels within 0.6dB of the other two runs, not a
+normalization effect). Full three-way table:
+
+| | Off (delay=1.00) | gdeq+`I` (delay=3.00) | gdeq alone (delay=1.10) |
+|---|---|---|---|
+| Low 3rd IMD | -41.41dB | -34.50dB | -30.90dB |
+| High 3rd IMD | -34.17dB | -29.97dB | -27.17dB |
+
+gdeq alone is the WORST of the three, not an intermediate case — 10.5dB
+worse than off on Low, 7.0dB worse on High, worse even than gdeq+`I`
+together. So `'I'` is not masking gdeq's damage; gdeq itself is the bigger
+single contributor of the two.
+
+**But flag before treating this as final:** the tuned delay (1.10) sits
+only +0.10 samples above the off-state optimum (1.00), nowhere near the
+fitted equalizer's own predicted +2.105 sample mean delay addition that
+`envelope_gdeq.h`'s "IMPORTANT SIDE EFFECT" note documents as the correct
+operating point with gdeq on. The gdeq+`I` run's own tuned delay (3.00)
+landed much closer to that predicted region. A search converging at +0.10
+instead of near +2.1 looks like it found a shallow local minimum close to
+the off-state value rather than the theoretically-predicted one — possibly
+because the search didn't sweep far enough out. **Before trusting -30.90/
+-27.17dB as gdeq's true best case, re-run the `[`/`]` search for gdeq-alone
+specifically probing delay ≈ 1.8-2.4 samples** (centered on +2.105), not
+just refining near 1.10. If that region turns out worse still, this is a
+genuinely decisive result against the equalizer for this filter; if it's
+meaningfully better, the -30.90/-27.17dB numbers above were an artifact of
+an incomplete delay search, not the equalizer's real ceiling.
+
+**Follow-up, same day: delay=1.40 tuned for min Low 3rd IMD specifically.**
+Low improved to -33.34dB (+2.44dB vs. the 1.10 run), but High barely moved
+(-27.40dB, 0.24dB worse - within noise). Both still well short of the
+off-state baseline (-41.41/-34.17dB). Two takeaways: (1) Low kept
+improving as delay increased from 1.10->1.40, consistent with the search
+not having reached far enough yet - worth continuing toward the fitted
++2.105 region rather than stopping here; (2) High did NOT track Low's
+improvement, which raises the separate possibility that Low and High 3rd
+IMD don't share one jointly-optimal delay for this filter+equalizer
+combination - a genuine low/high delay tradeoff, not just an unfinished
+search. Continuing the sweep to ~1.8-2.4 while watching BOTH sidebands
+together (not just Low) should distinguish the two: both improving further
+= search wasn't finished; Low improving while High keeps drifting worse =
+a real tradeoff.
+
+**Follow-up, same day: delay=2.00 tuned for min High 3rd IMD specifically.**
+High improved only modestly to -28.18dB (+0.78dB vs. the 1.40 run) - the
+best High result yet, and notably this delay (2.00) sits almost exactly at
+the fitted equalizer's own predicted +2.105 sample operating point. But
+Low did NOT keep improving out to this delay - it got substantially WORSE,
+-33.34dB (at 1.40) -> -27.36dB (at 2.00), a 6.0dB drop. Full gdeq-alone
+sweep now:
+
+| Delay | Low 3rd IMD | High 3rd IMD |
+|---|---|---|
+| 1.10 | -30.90dB | -27.17dB |
+| 1.40 | -33.34dB (best Low so far) | -27.40dB |
+| 2.00 | -27.36dB | -28.18dB (best High so far) |
+
+This resolves the "unfinished search" question for Low - it has a real
+interior minimum near delay~1.4 within the range tested, not a monotonic
+trend still climbing toward +2.105. The low/high tradeoff from the
+previous entry is now well supported: Low's best point (~1.4) and High's
+best point so far (~2.0, right at the theoretical prediction) are
+different operating points, and **neither sideband's individually-best
+case gets remotely close to the off-state baseline** (-41.41/-34.17dB) -
+Low's best is still 8.1dB worse, High's best is still 6.0dB worse, picked
+independently and generously (not even simultaneously achievable at one
+delay). Significant: 2.00 is essentially the theoretically "correct" delay
+for this filter+equalizer and it still doesn't recover anywhere near
+baseline on either sideband - this is no longer well-explained by "hadn't
+reached the right delay," since the right delay (by the fit) has now been
+tested directly.
+
+**Follow-up, same day: sweep closed out.** Confirmed on the bench: past
+delay=2.00, Low 3rd, High 3rd, AND the higher-order products all get
+WORSE, not just one sideband trading against another. This resolves the
+last open thread above - there's no point further out worth chasing, the
+gdeq-alone delay sweep is now bracketed on both sides of a genuine
+interior optimum region (~1.4-2.0 samples), and even the best achievable
+point within that region for each sideband individually stays 6-8dB worse
+than off. **This is no longer explainable as an unfinished or mistuned
+delay search - the fit's own predicted +2.105 sample operating point has
+been tested directly (delay=2.00) and does not recover anywhere near
+baseline performance.**
+
+Re: the gdeq+`I` run (delay=3.00) beating gdeq-alone's best on both
+sidebands (-34.50/-29.97 vs -33.34/-28.18) - since pushing gdeq-alone's
+own delay toward 3.00 makes everything worse (confirmed above), that
+combined run's better numbers can't be "more delay helping." `'I'` must be
+doing something genuinely independent of gdeq there - plausibly not the
+purely-harmful factor it was assumed to be for 3rd-order IMD specifically,
+even though it's still a documented, real problem for OTHER symptoms (the
+`'p'` step-response ripple, the audibly-worse two-tone stability in
+`null_bias_investigation.md`). Those are different failure modes and don't
+have to move together - worth keeping `'I'`'s effect on 3rd-order IMD as
+its own separate open question rather than assuming it's uniformly bad.
+
+**Working conclusion, real-hardware-confirmed:** gdeq's IMD3 degradation on
+this filter is a genuine property of the equalizer itself, not a
+delay-tuning artifact - bracketed on both sides of its own predicted
+operating point and consistently 6-8dB worse than leaving it off, even at
+each sideband's individually-best delay. Combined with the three
+mechanisms discussed earlier (fit-window/wideband mismatch, the
+DC-operating-point dependence, and the smaller-than-first-estimated but
+real amplitude penalty above ~3kHz), the most likely explanation is that
+group-delay-only correction simply isn't addressing this filter's dominant
+real-world distortion mechanism - **recommendation stands and is now
+stronger: leave `env_gdeq_enable` off by default for
+`ENV_FILTER_PNP_BC327_ATTN`**, and don't invest further bench time
+re-tuning its delay for this filter revision.
+
+**Real (mic-path) audio, same day: gdeq's effect all but vanishes into a
+much bigger existing problem.** All the numbers above came from
+`AUDIO_SRC_TWOTONE` (digitally-generated, clean two-tone injected straight
+into the DSP chain, EQ/compressor bypassed). Repeating with `AUDIO_SRC_MIC`
+(real ADC front end, `eq_enable=true`, `compressor_enable=true`, ADC LPF
+in Chebyshev mode - i.e. the actual on-air signal path) gives a very
+different picture:
+
+| Run (mic path) | Low 3rd IMD | High 3rd IMD |
+|---|---|---|
+| Off (delay=0.98) | -30.16dB | -10.25dB |
+| gdeq alone (delay=1.48) | -29.27dB (-0.89dB) | -10.43dB (-0.18dB) |
+| gdeq+`I` (delay=2.88) | -29.56dB (-0.53dB) | -10.58dB (-0.33dB) |
+| Off, repeat (delay=0.93) | -30.02dB | -10.24dB |
+
+Repeatability is excellent (the two off-state runs agree to 0.14dB/0.01dB),
+so this is a clean measurement, and against that noise floor gdeq's real
+effect here is small - still consistently in the "worse" direction on Low
+(~0.5-0.9dB) as in every other test, but close to a rounding error on High
+(~0.2-0.3dB), nothing like the 6-10dB hit on the synthetic two-tone test.
+
+Far more significant: the ABSOLUTE levels. High 3rd IMD sits at only
+**-10.2 to -10.6dB across every mic-path run, gdeq on or off** - 24dB worse
+than the -34.17dB synthetic-two-tone-off baseline; Low 3rd is ~11dB worse
+too (-30dB vs -41dB). Since this preset adds `eq_enable`/`compressor_
+enable` (both off in every prior two-tone run) and switches the ADC LPF to
+Chebyshev, something in that real chain - the compressor is the leading
+suspect (a classic dominant IMD3 source), possibly compounded by the EQ or
+the Chebyshev ADC filter - is producing an IMD3 floor far worse than
+anything the envelope filter or its equalizer contributes. -10dB IMD3 is
+a genuinely poor number for SSB (normal targets are -30dB or better).
+
+**Net effect on the gdeq decision: unchanged (still leave it off - it
+never helped, costs nothing to disable), but it's now clearly not where
+the real audio-quality problem lives.** The compressor/EQ/ADC-chain
+IMD3 floor is a much bigger, separate issue worth chasing next - start by
+toggling `eq_enable`/`compressor_enable`/ADC LPF mode independently on
+`AUDIO_SRC_MIC` (same delay-tuned-per-config approach used throughout this
+sweep) to find which stage is actually responsible for the ~24dB gap.
+
+**Follow-up, same day: compressor and EQ both ruled out as the dominant
+cause.** `delay=0.98`, `gdeq`/`I` off throughout, ref levels matched to
+within ~1.3dB across all three runs (not a level-mismatch artifact):
+
+| Run | Low 3rd IMD | High 3rd IMD |
+|---|---|---|
+| Comp ON, EQ ON (17.3dB gain, baseline avg) | -30.09dB | -10.25dB |
+| Comp OFF, EQ ON (30.3dB gain) | -31.20dB (1.1dB better) | -10.83dB (0.6dB better) |
+| Comp OFF, EQ OFF (30.3dB gain) | -31.79dB (1.7dB better than baseline) | -9.88dB (0.4dB WORSE than baseline) |
+
+The compressor accounts for ~0.6-1.1dB - real, but tiny next to the ~24dB
+gap. EQ's effect is mixed and small: helps Low a little further but makes
+High slightly worse when removed (mildly protective there, if anything -
+the opposite of "EQ is a distortion source"). Both now ruled out as the
+dominant cause; High 3rd IMD stays pinned near -10dB regardless.
+
+**Leading remaining hypothesis: the injected two-tone stimulus itself**,
+upstream of everything this firmware controls (external generator/
+soundcard/cabling/mic preamp feeding the mic input) - if that source
+already carries ~-10 to -12dB IMD3 of its own, no internal DSP option can
+move a floor set before the ADC ever sees it. Direct check: spectrum-
+analyze the injected two-tone signal itself, or loop it back ahead of the
+mic preamp, before chasing more internal toggles. Remaining untested
+internal variable: `ADC_LPF_MODE_OFF` on `AUDIO_SRC_MIC` (every mic-path
+run so far has been Chebyshev) - worth one data point, but a weaker bet
+than the source-purity hypothesis given how little compressor/EQ moved
+things.
+
+- **The fit window doesn't cover what these tests excite.** The 100-4300Hz
+  grid was chosen for two-tone/IMD spectral relevance, but a step edge and
+  white noise both carry energy well outside it. Outside the fit window
+  the combined (analog + digital) delay curve was never constrained and
+  can diverge — plausibly exactly the lead-out ripple being seen. The
+  digital side's contribution is well-behaved on its own (a real,
+  non-oscillatory pole pair, `a1=a2=0.622515`, confirmed as a genuine
+  optimum, not degenerate), so this points at analog/digital delay
+  *mismatch above ~4.3kHz* rather than the digital fit misbehaving by
+  itself.
+- **An all-pass equalizer cannot touch the amplitude problem, and part of
+  the amplitude problem is real (though smaller than first estimated).**
+  Correcting for the new design's own ~2.5dB gate attenuator (a flat
+  offset, not a shape effect — see the table above), the genuine
+  frequency-dependent excess loss at the IMD3/IMD5 offsets is more like
+  ~0dB at 500Hz growing to ~1.4-2.4dB at 3100/4300Hz, not the 1.7-4.1dB
+  raw gap quoted earlier. Rounding/attenuating envelope content above
+  ~3kHz is still a plausible secondary distortion mechanism a delay-only
+  fix can't touch, but it's no longer the strongest leg of this
+  explanation — the delay-dispersion-outside-fit-window and DC-bias-point
+  mismatch factors below are doing more of the work.
+- **The fit is only exact at one DC bias point.** The equalizer's
+  coefficients were fit against the mid-DC analog TF; the DC-dependence
+  finding below shows the real filter's phase (and presumably amplitude)
+  shifts by 7-14% in crossing frequency across the duty range that real
+  audio actually sweeps through. A fixed narrowband fit at one bias point
+  can't track that, whereas by-ear `[`/`]` tuning implicitly compromises
+  across the whole swept range — which is a plausible reason hand-tuned
+  "off" can match or beat the "theoretically correct" fixed comp.
+- **Possible confound, not yet isolated: `envelope_interp.h`'s Catmull-Rom
+  stage (`'I'`) rounds off the exact same null transient, upstream of the
+  analog filter.** Its own v4.2 validation note already found a smooth
+  cubic can't represent a two-tone null's hard fold (a genuine derivative
+  discontinuity — `2A|cos(...)|` looks locally like a V there) and rounds
+  it instead, unlike the plain straight-line ramp it replaced, which
+  reproduces a V-shaped fold naturally. `envelope_interp_on_full_tick()`
+  is the last digital stage before the PWM write, i.e. immediately
+  upstream of this filter's own extra HF roll-off — so if `'I'` was
+  enabled during the two-tone/mic comp-on/off comparison above, the null
+  transient may already have been smoothed digitally before the analog
+  filter or the equalizer ever saw it, which would mask/confound the
+  filter-only question this Status section is trying to answer. `'I'` is
+  already separately parked in `null_bias_investigation.md` (2026-08-31)
+  as an unresolved, user-confirmed "audibly worse" regression — not
+  something to treat as a known-neutral background setting. Not yet
+  confirmed whether `'I'` was on or off during the tests behind this
+  Status entry. Recommended: repeat the comp-on/comp-off two-tone/mic
+  comparison with `'I'` forced off, to get a clean read on the filter/gdeq
+  question in isolation from this still-open interpolation issue.
+
+None of these four are mutually exclusive; the honest read is that several
+are plausibly working against the equalizer at once for this filter, and
+the delay-flatness gain it does deliver in the fit band isn't large enough
+to outweigh them. **Current recommendation: leave `env_gdeq_enable` off by
+default for `ENV_FILTER_PNP_BC327_ATTN`** (already true — off is the
+compiled-in default in `envelope_gdeq.cpp`, unaffected by this finding)
+and don't spend further effort re-fitting the all-pass sections for this
+filter. If this filter's IMD is to be improved further, the insertion-loss
+table above says the amplitude penalty is the more promising thing to
+chase — either in the analog design itself (less loss in the 3-4.3kHz
+region) or with an actual IMD3/IMD5 spectrum-analyzer comparison (comp on
+vs. off, each re-tuned) to replace this by-ear read with numbers, rather
+than more delay-equalizer iteration. The coefficients and
+`ENV_FILTER_VARIANT` plumbing stay in the firmware since they're correct
+for what they do (narrowband delay flattening) and cost nothing while
+disabled — this is a "don't reach for this tool on this filter" finding,
+not a "the fit was wrong" finding.
+
+## Related: DC-operating-point dependence (envelope filter TF, not group delay)
+
+Separate from the group-delay/equalizer work above: real hardware testing
+with the sine-chirp test mode (`w`, see `ssb_mic_test_commands.md`) found
+that this analog filter's transfer function itself shifts with the
+envelope's DC operating point (duty-range offset/scale, not master gain,
+which only scales swing around a fixed mean) — the -90° phase-crossing
+frequency moved from 2626Hz (low DC) to 2441Hz (high DC), a -7.1% shift,
+growing to -14% by the -180° crossing (6899Hz -> 5930Hz). Confirmed as a
+real, monotonic, hardware-measured effect, not noise. Not yet incorporated
+into the equalizer fit above (which assumes one fixed analog TF) — the
+group-delay equalizer's own coefficients would, in principle, need to vary
+with DC operating point too if this turns out to matter enough to chase
+further. Parked here since it's the same underlying analog filter this
+whole document is about, even though it surfaced from the TF measurement
+work rather than the group-delay refit itself.

@@ -14,6 +14,12 @@
  * CURVE compute_ramp_value() evaluates changed - the time-accurate frac
  * derivation from v4.1 is untouched. See envelope_interp.h for the
  * simulation results and latency tradeoff behind this.
+ *
+ * v4.3: curve made runtime-switchable (linear vs. Catmull-Rom), for a
+ * direct A/B on real hardware - see envelope_interp.h's "v4.3" header note
+ * for the full rationale, including why this deliberately keeps v4.2's
+ * data window/timing identical for both curve choices rather than
+ * reverting "linear" mode to v4's original narrower one.
  */
 
 #include "envelope_interp.h"
@@ -57,6 +63,14 @@ static float   s_last_value   = 0.0f; // whatever was last submitted, enabled or
 static volatile bool s_enabled        = false;
 static volatile bool s_reseed_pending = false;
 
+// v4.3: which curve compute_ramp_value() evaluates - see envelope_interp.h's
+// "v4.3" header note. Plain volatile enum, same single-word cross-task-flag
+// convention as s_enabled above (set from loop()/Core 1 via
+// envelope_interp_set_curve(), read from dsp_task/Core 0 inside
+// compute_ramp_value()) - no lock needed for the same reason s_enabled
+// doesn't need one.
+static volatile envelope_interp_curve_t s_curve = ENVELOPE_INTERP_CURVE_CATMULL_ROM;
+
 // Time-based, not step-counted (see header comment for why): returns
 // where the ramp SHOULD be right now, based on actual elapsed time since
 // this tick group's true start, not on how many on_interp_tick() calls
@@ -81,28 +95,38 @@ static float IRAM_ATTR compute_ramp_value(void)
     } else if (frac > 1.0f) {
         frac = 1.0f;
     }
-    float frac2 = frac * frac;
-    float frac3 = frac2 * frac;
-    float h00 =  2.0f * frac3 - 3.0f * frac2 + 1.0f;
-    float h10 =         frac3 - 2.0f * frac2 + frac;
-    float h01 = -2.0f * frac3 + 3.0f * frac2;
-    float h11 =         frac3 -        frac2;
-    float value = h00 * s_p1 + h10 * s_m1 + h01 * s_p2 + h11 * s_m2;
+    // v4.3: curve is runtime-switchable - see envelope_interp.h's "v4.3"
+    // header note. Both branches evaluate over the SAME [s_p1,s_p2]
+    // segment (deliberate - see header note for why "linear" mode doesn't
+    // revert to v4's narrower/lower-latency window).
+    float value;
+    if (s_curve == ENVELOPE_INTERP_CURVE_LINEAR) {
+        value = s_p1 + frac * (s_p2 - s_p1);
+    } else {
+        float frac2 = frac * frac;
+        float frac3 = frac2 * frac;
+        float h00 =  2.0f * frac3 - 3.0f * frac2 + 1.0f;
+        float h10 =         frac3 - 2.0f * frac2 + frac;
+        float h01 = -2.0f * frac3 + 3.0f * frac2;
+        float h11 =         frac3 -        frac2;
+        value = h00 * s_p1 + h10 * s_m1 + h01 * s_p2 + h11 * s_m2;
+    }
 
-    // Unlike v4's straight line (which can never leave the [s_p1,s_p2]
-    // range), a cubic CAN over/undershoot slightly beyond its own
-    // endpoints on a sharp enough feature - confirmed with a synthetic
-    // worst-case dip (two duty-0 samples flanked by two much higher
-    // ones, close to what a two-tone envelope null looks like), even
-    // though neither real test signal this was validated against
-    // (two-tone, AM-test) triggered it. s_p1/s_p2 themselves are always
-    // in [0,1] (the .ino clamps envelope before ever calling
-    // envelope_interp_on_full_tick()), so this clamp only ever trims a
-    // genuine curve overshoot, never a legitimately out-of-range input -
-    // and it matters here specifically because envelope_output_write_pwm()
-    // casts straight to an unsigned duty with no clamp of its own: a
-    // negative excursion left unclamped would become a huge duty value
-    // via unsigned wraparound, not a small negative one.
+    // Unlike a straight line (which can never leave the [s_p1,s_p2]
+    // range - so this clamp is a no-op in LINEAR mode), the Catmull-Rom
+    // cubic CAN over/undershoot slightly beyond its own endpoints on a
+    // sharp enough feature - confirmed with a synthetic worst-case dip
+    // (two duty-0 samples flanked by two much higher ones, close to what
+    // a two-tone envelope null looks like), even though neither real test
+    // signal this was validated against (two-tone, AM-test) triggered it.
+    // s_p1/s_p2 themselves are always in [0,1] (the .ino clamps envelope
+    // before ever calling envelope_interp_on_full_tick()), so this clamp
+    // only ever trims a genuine curve overshoot, never a legitimately
+    // out-of-range input - and it matters here specifically because
+    // envelope_output_write_pwm() casts straight to an unsigned duty with
+    // no clamp of its own: a negative excursion left unclamped would
+    // become a huge duty value via unsigned wraparound, not a small
+    // negative one.
     if (value < 0.0f) {
         value = 0.0f;
     } else if (value > 1.0f) {
@@ -206,4 +230,21 @@ void envelope_interp_set_enabled(bool enable)
     }
 
     s_enabled = enable;
+}
+
+envelope_interp_curve_t envelope_interp_get_curve(void)
+{
+    return s_curve;
+}
+
+void envelope_interp_set_curve(envelope_interp_curve_t curve)
+{
+    // Plain store, deliberately no reseed/transient handling - see
+    // envelope_interp.h's "v4.3" header note. compute_ramp_value() reads
+    // s_curve fresh on every call (interp tick or full tick), so a switch
+    // takes effect on the very next write; the only visible effect
+    // mid-ramp is that the CURRENTLY-RENDERING segment's remaining samples
+    // switch shape (still landing on the same s_p1/s_p2 endpoints either
+    // way), not a discontinuity in the underlying state.
+    s_curve = curve;
 }

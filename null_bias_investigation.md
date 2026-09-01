@@ -8,6 +8,16 @@ audibly worse, not just subtly worse — see item 5 under "Open, un-actioned
 next steps" below. Treat that as higher priority than the null-bias fix
 itself when this is picked back up.**
 
+**Cross-reference, 2026-09-01:** the new PNP BC327+attn filter's group-delay
+equalizer testing (`group_delay_fit_notes.md`, "2026-09-01 refit" Status
+section) raised the same null-region-fidelity question from the other end —
+that filter's own HF roll-off can't be the whole story for the disappointing
+real-hardware IMD result, since `envelope_interp.h`'s Catmull-Rom stage
+(item 5 below) independently rounds off the exact same two-tone null fold,
+upstream of the analog filter. The two issues may be entangled in any
+comp-on/off data taken with `'I'` enabled — worth checking `'I'`'s state
+before trusting either investigation's real-hardware numbers in isolation.
+
 ## Symptom that started this
 
 Poor perceived audio quality on two-tone tests: pitch wandering ~10Hz on a

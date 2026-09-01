@@ -208,6 +208,28 @@
                                     // Mutually exclusive with TIMING_DEBUG_GPIO_CMD's use of this
                                     // same pin - see CMD_DEBUG_PIN_ENABLED above.
 
+// ---- Analog envelope/RSET reconstruction filter hardware variant ----
+// Selects which LTspice-fitted group-delay-equalizer coefficient set
+// envelope_gdeq.h uses: ENV_FILTER_BC337 is the original 2-pole Sallen-Key
+// + BC337 NPN buffer design (SallenKey_LP_filter_BC337.txt);
+// ENV_FILTER_PNP_BC327_ATTN is the replacement PNP BC327 RSET driver +
+// gate attenuator now under test (SallenKey_LP_filter_PNP_BC327__RSET_
+// Driver__Gate_Attn.txt) - measurably slower (~25-30us more group delay
+// through the audio band) and lossier (~2-7dB more insertion loss,
+// growing with frequency) than the BC337 design; see
+// group_delay_fit_notes.md's 2026-09-01 refit entry for the full
+// comparison, including the still-open question of whether that extra
+// high-frequency loss hurts IMD3/IMD5 performance in a way the group-delay
+// equalizer alone can't fix (it's all-pass - unity magnitude by
+// construction, so it flattens delay only, never touches amplitude).
+// envelope_gdeq.h #error's out for any unrecognized value here, same
+// defense as SAMPLE_RATE_HZ's own #error just below - silently running
+// one filter's fit against the other filter's real hardware would be a
+// subtle dispersion/IMD regression, not a crash.
+#define ENV_FILTER_BC337            0
+#define ENV_FILTER_PNP_BC327_ATTN   1
+#define ENV_FILTER_VARIANT   ENV_FILTER_PNP_BC327_ATTN
+
 #define SAMPLE_RATE_HZ     16000u  // was 9600 (see below), then 10000 for a long stretch, now
                                     // raised to 16000 once the AD9851 write path (bit-bang +
                                     // fast register writes, see AD9851.c) freed up enough
@@ -224,8 +246,9 @@
                                     //
                                     // IMPORTANT: SAMPLE_RATE_HZ isn't just this #define - see
                                     // envelope_gdeq.h's ENV_GDEQ_A1/A2 (fitted separately per
-                                    // Fs, #error's out at compile time for any value other than
-                                    // 10000/16000), settings.h's relative_delay_samples presets
+                                    // Fs AND per ENV_FILTER_VARIANT above, #error's out at
+                                    // compile time for any unfitted combination), settings.h's
+                                    // relative_delay_samples presets
                                     // (rescaled by the Fs ratio when this last changed, but only
                                     // an approximation - see that file's header note), and
                                     // dsp_task's dc_alpha (now derived from DC_BLOCK_TIME_CONSTANT_S

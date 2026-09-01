@@ -5,16 +5,23 @@
  *
  * ---- Envelope-path group-delay equalizer ----
  * Two cascaded first-order digital all-pass sections (ssb_allpass1_t, see
- * ssb_dsp.h) that flatten the ORIGINAL (non-Bessel) 2-pole Sallen-Key RSET
+ * ssb_dsp.h) that flatten the non-Bessel 2-pole Sallen-Key RSET
  * reconstruction filter's group-delay dispersion across the voice/two-tone
  * band - the point being to let that filter's better stopband rejection
  * (vs. the Bessel redesign adopted earlier specifically to fix dispersion,
  * see project history) be used WITHOUT paying the harmonic-dispersion IMD
  * penalty that motivated switching to Bessel in the first place. If this
  * works out on real hardware, it replaces the Bessel filter's tradeoff
- * with "good rejection AND flat phase simultaneously" instead of picking one.
+ * with "good rejection AND flat phase simultaneously" instead of picking
+ * one. Now covers TWO Sallen-Key hardware variants (ENV_FILTER_VARIANT,
+ * config.h) with independently-fitted coefficients: the original BC337
+ * NPN buffer design, and the newer PNP BC327 + gate-attenuator design -
+ * see the 2026-09-01 entry further down for that second fit and how it
+ * compares.
  *
- * Coefficients fitted numerically against SallenKey_LP_filter_BC337.txt -
+ * Coefficients fitted numerically against SallenKey_LP_filter_BC337.txt
+ * (BC337 variant) or SallenKey_LP_filter_PNP_BC327__RSET_Driver__Gate_
+ * Attn.txt (PNP_BC327_ATTN variant) -
  * a real LTspice AC sweep of the ACTUAL circuit including the BC337 buffer
  * stage's own loading/parasitics, not an idealized 2-pole formula (an
  * idealized model can't capture the transistor stage's contribution to the
@@ -58,21 +65,59 @@
  *     fit's ~265us, a genuine ~102us difference from the coefficients
  *     themselves, independent of anything to do with sample count
  *     scaling - see settings.h's relative_delay_samples header note.
- * NOT YET VALIDATED ON REAL HARDWARE at either Fs - this is a
- * numerically-fitted prediction against a simulated filter response, the
- * same status the Bessel filter's LTspice design had before real hardware
- * confirmed it.
+ * NOT YET VALIDATED ON REAL HARDWARE at either Fs, for the BC337 filter -
+ * this is a numerically-fitted prediction against a simulated filter
+ * response, the same status the Bessel filter's LTspice design had before
+ * real hardware confirmed it.
  *
- * IMPORTANT SIDE EFFECT: an all-pass filter can only ADD delay, never
- * subtract it - flattening this curve pushes the envelope path's OVERALL
- * delay up (see the per-Fs mean-added-delay figures above), not just its
- * dispersion. The phase/envelope relative-delay line (see relative_delay.h,
- * '['/']') will need to be RE-TUNED once this is enabled: the theoretical
- * starting point is roughly the mean added delay above, in samples at
- * whichever Fs is active (positive = hold phase back, matching the sign
- * convention documented at relative_delay.h), a completely different
- * regime from the old best-known -0.20 to -0.25 samples found for the
- * Bessel filter - not a small tweak from that value.
+ * ---- 2026-09-01: PNP BC327 + gate-attenuator filter (ENV_FILTER_
+ * PNP_BC327_ATTN) refit ---- New RSET driver topology, still Fs=16000 only
+ * so far. Same method as above, applied to SallenKey_LP_filter_PNP_BC327__
+ * RSET_Driver__Gate_Attn.txt - see group_delay_fit_notes.md's matching
+ * entry for the full comparison against the BC337 filter. Headline
+ * numbers: this filter's ANALOG response alone is both slower (93.4us mean
+ * delay vs. BC337's 68.8us, +24.6us) and less flat (41.1us peak-to-peak
+ * over 100-4300Hz vs. 29.8us) - a harder starting point for the equalizer
+ * to work with. Two sections, a1=a2=0.622515 (grid-search-confirmed global
+ * optimum, not a stuck/degenerate fit - see the #elif above): 41.1us ->
+ * 13.7us peak-to-peak, actually slightly BETTER than the BC337 filter's
+ * own 16000Hz fit (14.7us) despite the harder analog starting point. Mean
+ * added delay: ~131.6us (2.105 samples @ 16000Hz) - LESS than the BC337
+ * filter's 163us/2.611 samples, because a1=a2 here happens to need less
+ * cumulative delay to flatten this particular dispersion shape.
+ *
+ * IMPORTANT, separate from the delay/dispersion result above: this filter
+ * also has substantially more INSERTION LOSS than the BC337 filter,
+ * growing with frequency (~1.7dB more at 500Hz, ~4.1dB more at 4300Hz,
+ * ~6.9dB more at 8000Hz - roughly half the amplitude of the BC337 filter's
+ * response by 8kHz). An all-pass equalizer is unity-magnitude BY
+ * DEFINITION, so nothing above corrects any of this - the extra loss is
+ * present regardless of how well delay gets flattened. Open question, not
+ * yet resolved either way: whether that extra high-frequency loss
+ * (attenuating exactly the range where an envelope null's fast transient
+ * has its content, and where MAX_FREQ_DEV_HZ's up-to-8000Hz excursions
+ * happen at the same instant) makes real IMD3/IMD5 performance worse
+ * despite the improved delay flatness. See group_delay_fit_notes.md for
+ * the reasoning and the suggested verification (a real two-tone IMD3/IMD5
+ * spectrum comparison, BC337 vs. this filter, each with its own properly-
+ * retuned delay) - not run yet.
+ *
+ * NOT YET VALIDATED ON REAL HARDWARE - same caveat as the BC337 fit above.
+ *
+ * IMPORTANT SIDE EFFECT (both filters): an all-pass filter can only ADD
+ * delay, never subtract it - flattening this curve pushes the envelope
+ * path's OVERALL delay up (see the per-filter, per-Fs mean-added-delay
+ * figures above), not just its dispersion. The phase/envelope
+ * relative-delay line (see relative_delay.h, '['/']') will need to be
+ * RE-TUNED once this is enabled, and AGAIN if ENV_FILTER_VARIANT is ever
+ * switched (the two filters' theoretical starting points differ by
+ * roughly half a sample - 2.611 for BC337, 2.105 for PNP_BC327_ATTN, both
+ * @ 16000Hz): the theoretical starting point is roughly the mean added
+ * delay above for whichever filter/Fs combination is active (positive =
+ * hold phase back, matching the sign convention documented at
+ * relative_delay.h) - a completely different regime from the old
+ * best-known -0.20 to -0.25 samples found for the Bessel filter, not a
+ * small tweak from that value, for EITHER Sallen-Key variant.
  *
  * Applied unconditionally to `envelope` regardless of audio source (see
  * dsp_task in the .ino) - including ENVSTEP and AMTEST - so those
@@ -91,21 +136,40 @@
 #include "config.h"
 #include "ssb_dsp.h"
 
-// Selected at compile time by SAMPLE_RATE_HZ (config.h) - see the fitting
-// results in the header comment above for why these AREN'T simply rescaled
-// from one Fs to the other the way a time-domain delay would be. The
-// #error is deliberate: silently running with the wrong Fs's coefficients
+// Selected at compile time by SAMPLE_RATE_HZ AND ENV_FILTER_VARIANT
+// (config.h) - see the fitting results in the header comment above for why
+// these AREN'T simply rescaled from one Fs (or one analog filter) to
+// another the way a time-domain delay would be. The #error is deliberate:
+// silently running with the wrong Fs/filter combination's coefficients
 // would be a subtle, hard-to-notice IMD/dispersion regression, not a
 // crash - same failure class this project has repeatedly flagged for
 // AD9851 bit-order mistakes. Add a new #elif (and a matching fit, see
-// group_delay_fit_notes.md) rather than guessing if SAMPLE_RATE_HZ ever
-// changes again.
+// group_delay_fit_notes.md) rather than guessing if SAMPLE_RATE_HZ or the
+// analog filter ever changes again.
 #if SAMPLE_RATE_HZ == 16000
-#define ENV_GDEQ_A1  -0.023900f
-#define ENV_GDEQ_A2   0.447131f
+  #if ENV_FILTER_VARIANT == ENV_FILTER_BC337
+    #define ENV_GDEQ_A1  -0.023900f
+    #define ENV_GDEQ_A2   0.447131f
+  #elif ENV_FILTER_VARIANT == ENV_FILTER_PNP_BC327_ATTN
+    // Fitted 2026-09-01 against SallenKey_LP_filter_PNP_BC327__RSET_
+    // Driver__Gate_Attn.txt - see group_delay_fit_notes.md's matching
+    // refit entry. Grid-search cross-checked (not just Nelder-Mead from
+    // one start) - a1==a2 is a genuine optimum for this filter's phase
+    // shape, not a degenerate/stuck fit: two IDENTICAL cascaded sections
+    // happen to flatten this filter's dispersion better than any
+    // opposite-sign pair does.
+    #define ENV_GDEQ_A1   0.622515f
+    #define ENV_GDEQ_A2   0.622515f
+  #else
+    #error "ENV_GDEQ_A1/A2 have only been fitted for ENV_FILTER_BC337 or ENV_FILTER_PNP_BC327_ATTN at SAMPLE_RATE_HZ=16000 - see group_delay_fit_notes.md for the fitting method to add another"
+  #endif
 #elif SAMPLE_RATE_HZ == 10000
-#define ENV_GDEQ_A1   0.194594f
-#define ENV_GDEQ_A2  -0.136698f
+  #if ENV_FILTER_VARIANT == ENV_FILTER_BC337
+    #define ENV_GDEQ_A1   0.194594f
+    #define ENV_GDEQ_A2  -0.136698f
+  #else
+    #error "ENV_FILTER_PNP_BC327_ATTN has not been fitted at SAMPLE_RATE_HZ=10000 - see group_delay_fit_notes.md for the fitting method"
+  #endif
 #else
 #error "ENV_GDEQ_A1/A2 have only been fitted for SAMPLE_RATE_HZ = 10000 or 16000 - see group_delay_fit_notes.md for the fitting method to add another"
 #endif
