@@ -286,26 +286,51 @@ static void IRAM_ATTR dsp_task(void* arg)
         // rest of this loop uses. A 20kHz chirp needs more than
         // SAMPLE_RATE_HZ's own 8kHz Nyquist, so this mode can't reuse the
         // normal 16kHz full-tick pipeline the way ENVSTEP/FMTEST/AMTEST
-        // do - it bypasses that ENTIRE pipeline (ADC, ssb_dsp_process_
-        // sample, envelope_floor/gdeq/predistort, relative_delay, AD9851,
-        // normal diagnostics), writing straight to the PWM output and the
-        // reference GPIO instead. Raw register writes for the reference
-        // pin (GPIO.out_w1ts/w1tc), not digitalWrite - this runs at 64kHz,
-        // same real-time-sensitivity reasoning as on_timer_alarm()'s own
-        // ISR-context register writes (see config.h's TIMING_DEBUG_GPIO_ISR
-        // comment), even though this call site is task, not ISR, context.
+        // do - it bypasses ADC/ssb_dsp_process_sample/envelope_floor/gdeq/
+        // relative_delay/AD9851/normal diagnostics, writing (almost)
+        // straight to the PWM output and the reference GPIO instead. Raw
+        // register writes for the reference pin (GPIO.out_w1ts/w1tc), not
+        // digitalWrite - this runs at 64kHz, same real-time-sensitivity
+        // reasoning as on_timer_alarm()'s own ISR-context register writes
+        // (see config.h's TIMING_DEBUG_GPIO_ISR comment), even though this
+        // call site is task, not ISR, context.
+        //
+        // "Almost" straight to the PWM output: the offset/scale (or
+        // predistort) DC mapping is deliberately NOT skipped - see the
+        // comment right before that call below for why, and 'u'/'j'/'i'/
+        // 'k'/'D' in serial_commands.cpp for the knobs it wires in.
         if (dsp_state_get_audio_source() == AUDIO_SRC_CHIRP) {
             float chirp_envelope;
             bool ref_high;
             test_signals_generate_chirp(dsp_state_get_master_gain_linear(), &chirp_envelope, &ref_high);
-            // This mode bypasses the normal full-tick pipeline entirely
-            // (see above), which is where every other source's envelope
-            // normally gets clamped to [0,1] before reaching
-            // envelope_output_write_pwm() - clamp explicitly here too,
-            // same bounds, same reasoning as AMTEST's own "above 0dB the
-            // swing can push peaks past 1.0" note (test_signals.cpp): at
-            // high master gain this flattens the sine's peaks rather than
-            // wrapping the raw LEDC duty register.
+
+            // Apply the SAME offset/scale (or predistort) DC mapping every
+            // other source gets from the normal full-tick pipeline below -
+            // deliberately NOT skipped here, unlike envelope_floor/gdeq
+            // (see this block's own top comment for why those specific two
+            // stay skipped). Master gain ('+'/'-', already passed into
+            // test_signals_generate_chirp() above) only scales the SWING
+            // around AM_TEST_DEPTH's fixed mean (same convention as
+            // AMTEST) - it moves how HARD the filter is driven, not WHERE
+            // on the duty range it's centered, so it can't reveal a
+            // duty-range-dependent (DC-operating-point-dependent)
+            // nonlinearity in the analog filter/BS170 gate stage. 'u'/'j'
+            // (offset) and 'i'/'k' (scale) directly move that operating
+            // point - exactly the knob needed to test the TF across
+            // different parts of the duty range - so wiring them in here
+            // is what actually answers that question, not more gain.
+            if (envelope_predistort_get_enabled()) {
+                chirp_envelope = envelope_predistort_process(chirp_envelope);
+            } else {
+                chirp_envelope = chirp_envelope * envelope_output_get_pwm_scale() + envelope_output_get_pwm_offset();
+            }
+            // Final safety clamp - same bounds/reasoning as the normal
+            // pipeline's own clamp right before its envelope_output_write_
+            // pwm() call: an offset/scale combination (or, at high master
+            // gain, AMTEST's own "swing can push peaks past 1.0" case,
+            // still possible pre-mapping above) can push this outside
+            // [0,1] - flatten it here rather than wrapping the raw LEDC
+            // duty register.
             if (chirp_envelope < 0.0f) chirp_envelope = 0.0f;
             if (chirp_envelope > 1.0f) chirp_envelope = 1.0f;
             envelope_output_write_pwm(chirp_envelope);
@@ -711,7 +736,9 @@ void setup()
     Serial.printf("Send 'w' for the sine-chirp test mode (%.0fHz-%.0fHz log sweep over %.1fs, %.0fms mute/"
                   "sync marker at each restart, square-wave reference on pin%d) - characterizes the "
                   "envelope/PWM (RSET) analog filter's transfer function against an external ADC-based "
-                  "measurement rig.\r\n",
+                  "measurement rig. 'u'/'j'/'i'/'k'/'D' still move the sweep's DC operating point on the "
+                  "duty range (use these to test the filter across the range, NOT master gain, which "
+                  "only scales swing depth around a fixed mean).\r\n",
                   CHIRP_F0_HZ, CHIRP_F1_HZ, CHIRP_SWEEP_SEC, CHIRP_MUTE_SEC * 1000.0f, CHIRP_REF_GPIO);
     Serial.printf("Send 'T' to step the two-tone pair through a spread of bands (currently f1=%.0fHz f2=%.0fHz) - "
                   "for mapping envelope/phase delay mismatch vs. frequency without a recompile per band.\r\n",

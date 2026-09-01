@@ -51,16 +51,20 @@ typedef enum {
                                 // CHIRP_* constants) direct to the envelope/PWM (RSET) output, plus a
                                 // synced square-wave reference on CHIRP_REF_GPIO (pin13) - for
                                 // characterizing the analog reconstruction filter's transfer function
-                                // against an external ADC-based TF measurement rig. Bypasses the
-                                // ENTIRE normal per-tick pipeline (ssb_dsp_process_sample,
-                                // envelope_floor/gdeq/predistort, relative_delay, AD9851, normal
-                                // diagnostics), not just ssb_dsp_process_sample() the way
-                                // ENVSTEP/FMTEST/AMTEST do - it runs on EVERY fast tick (64kHz), not
-                                // just full ticks (16kHz), since a 20kHz chirp needs more than
-                                // SAMPLE_RATE_HZ's own 8kHz Nyquist. Appended at the END of this enum
-                                // (value 6) rather than inserted near AMTEST above, so no existing
-                                // settingsPresets[] entry (which reference these by name, not by
-                                // value) is disturbed.
+                                // against an external ADC-based TF measurement rig. Bypasses
+                                // ssb_dsp_process_sample/envelope_floor/gdeq/relative_delay/AD9851/
+                                // normal diagnostics - more than just ssb_dsp_process_sample() the
+                                // way ENVSTEP/FMTEST/AMTEST do - and runs on EVERY fast tick (64kHz),
+                                // not just full ticks (16kHz), since a 20kHz chirp needs more than
+                                // SAMPLE_RATE_HZ's own 8kHz Nyquist. The offset/scale ('u'/'j'/'i'/'k')
+                                // or predistort ('D') DC mapping is deliberately NOT bypassed, though -
+                                // unlike master gain (which only scales the swing around a fixed mean,
+                                // same as AMTEST), those knobs move WHERE on the duty range the sweep
+                                // is centered, which is what's needed to test the analog filter/BS170
+                                // gate for duty-range-dependent nonlinearity - see the .ino's dsp_task
+                                // chirp block. Appended at the END of this enum (value 6) rather than
+                                // inserted near AMTEST above, so no existing settingsPresets[] entry
+                                // (which reference these by name, not by value) is disturbed.
 } audio_source_t;
 
 

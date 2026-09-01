@@ -172,8 +172,9 @@ void handle_serial_commands(void)
             dsp_state_set_audio_source(AUDIO_SRC_CHIRP);
             serial_reply("-> sine chirp test (%.0fHz-%.0fHz log sweep, %.1fs, %.0fms mute/sync marker "
                           "at each restart, square-wave ref on pin%d - characterizes the envelope/PWM "
-                          "filter's TF; runs at the full %dx fast-tick rate, bypasses the entire normal "
-                          "pipeline)\r\n",
+                          "filter's TF; runs at the full %dx fast-tick rate, bypasses the normal pipeline "
+                          "EXCEPT the 'u'/'j'/'i'/'k'/'D' DC mapping, which still applies - use those, "
+                          "not gain, to move the sweep's operating point on the duty range)\r\n",
                           CHIRP_F0_HZ, CHIRP_F1_HZ, CHIRP_SWEEP_SEC, CHIRP_MUTE_SEC * 1000.0f,
                           CHIRP_REF_GPIO, ENVELOPE_INTERP_FACTOR);
         } else if (c == 'T') {
