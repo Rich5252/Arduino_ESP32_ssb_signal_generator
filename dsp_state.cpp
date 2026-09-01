@@ -64,6 +64,7 @@ const char *audio_source_name(int src)
         case AUDIO_SRC_ENVSTEP:    return "ENVELOPE STEP TEST";
         case AUDIO_SRC_FMTEST:     return "FM TEST (AD9851 isolation)";
         case AUDIO_SRC_AMTEST:     return "AM TEST (RSET isolation)";
+        case AUDIO_SRC_CHIRP:      return "CHIRP TEST (envelope/PWM filter TF)";
         default:                   return "mic";
     }
 }

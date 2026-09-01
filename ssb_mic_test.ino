@@ -279,6 +279,46 @@ static void IRAM_ATTR dsp_task(void* arg)
             last_full_group = fast_tick_group;
         }
 
+        // Sine-chirp test mode ('w', AUDIO_SRC_CHIRP) - intercepted here,
+        // BEFORE the is_full_tick check below, so it runs on EVERY fast
+        // tick (the full ENVELOPE_INTERP_FACTOR x SAMPLE_RATE_HZ = 64kHz
+        // rate), not just the 1-in-ENVELOPE_INTERP_FACTOR full ticks the
+        // rest of this loop uses. A 20kHz chirp needs more than
+        // SAMPLE_RATE_HZ's own 8kHz Nyquist, so this mode can't reuse the
+        // normal 16kHz full-tick pipeline the way ENVSTEP/FMTEST/AMTEST
+        // do - it bypasses that ENTIRE pipeline (ADC, ssb_dsp_process_
+        // sample, envelope_floor/gdeq/predistort, relative_delay, AD9851,
+        // normal diagnostics), writing straight to the PWM output and the
+        // reference GPIO instead. Raw register writes for the reference
+        // pin (GPIO.out_w1ts/w1tc), not digitalWrite - this runs at 64kHz,
+        // same real-time-sensitivity reasoning as on_timer_alarm()'s own
+        // ISR-context register writes (see config.h's TIMING_DEBUG_GPIO_ISR
+        // comment), even though this call site is task, not ISR, context.
+        if (dsp_state_get_audio_source() == AUDIO_SRC_CHIRP) {
+            float chirp_envelope;
+            bool ref_high;
+            test_signals_generate_chirp(dsp_state_get_master_gain_linear(), &chirp_envelope, &ref_high);
+            // This mode bypasses the normal full-tick pipeline entirely
+            // (see above), which is where every other source's envelope
+            // normally gets clamped to [0,1] before reaching
+            // envelope_output_write_pwm() - clamp explicitly here too,
+            // same bounds, same reasoning as AMTEST's own "above 0dB the
+            // swing can push peaks past 1.0" note (test_signals.cpp): at
+            // high master gain this flattens the sine's peaks rather than
+            // wrapping the raw LEDC duty register.
+            if (chirp_envelope < 0.0f) chirp_envelope = 0.0f;
+            if (chirp_envelope > 1.0f) chirp_envelope = 1.0f;
+            envelope_output_write_pwm(chirp_envelope);
+#if !CMD_DEBUG_PIN_ENABLED
+            if (ref_high) {
+                GPIO.out_w1ts = (1UL << CHIRP_REF_GPIO);
+            } else {
+                GPIO.out_w1tc = (1UL << CHIRP_REF_GPIO);
+            }
+#endif
+            continue;
+        }
+
         if (!is_full_tick) {
             // Cheap path: no ADC read, no DSP compute, no AD9851/DAC/
             // diagnostics work - just one more step of envelope_interp's
@@ -668,6 +708,11 @@ void setup()
              MCP4725_I2C_ADDR,
              PWM_COMPARISON_ENABLED ? "on" : "off");
     Serial.println("Send 't' for two-tone test signal, 's' for single-tone test signal, 'm' for live mic input, 'p' for envelope step test, 'y' for FM isolation test, 'h' for AM isolation test, 'f' to cycle the ADC LPF off/Butterworth/Chebyshev, 'r' to reset diagnostics, 'v' to mute periodic diagnostics, 'n' to cycle the null_bias diagnostic's envelope threshold (see '[dsp] null_bias' line).");
+    Serial.printf("Send 'w' for the sine-chirp test mode (%.0fHz-%.0fHz log sweep over %.1fs, %.0fms mute/"
+                  "sync marker at each restart, square-wave reference on pin%d) - characterizes the "
+                  "envelope/PWM (RSET) analog filter's transfer function against an external ADC-based "
+                  "measurement rig.\r\n",
+                  CHIRP_F0_HZ, CHIRP_F1_HZ, CHIRP_SWEEP_SEC, CHIRP_MUTE_SEC * 1000.0f, CHIRP_REF_GPIO);
     Serial.printf("Send 'T' to step the two-tone pair through a spread of bands (currently f1=%.0fHz f2=%.0fHz) - "
                   "for mapping envelope/phase delay mismatch vs. frequency without a recompile per band.\r\n",
                   test_signals_get_twotone_f1_hz(), test_signals_get_twotone_f2_hz());
@@ -747,15 +792,19 @@ void loop()
     // accumulators via one combined recorder call at the end - see
     // diagnostics_record_core1_loop_timings()'s header comment.
     int64_t t_cmd0 = esp_timer_get_time();
-#if TIMING_DEBUG_ENABLED
+#if TIMING_DEBUG_ENABLED && CMD_DEBUG_PIN_ENABLED
     // See config.h's TIMING_DEBUG_GPIO_CMD comment - marks the exact
     // window handle_serial_commands() is running, to scope alongside
     // pin5 and test the "serial activity delays/disrupts gptimer's
     // alarm ISR" theory directly, rather than relying on manual timing.
+    // Gated on CMD_DEBUG_PIN_ENABLED (config.h) - off by default now that
+    // this same physical pin (13) is the chirp test mode's square-wave
+    // reference output (CHIRP_REF_GPIO); the two must never toggle it at
+    // once. Flip CMD_DEBUG_PIN_ENABLED back to 1 to re-enable this marker.
     digitalWrite(TIMING_DEBUG_GPIO_CMD, HIGH);
 #endif
     handle_serial_commands();
-#if TIMING_DEBUG_ENABLED
+#if TIMING_DEBUG_ENABLED && CMD_DEBUG_PIN_ENABLED
     digitalWrite(TIMING_DEBUG_GPIO_CMD, LOW);
 #endif
     int64_t t_cmd1 = esp_timer_get_time();

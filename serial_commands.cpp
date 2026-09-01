@@ -109,6 +109,7 @@ static const char *audio_source_enum_name(audio_source_t src)
         case AUDIO_SRC_ENVSTEP:    return "AUDIO_SRC_ENVSTEP";
         case AUDIO_SRC_FMTEST:     return "AUDIO_SRC_FMTEST";
         case AUDIO_SRC_AMTEST:     return "AUDIO_SRC_AMTEST";
+        case AUDIO_SRC_CHIRP:      return "AUDIO_SRC_CHIRP";
         default:                   return "AUDIO_SRC_MIC";
     }
 }
@@ -157,6 +158,24 @@ void handle_serial_commands(void)
                           "expect ONLY fc+/-%.0fHz sideband pair, no FM content - "
                           "isolates RSET/PWM/filter path from AD9851/DSP)\r\n",
                           AM_TEST_MOD_HZ, AM_TEST_DEPTH * 200.0f, AM_TEST_MOD_HZ);
+        } else if (c == 'w' && src != AUDIO_SRC_CHIRP) {
+            // Sine-chirp test mode - see test_signals.h/config.h's CHIRP_*
+            // constants and the .ino's dsp_task early-intercept block.
+            // Resets the sweep's phase/elapsed-time state on every entry
+            // (same reset-on-transition convention as 'g'/'I' above) so
+            // 'w' always starts a clean sweep from t=0 (mute period
+            // first), never resuming mid-sweep from a previous session.
+            // NOTE: CMD_DEBUG_PIN_ENABLED (config.h) must be 0 for the
+            // chirp's square-wave reference on pin13 to be glitch-free -
+            // it shares that physical pin with TIMING_DEBUG_GPIO_CMD.
+            test_signals_chirp_reset();
+            dsp_state_set_audio_source(AUDIO_SRC_CHIRP);
+            serial_reply("-> sine chirp test (%.0fHz-%.0fHz log sweep, %.1fs, %.0fms mute/sync marker "
+                          "at each restart, square-wave ref on pin%d - characterizes the envelope/PWM "
+                          "filter's TF; runs at the full %dx fast-tick rate, bypasses the entire normal "
+                          "pipeline)\r\n",
+                          CHIRP_F0_HZ, CHIRP_F1_HZ, CHIRP_SWEEP_SEC, CHIRP_MUTE_SEC * 1000.0f,
+                          CHIRP_REF_GPIO, ENVELOPE_INTERP_FACTOR);
         } else if (c == 'T') {
             // Steps the two-tone pair through TWOTONE_BAND_PRESETS
             // (test_signals.cpp) - lets you sweep the pair across the

@@ -172,6 +172,42 @@
                                     // task context - digitalWrite is fine here, same as
                                     // TIMING_DEBUG_GPIO).
 
+// CMD_DEBUG_PIN_ENABLED gates the loop()-context toggle of
+// TIMING_DEBUG_GPIO_CMD above (same physical pin as TIMING_DEBUG_GPIO_ADC,
+// pin13) - set to 0 here for the same reason ADC_ISR_DEBUG_PIN_ENABLED is
+// 0 above: pin13 is being TEMPORARILY REPURPOSED again, this time as the
+// sine-chirp test mode's square-wave reference output (CHIRP_REF_GPIO
+// below) for the external ADC-based transfer-function measurement rig.
+// Two things (the serial-activity-correlation marker this flag normally
+// gates, and the chirp reference square wave) must never drive the same
+// physical pin at once, same mutual-exclusivity reasoning as
+// ADC_ISR_DEBUG_PIN_ENABLED. Flip back to 1 (and move CHIRP_REF_GPIO to
+// its own pin) if the serial-activity-correlation marker is needed again.
+#define CMD_DEBUG_PIN_ENABLED 0
+
+// ---- Sine-chirp test mode ('w', AUDIO_SRC_CHIRP) - characterizes the
+// analog envelope/PWM (RSET) reconstruction filter's transfer function
+// against the user's own 2-channel ADC-based TF measurement rig. Sweeps
+// logarithmically from CHIRP_F0_HZ to CHIRP_F1_HZ over CHIRP_SWEEP_SEC,
+// then repeats, with a brief CHIRP_MUTE_SEC silence at each restart as a
+// sync marker the measurement system can trigger on. Runs at the full
+// ENVELOPE_INTERP_FACTOR x SAMPLE_RATE_HZ fast-tick rate (see
+// envelope_interp.h), NOT the normal SAMPLE_RATE_HZ full-tick rate -
+// SAMPLE_RATE_HZ=16000's 8kHz Nyquist can't represent a 20kHz chirp, but
+// the fast-tick infrastructure already runs unconditionally at 64kHz
+// regardless of whether 'I' interpolation is toggled on, so no new timer
+// infrastructure is needed. CHIRP_F1_HZ=20kHz matches the user's stated
+// measurement range ("I can measure to about 20kHz").
+#define CHIRP_F0_HZ      20.0f
+#define CHIRP_F1_HZ   20000.0f
+#define CHIRP_SWEEP_SEC   5.0f
+#define CHIRP_MUTE_SEC    0.03f
+#define CHIRP_REF_GPIO  TIMING_DEBUG_GPIO_ADC   // pin13 - square-wave reference channel for the
+                                    // TF measurement rig, in sync with the chirp's own
+                                    // instantaneous frequency (see test_signals_generate_chirp()).
+                                    // Mutually exclusive with TIMING_DEBUG_GPIO_CMD's use of this
+                                    // same pin - see CMD_DEBUG_PIN_ENABLED above.
+
 #define SAMPLE_RATE_HZ     16000u  // was 9600 (see below), then 10000 for a long stretch, now
                                     // raised to 16000 once the AD9851 write path (bit-bang +
                                     // fast register writes, see AD9851.c) freed up enough

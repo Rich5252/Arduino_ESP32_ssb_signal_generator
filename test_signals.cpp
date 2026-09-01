@@ -5,10 +5,11 @@
 #include <math.h>
 #include "test_signals.h"
 #include "config.h"
+#include "envelope_interp.h"   // ENVELOPE_INTERP_FACTOR - the chirp's fast-tick rate
 
- // Always compiled in now (not gated on TWOTONE_TEST_MODE) since dsp_task
- // branches on the runtime audio-source selector and can switch to this at
- // any time via the 't' serial command.
+// Always compiled in now (not gated on TWOTONE_TEST_MODE) since dsp_task
+// branches on the runtime audio-source selector and can switch to this at
+// any time via the 't' serial command.
 static float s_tone1_phase = 0.0f;
 static float s_tone2_phase = 0.0f;
 
@@ -20,7 +21,7 @@ static float s_tone2_phase = 0.0f;
 static volatile float s_tone1_hz = TWOTONE_F1_HZ;
 static volatile float s_tone2_hz = TWOTONE_F2_HZ;
 
-typedef struct { const char* name; float f1_hz; float f2_hz; } twotone_band_t;
+typedef struct { const char *name; float f1_hz; float f2_hz; } twotone_band_t;
 
 // Spread across roughly the same ~100-4300Hz band envelope_gdeq was
 // originally fit against (see envelope_gdeq.h) - a single tone-pair only
@@ -68,7 +69,7 @@ float IRAM_ATTR generate_twotone_sample(void)
 {
     const float two_pi = 2.0f * (float)M_PI;
     float sample = TWOTONE_AMPLITUDE * sinf(s_tone1_phase) +
-        TWOTONE_AMPLITUDE * sinf(s_tone2_phase);
+                   TWOTONE_AMPLITUDE * sinf(s_tone2_phase);
     s_tone1_phase += two_pi * s_tone1_hz / (float)SAMPLE_RATE_HZ;
     s_tone2_phase += two_pi * s_tone2_hz / (float)SAMPLE_RATE_HZ;
     if (s_tone1_phase > two_pi) s_tone1_phase -= two_pi;
@@ -110,7 +111,7 @@ float IRAM_ATTR test_signals_generate_envstep(float master_gain_linear)
     return envelope;
 }
 
-void IRAM_ATTR test_signals_generate_fmtest(float* out_freq_dev_hz, float* out_envelope)
+void IRAM_ATTR test_signals_generate_fmtest(float *out_freq_dev_hz, float *out_envelope)
 {
     // Direct sinusoidal frequency modulation, ALSO bypassing
     // ssb_dsp_process_sample() entirely - the mirror-image isolation test
@@ -129,7 +130,7 @@ void IRAM_ATTR test_signals_generate_fmtest(float* out_freq_dev_hz, float* out_e
     *out_envelope = 1.0f;   // fixed, full-scale - no AM content, phase path only
 }
 
-void IRAM_ATTR test_signals_generate_amtest(float master_gain_linear, float* out_envelope, float* out_freq_dev_hz)
+void IRAM_ATTR test_signals_generate_amtest(float master_gain_linear, float *out_envelope, float *out_freq_dev_hz)
 {
     // Direct sinusoidal amplitude modulation, ALSO bypassing
     // ssb_dsp_process_sample() entirely - mirror image of FMTEST:
@@ -158,4 +159,77 @@ void IRAM_ATTR test_signals_generate_amtest(float master_gain_linear, float* out
     s_amtest_phase += two_pi * AM_TEST_MOD_HZ / (float)SAMPLE_RATE_HZ;
     if (s_amtest_phase > two_pi) s_amtest_phase -= two_pi;
     *out_freq_dev_hz = 0.0f;   // carrier held completely fixed - AM content only
+}
+
+// ---- Sine-chirp test mode ('w', AUDIO_SRC_CHIRP) - see test_signals.h. ----
+//
+// File-scope (not function-local) statics, unlike every generator above -
+// this one needs an explicit reset (test_signals_chirp_reset()) callable
+// from OUTSIDE this function (serial_commands.cpp's 'w' handler), so a
+// fresh entry into chirp mode always starts a clean sweep from t=0 rather
+// than resuming mid-sweep from a previous session.
+static float s_chirp_phase = 0.0f;        // envelope sine's own phase accumulator, radians
+static float s_chirp_elapsed_s = 0.0f;    // time within the current CHIRP_MUTE_SEC+CHIRP_SWEEP_SEC cycle
+
+void test_signals_chirp_reset(void)
+{
+    s_chirp_phase = 0.0f;
+    s_chirp_elapsed_s = 0.0f;
+}
+
+void IRAM_ATTR test_signals_generate_chirp(float master_gain_linear, float *out_envelope, bool *out_ref_high)
+{
+    // Runs at the FULL fast-tick rate (ENVELOPE_INTERP_FACTOR x
+    // SAMPLE_RATE_HZ = 64kHz, not the normal 16kHz full-tick rate) - see
+    // the .ino's dsp_task for the early-intercept call site that makes
+    // that true. Computed fresh here every call rather than cached, since
+    // it's cheap (one integer multiply) next to the sinf/powf below.
+    const float fs_fast = (float)SAMPLE_RATE_HZ * (float)ENVELOPE_INTERP_FACTOR;
+    const float two_pi = 2.0f * (float)M_PI;
+
+    if (s_chirp_elapsed_s < CHIRP_MUTE_SEC) {
+        // Brief silence at the start of every cycle - a clean, easy-to-
+        // trigger-on marker for the external measurement rig to detect
+        // "sweep restarting here" without needing any other sync signal.
+        // Reference square wave forced low too, so BOTH channels the rig
+        // reads show the same unambiguous marker.
+        *out_envelope = 0.0f;
+        *out_ref_high = false;
+        // Phase deliberately NOT advanced during mute - the sweep always
+        // begins its first post-mute sample at exactly phase=0, so every
+        // repeat of the sweep is bit-for-bit identical, same reasoning as
+        // why the null-bias investigation's test tones repeat identically
+        // (see null_bias_investigation.md) - here that's a feature, not a
+        // confound, since a repeatable stimulus is exactly what a transfer-
+        // function measurement wants.
+    } else {
+        float t_sweep = s_chirp_elapsed_s - CHIRP_MUTE_SEC;   // 0 at sweep start
+        if (t_sweep > CHIRP_SWEEP_SEC) t_sweep = CHIRP_SWEEP_SEC;   // clamp the last fractional tick before wrap
+
+        // Logarithmic (exponential) sweep: f(t) = f0 * (f1/f0)^(t/T) -
+        // instantaneous frequency, integrated into a phase accumulator
+        // per-sample rather than using the sweep's closed-form phase
+        // integral, since the per-sample instantaneous-frequency approach
+        // is simpler to get right and cheap enough at this rate (one powf
+        // per fast tick, ~64k/sec - negligible next to the DSP budget the
+        // full 16kHz pipeline already spends per tick).
+        float f_inst = CHIRP_F0_HZ * powf(CHIRP_F1_HZ / CHIRP_F0_HZ, t_sweep / CHIRP_SWEEP_SEC);
+
+        s_chirp_phase += two_pi * f_inst / fs_fast;
+        if (s_chirp_phase > two_pi) s_chirp_phase -= two_pi;
+
+        // Same AM_TEST_DEPTH convention test_signals_generate_amtest() uses:
+        // fixed mean (carrier amplitude) so '+'/'-' master gain scales only
+        // the swing, not the baseline - keeps depth and overall level as
+        // separate, independently-readable knobs on a scope/analyzer.
+        float s = sinf(s_chirp_phase);
+        *out_envelope = AM_TEST_DEPTH + AM_TEST_DEPTH * master_gain_linear * s;
+        *out_ref_high = (s >= 0.0f);
+    }
+
+    s_chirp_elapsed_s += 1.0f / fs_fast;
+    if (s_chirp_elapsed_s >= CHIRP_MUTE_SEC + CHIRP_SWEEP_SEC) {
+        s_chirp_elapsed_s = 0.0f;
+        s_chirp_phase = 0.0f;   // resync phase too, so every repeat sweep is identical (see above)
+    }
 }

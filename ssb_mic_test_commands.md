@@ -12,7 +12,18 @@ Send any of these single characters over the serial monitor (921600 baud). Each 
 | `p` | Envelope step test — 4Hz square wave direct to PWM, carrier held fixed. For measuring the analog reconstruction filter's step response with a scope, independent of everything else in the chain |
 | `y` | FM isolation test — pure sinusoidal frequency modulation (1200Hz mod, 3000Hz peak deviation), envelope held fixed, bypasses `ssb_dsp_process_sample()` entirely. Isolates the AD9851/SPI/delay-line chain from the Hilbert/DSP math |
 | `h` | AM isolation test — pure sinusoidal amplitude modulation (1200Hz mod, 100% depth), `freq_dev_hz` locked at 0, also bypasses `ssb_dsp_process_sample()`. Isolates the RSET/PWM/analog-filter/transistor path |
+| `w` | Sine-chirp test — logarithmic 20Hz–20kHz sweep over 5s direct to the envelope/PWM output, with a synced square-wave reference on pin13 and a 30ms mute/sync marker at each restart. See "Sine-chirp test mode" below |
 | `T` | Steps the two-tone pair through `TWOTONE_BAND_PRESETS` (`test_signals.cpp`), low to high center frequency: 300/500, 700/900, 1500/1700, 2500/2700, 3500/3700Hz (all 200Hz spacing, each a clean single-point probe), then the original 700/1900Hz pair (1200Hz spacing, kept last for reference — its wide spacing averages alignment across a much bigger span, so it's not directly comparable to the other five), wrapping around. Switches into two-tone mode too if not already there. For sweeping the pair across the audio band without a recompile, to empirically map how much relative-delay retuning each band needs — see the group-delay-equalizer band-mapping note below |
+
+### Sine-chirp test mode (`w`, `AUDIO_SRC_CHIRP`)
+
+Added to characterize the envelope/PWM (RSET) analog reconstruction filter's transfer function against a 2-channel ADC-based TF measurement rig, replacing the need to infer the filter's shape indirectly from two-tone/step-response artifacts.
+
+`w` starts a logarithmic sweep from `CHIRP_F0_HZ` (20Hz) to `CHIRP_F1_HZ` (20kHz) over `CHIRP_SWEEP_SEC` (5s), direct to the envelope/PWM output, repeating continuously. A `CHIRP_MUTE_SEC` (30ms) silence at the start of every repeat acts as a sync/restart marker the measurement rig can trigger on. A square-wave reference — high while the chirp's own instantaneous sine is ≥0, forced low during the mute period — is driven on `CHIRP_REF_GPIO` (pin13) for the rig's reference channel. All constants live in `config.h`.
+
+Unlike `p`/`y`/`h` (which bypass only `ssb_dsp_process_sample()` and still run on the normal `SAMPLE_RATE_HZ` (16kHz) full-tick pipeline), chirp mode bypasses the **entire** per-tick pipeline — ADC, DSP, `envelope_floor`/`gdeq`/predistort, relative delay, AD9851, normal diagnostics — and runs on **every** fast tick, i.e. the full `ENVELOPE_INTERP_FACTOR x SAMPLE_RATE_HZ` (64kHz) rate `envelope_interp.h`'s fast-tick timer already runs unconditionally at. This is required, not a convenience: 16kHz's own 8kHz Nyquist can't represent a 20kHz sweep.
+
+**pin13 conflict**: `CHIRP_REF_GPIO` reuses the same physical pin as `TIMING_DEBUG_GPIO_CMD` (the serial-activity-correlation marker toggled every `loop()` iteration — see `config.h`'s `TIMING_DEBUG_GPIO_CMD`/`ADC_ISR_DEBUG_PIN_ENABLED` history). `CMD_DEBUG_PIN_ENABLED` (config.h, default **0**) gates that marker off so chirp's reference square wave isn't corrupted by it; flip it back to 1 (and expect chirp's reference output to go dark) if that marker is needed again instead.
 
 ## Phase/envelope relative timing
 

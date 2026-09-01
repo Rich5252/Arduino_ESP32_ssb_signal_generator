@@ -47,6 +47,20 @@ typedef enum {
                                 // quantization, filter); any FM-looking sidebands appearing despite
                                 // freq_dev_hz never being nonzero would mean genuine AM-to-PM
                                 // crosstalk somewhere physical, a distinct and worth-knowing finding.
+    AUDIO_SRC_CHIRP = 6,        // logarithmic sine-chirp sweep (20Hz-20kHz by default, see config.h's
+                                // CHIRP_* constants) direct to the envelope/PWM (RSET) output, plus a
+                                // synced square-wave reference on CHIRP_REF_GPIO (pin13) - for
+                                // characterizing the analog reconstruction filter's transfer function
+                                // against an external ADC-based TF measurement rig. Bypasses the
+                                // ENTIRE normal per-tick pipeline (ssb_dsp_process_sample,
+                                // envelope_floor/gdeq/predistort, relative_delay, AD9851, normal
+                                // diagnostics), not just ssb_dsp_process_sample() the way
+                                // ENVSTEP/FMTEST/AMTEST do - it runs on EVERY fast tick (64kHz), not
+                                // just full ticks (16kHz), since a 20kHz chirp needs more than
+                                // SAMPLE_RATE_HZ's own 8kHz Nyquist. Appended at the END of this enum
+                                // (value 6) rather than inserted near AMTEST above, so no existing
+                                // settingsPresets[] entry (which reference these by name, not by
+                                // value) is disturbed.
 } audio_source_t;
 
 
@@ -130,27 +144,15 @@ static const PersistentSettings settingsPresets[10] =
 {
     // Preset 0 - Normal microphone operation
 
-    {"Micr latest 16kFs",    AUDIO_SRC_MIC, 2.48f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV, true, true, 33.0f, true, false, 0.00f,
-    SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, true },
-                                                    // relative_delay_samples
-                                                    // env_pwm_offset
-                                                    // env_pwm_scale
-                                                    // env_gdeq_enable
-                                                    // adc_lpf_mode
-                                                    // eq_enable
-                                                    // compressor_enable
-                                                    // master_gain_db
-                                                    // ad9851_output_enable
-                                                    // env_predistort_enable
-                                                    // env_floor
-                                                    // freq_dev_slew_limit_hz
-                                                    // envelope_interp_enable
-    
+    {"Micr latest 16kFs", AUDIO_SRC_MIC, 2.43f, 0.40f, 0.42f, true, ADC_LPF_MODE_CHEBYSHEV, true, true, 11.0f, true, true, 0.0f,               // env_floor
+        SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false  // freq_dev_slew_limit_hz, envelope_interp_enable
+    },
+
     // Preset 1 - Two-tone test
     {
     "TwoTone Base",
-    AUDIO_SRC_TWOTONE, 0.00f, 0.20f, 0.90f, false, ADC_LPF_MODE_OFF, false, false, -2.0f, true, false, 0.00f,
-    SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false },
+    AUDIO_SRC_TWOTONE, 0.0f, 0.36f, 0.48f, false, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f,
+    SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false},  // freq_dev_slew_limit_hz, envelope_interp_enable
 
     // Preset 2 - Single-tone test
     {
@@ -192,10 +194,10 @@ static const PersistentSettings settingsPresets[10] =
     { "AM-ButwGd", AUDIO_SRC_AMTEST, 2.96f, 0.08f, 0.84f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
 
     // Preset 5 -
-    { "V4 Microphone tuned", AUDIO_SRC_MIC, 3.48f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV, true, true, 21.3f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, true },  
+    { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.43f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV, false, false, 1.0f, true, true, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false},  // was 1.55f @ 10000Hz; adc_lpf_bypass=true
 
         // Preset 6 -
-    { "V4 Two tone tuned", AUDIO_SRC_TWOTONE, 2.15f, 0.20f, 0.90f, false, ADC_LPF_MODE_OFF, false, false, 0.6f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, true },  
+    { "TwoToneButwGD Env 1.6-2.9 DelayTuned", AUDIO_SRC_TWOTONE, 2.64f, 0.36f, 0.48f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false },  // was 1.65f @ 10000Hz; adc_lpf_bypass=true
         // Preset 7 -
     { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.96f, 0.40f, 0.46f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
         // Preset 8 -

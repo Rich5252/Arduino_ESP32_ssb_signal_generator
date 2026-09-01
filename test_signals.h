@@ -12,11 +12,12 @@
  */
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_attr.h"
 
- // Two-tone (700/1900Hz default) and single-tone (1000Hz default) sample
- // generators - selected via 't'/'s', consumed by ssb_dsp_process_sample()
- // exactly like a mic sample would be.
+// Two-tone (700/1900Hz default) and single-tone (1000Hz default) sample
+// generators - selected via 't'/'s', consumed by ssb_dsp_process_sample()
+// exactly like a mic sample would be.
 float IRAM_ATTR generate_twotone_sample(void);
 float IRAM_ATTR generate_singletone_sample(void);
 
@@ -51,11 +52,34 @@ float IRAM_ATTR test_signals_generate_envstep(float master_gain_linear);
 // FM isolation test ('y') - pure sinusoidal frequency modulation, envelope
 // held at a fixed full-scale constant, also bypassing
 // ssb_dsp_process_sample() entirely.
-void IRAM_ATTR test_signals_generate_fmtest(float* out_freq_dev_hz, float* out_envelope);
+void IRAM_ATTR test_signals_generate_fmtest(float *out_freq_dev_hz, float *out_envelope);
 
 // AM isolation test ('h') - pure sinusoidal amplitude modulation,
 // freq_dev_hz held at exactly 0, also bypassing ssb_dsp_process_sample()
 // entirely. master_gain_linear scales the SWING only (see the .cpp for
 // why the mean/carrier-amplitude term deliberately does not scale with
 // gain).
-void IRAM_ATTR test_signals_generate_amtest(float master_gain_linear, float* out_envelope, float* out_freq_dev_hz);
+void IRAM_ATTR test_signals_generate_amtest(float master_gain_linear, float *out_envelope, float *out_freq_dev_hz);
+
+// Sine-chirp test mode ('w', AUDIO_SRC_CHIRP) - logarithmic sweep from
+// CHIRP_F0_HZ to CHIRP_F1_HZ (config.h) direct to the envelope output,
+// plus a synced square-wave reference bit for CHIRP_REF_GPIO (pin13) - for
+// characterizing the analog envelope/PWM reconstruction filter's transfer
+// function against an external ADC-based measurement rig. Unlike
+// ENVSTEP/FMTEST/AMTEST above, this is called on EVERY fast tick (the full
+// ENVELOPE_INTERP_FACTOR x SAMPLE_RATE_HZ rate), not just full ticks - see
+// the .ino's dsp_task for the early-intercept call site. master_gain_linear
+// scales the swing only, matching AMTEST's own gain convention.
+// out_ref_high is the instantaneous sign of the chirp's own sine (true
+// while the sine is >= 0), forced false during the CHIRP_MUTE_SEC silence
+// at each sweep restart - the measurement rig can use it both as a phase
+// reference and as a restart/sync marker.
+void IRAM_ATTR test_signals_generate_chirp(float master_gain_linear, float *out_envelope, bool *out_ref_high);
+
+// Zeroes the chirp's phase/elapsed-time state so a fresh 'w' entry always
+// starts a clean sweep from t=0 (mute period first) rather than resuming
+// wherever a PREVIOUS chirp session left off - same reset-on-entry
+// convention as envelope_gdeq_set_enabled()/envelope_interp_set_enabled()
+// use for their own off->on transitions. Call once when switching INTO
+// AUDIO_SRC_CHIRP (see serial_commands.cpp's 'w' handler).
+void test_signals_chirp_reset(void);
