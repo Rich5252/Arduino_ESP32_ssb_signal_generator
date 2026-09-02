@@ -304,11 +304,12 @@
  * A/B), not a literal restoration of v4's original zero-look-ahead
  * implementation.
  *
- * Runtime toggle via 'C' (serial_commands.cpp) - cycles CATMULL_ROM <->
- * LINEAR, independent of 'I' itself (the enable/disable toggle); only
- * affects rendered output while 'I' is ON (envelope_interp_get_enabled()
- * true) - with 'I' off, on_full_tick() takes its early-return plain-ZOH
- * path regardless of curve selection. No reseed needed on a curve switch
+ * Runtime toggle via 'C' (serial_commands.cpp) - cycles CATMULL_ROM ->
+ * LINEAR -> HOLD -> CATMULL_ROM (v4.4 added the third state; see below),
+ * independent of 'I' itself (the enable/disable toggle); only affects
+ * rendered output while 'I' is ON (envelope_interp_get_enabled() true) -
+ * with 'I' off, on_full_tick() takes its early-return plain-ZOH path
+ * regardless of curve selection. No reseed needed on a curve switch
  * (unlike 'I' itself) - it only changes which formula reads the existing
  * s_p0..s_p3/s_m1/s_m2 state, not the state itself, so a mid-ramp switch
  * just changes the shape of the segment currently being rendered, not its
@@ -317,6 +318,41 @@
  * added after presets already existed - defaults to ENVELOPE_INTERP_CURVE_
  * CATMULL_ROM (=0) so every existing preset keeps today's live behavior
  * unless explicitly set otherwise.
+ *
+ * ---- v4.4: third curve, HOLD - isolates write RATE from ramp SHAPE ----
+ * User's own hypothesis, worth stating plainly because it's exactly right:
+ * 'I' on/off doesn't just add smoothing, it changes the EFFECTIVE PWM
+ * UPDATE RATE. With 'I' off, on_interp_tick() is a complete no-op (early
+ * return, no register write) - the LEDC duty register is only touched once
+ * per full tick, 16kHz. With 'I' on (either curve so far), it's touched
+ * ENVELOPE_INTERP_FACTOR (4) times as often, 64kHz. LINEAR-vs-CATMULL_ROM
+ * (v4.3) only ever compared two ways of filling that faster update rate
+ * with a RAMP - it never tested whether the faster rate itself, independent
+ * of any ramp, does anything (LEDC/driver-level timing effects from simply
+ * re-issuing ledc_set_duty()/ledc_update_duty() 4x more often, even with an
+ * UNCHANGED value each time).
+ *
+ * HOLD answers that: it writes each full tick's own envelope value,
+ * unchanged, on all ENVELOPE_INTERP_FACTOR (4) of that tick's writes - a
+ * genuine zero-order-hold at 64kHz instead of 16kHz, with NO ramp toward
+ * the next value at all. Unlike LINEAR/CATMULL_ROM, which both deliberately
+ * spend one full tick "arriving" at their target (the v4/v4.2 look-ahead
+ * latency cost - see above), HOLD adds NO extra latency: on_full_tick()
+ * writes the fresh value immediately (bypassing compute_ramp_value()'s
+ * [s_p1,s_p2] segment logic entirely for this curve - see
+ * envelope_interp.cpp), identical timing to 'I' off, just repeated 3 more
+ * times per period instead of left untouched. This makes the three curves
+ * a genuine 3-way decomposition of what "'I' on" actually changes:
+ *   - 'I' off:                     16kHz updates, whatever value, once each
+ *   - 'I' on, HOLD:                64kHz updates, SAME value 4x in a row
+ *   - 'I' on, LINEAR/CATMULL_ROM:  64kHz updates, ramping toward next value
+ * If HOLD measures/sounds the same as 'I' off, the update-rate variable is
+ * cleared and whatever 'I' does is really about the ramp. If HOLD measures/
+ * sounds different from 'I' off despite carrying byte-for-byte identical
+ * VALUES (just written more often), that points at something in the LEDC
+ * peripheral/driver's own behavior when re-triggered at 64kHz, independent
+ * of envelope content entirely - a real, different finding from anything
+ * this document has chased so far.
  */
 
 #include <stdbool.h>
@@ -335,9 +371,21 @@
 // that doesn't explicitly set envelope_interp_curve (relying on C's
 // zero-fill of trailing struct initializers) keeps today's actual live
 // behavior, not v4's older one.
+//
+// v4.4: added HOLD - plain zero-order-hold at the fast-tick (64kHz) rate,
+// writing each full tick's own value unchanged ENVELOPE_INTERP_FACTOR
+// times instead of ramping toward the next one. Isolates a DIFFERENT
+// question than LINEAR-vs-CATMULL_ROM does: does merely writing the LEDC
+// duty register 4x more often matter at all (LEDC/driver-level timing
+// effects), independent of any ramp shape - see the "v4.4" header note
+// above. Zero added latency, unlike the other two curves (which both
+// spend a tick arriving at their target) - HOLD writes the fresh value
+// immediately, same timing as 'I' off, just repeated at 64kHz instead of
+// written once at 16kHz.
 typedef enum {
     ENVELOPE_INTERP_CURVE_CATMULL_ROM = 0,  // v4.2 (current default) - smooth cubic Hermite
     ENVELOPE_INTERP_CURVE_LINEAR      = 1,  // v4's original straight-line ramp, for direct A/B
+    ENVELOPE_INTERP_CURVE_HOLD        = 2,  // v4.4 - plain 64kHz ZOH, no ramp, zero added latency
 } envelope_interp_curve_t;
 
 // Resets the ramp state. Call once from setup(), after envelope_output_

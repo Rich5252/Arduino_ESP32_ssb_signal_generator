@@ -269,19 +269,22 @@ void handle_serial_commands(void)
             serial_reply("-> %dx envelope output interpolation %s (see envelope_interp.h)\r\n",
                           ENVELOPE_INTERP_FACTOR, now_on ? "ON" : "off");
         } else if (c == 'C') {
-            // v4.3: direct A/B between the two interp curves, independent
-            // of 'I' itself - see envelope_interp.h's "v4.3" header note.
-            // Only affects rendered output while 'I' is ON; harmless (and
-            // remembered) to toggle with 'I' off.
+            // v4.3/v4.4: direct A/B between the three interp curves,
+            // independent of 'I' itself - see envelope_interp.h's "v4.3"
+            // and "v4.4" header notes. Only affects rendered output while
+            // 'I' is ON; harmless (and remembered) to cycle with 'I' off.
+            // Cycles CATMULL_ROM(0) -> LINEAR(1) -> HOLD(2) -> CATMULL_ROM,
+            // same modulo-cycle convention as 'f' (adc_lpf_mode).
             envelope_interp_curve_t cur = envelope_interp_get_curve();
-            envelope_interp_curve_t next = (cur == ENVELOPE_INTERP_CURVE_CATMULL_ROM)
-                                            ? ENVELOPE_INTERP_CURVE_LINEAR
-                                            : ENVELOPE_INTERP_CURVE_CATMULL_ROM;
+            envelope_interp_curve_t next = (envelope_interp_curve_t)((cur + 1) % 3);
             envelope_interp_set_curve(next);
-            serial_reply("-> envelope interp curve: %s%s (see envelope_interp.h v4.3 note)\r\n",
-                          next == ENVELOPE_INTERP_CURVE_LINEAR
-                              ? "LINEAR (v4 straight-line ramp)"
-                              : "Catmull-Rom (v4.2 cubic Hermite, default)",
+            static const char *k_curve_desc[3] = {
+                "Catmull-Rom (v4.2 cubic Hermite, default)",
+                "LINEAR (v4 straight-line ramp)",
+                "HOLD (v4.4 plain 64kHz ZOH, no ramp)"
+            };
+            serial_reply("-> envelope interp curve: %s%s (see envelope_interp.h v4.3/v4.4 notes)\r\n",
+                          k_curve_desc[next],
                           envelope_interp_get_enabled() ? "" : " - no effect until 'I' is ON");
         } else if (c == 'f') {
             // Cycles off -> Butterworth -> Chebyshev -> off. See
@@ -465,10 +468,11 @@ void handle_serial_commands(void)
             // whichever of the two (env_predistort_enable=false, or 'D'
             // toggled off live) happens first.
             //
-            // envelope_interp_curve ('C', envelope_interp.h v4.3) is the
-            // newest trailing field - prints as the enum constant name
-            // (ENVELOPE_INTERP_CURVE_CATMULL_ROM/_LINEAR), same convention
-            // as adc_lpf_mode below, so the pasted line compiles directly.
+            // envelope_interp_curve ('C', envelope_interp.h v4.3/v4.4) is
+            // the newest trailing field - prints as the enum constant name
+            // (ENVELOPE_INTERP_CURVE_CATMULL_ROM/_LINEAR/_HOLD), same
+            // convention as adc_lpf_mode below, so the pasted line compiles
+            // directly.
 #if AD9851_ATTACHED
             float rel_delay = relative_delay_get_samples();
             bool rf_enabled = carrier_output_get_rf_enabled();
@@ -499,8 +503,9 @@ void handle_serial_commands(void)
             } else {
                 snprintf(slew_str, sizeof(slew_str), "%.0ff", slew_limit);
             }
-            static const char *k_interp_curve_enum_name[2] = {
-                "ENVELOPE_INTERP_CURVE_CATMULL_ROM", "ENVELOPE_INTERP_CURVE_LINEAR"
+            static const char *k_interp_curve_enum_name[3] = {
+                "ENVELOPE_INTERP_CURVE_CATMULL_ROM", "ENVELOPE_INTERP_CURVE_LINEAR",
+                "ENVELOPE_INTERP_CURVE_HOLD"
             };
             serial_reply("-> settings line (paste into settingsPresets[] in settings.h, then rename \"Live\"):\r\n");
             serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s, %s },\r\n",

@@ -20,6 +20,12 @@
  * for the full rationale, including why this deliberately keeps v4.2's
  * data window/timing identical for both curve choices rather than
  * reverting "linear" mode to v4's original narrower one.
+ *
+ * v4.4: added a third curve, HOLD - plain zero-order-hold at the fast-tick
+ * (64kHz) rate, no ramp at all, zero added latency. Isolates a DIFFERENT
+ * question than v4.3's LINEAR-vs-CATMULL_ROM did: does writing the LEDC
+ * duty register 4x more often matter AT ALL, independent of what shape (if
+ * any) is written - see envelope_interp.h's "v4.4" header note.
  */
 
 #include "envelope_interp.h"
@@ -88,6 +94,16 @@ static volatile envelope_interp_curve_t s_curve = ENVELOPE_INTERP_CURVE_CATMULL_
 // full tick of look-ahead than v4's plain 2-point ramp did.
 static float IRAM_ATTR compute_ramp_value(void)
 {
+    // v4.4: HOLD is a plain zero-order-hold at the fast-tick rate - no
+    // ramp, no frac, doesn't touch s_p0..s_p3/s_m1/s_m2 at all. Only
+    // reached from on_interp_tick() (on_full_tick() bypasses this function
+    // entirely for HOLD - see there) - by the time it's called, s_last_value
+    // already holds the CURRENT full tick's fresh envelope, so this simply
+    // repeats it unchanged. See envelope_interp.h's "v4.4" header note.
+    if (s_curve == ENVELOPE_INTERP_CURVE_HOLD) {
+        return s_last_value;
+    }
+
     float elapsed_us = (float)(esp_timer_get_time() - s_tick_start_us);
     float frac = elapsed_us / SAMPLE_PERIOD_US_F;
     if (frac < 0.0f) {
@@ -189,12 +205,31 @@ void IRAM_ATTR envelope_interp_on_full_tick(float envelope, int64_t tick_start_u
     // interval is the same intentional v4 property (see header comment);
     // v4.2 just adds one more full tick of that same kind of delay on top
     // of it, for the reason above.
+    //
+    // v4.4: always done regardless of which curve is selected, even HOLD
+    // (which doesn't read s_p0..s_p3/s_m1/s_m2 at all - see below) - a few
+    // wasted FLOPs while HOLD is active, but it keeps LINEAR/CATMULL_ROM's
+    // history always fresh, so switching curves live via 'C' never renders
+    // from stale data regardless of which curve was active a moment ago.
     s_p0 = s_p1;
     s_p1 = s_p2;
     s_p2 = s_p3;
     s_p3 = envelope;
     s_m1 = 0.5f * (s_p2 - s_p0);
     s_m2 = 0.5f * (s_p3 - s_p1);
+
+    if (s_curve == ENVELOPE_INTERP_CURVE_HOLD) {
+        // v4.4: no ramp, no look-ahead needed for this mode - write the
+        // fresh value immediately (zero added latency, same as 'I' off
+        // has) rather than going through compute_ramp_value()'s [s_p1,s_p2]
+        // segment logic. s_last_value is set here BEFORE returning, so the
+        // 3 on_interp_tick() calls that follow this one this period read
+        // the correct (this tick's) value via compute_ramp_value()'s own
+        // HOLD branch, not last tick's.
+        s_last_value = envelope;
+        envelope_output_write_pwm(envelope);
+        return;
+    }
 
     envelope_output_write_pwm(compute_ramp_value());
 
