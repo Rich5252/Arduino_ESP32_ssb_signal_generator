@@ -154,12 +154,12 @@ static bool IRAM_ATTR on_timer_alarm(gptimer_handle_t timer, const gptimer_alarm
     // 100MHz scope to resolve (using real work's own duration, not an
     // added delay), instead of two back-to-back register writes that are
     // over almost as soon as they start.
-    GPIO.out_w1tc = (1UL << TIMING_DEBUG_GPIO_ISR);
+    GPIO_FAST_CLR(TIMING_DEBUG_GPIO_ISR);
 #endif
     BaseType_t high_task_woken = pdFALSE;
     vTaskNotifyGiveFromISR(s_dsp_task, &high_task_woken);
 #if TIMING_DEBUG_ENABLED
-    GPIO.out_w1ts = (1UL << TIMING_DEBUG_GPIO_ISR);   // rising edge = notify call done, about to return
+    GPIO_FAST_SET(TIMING_DEBUG_GPIO_ISR);   // rising edge = notify call done, about to return
 #endif
     return high_task_woken == pdTRUE;
 }
@@ -336,9 +336,9 @@ static void IRAM_ATTR dsp_task(void* arg)
             envelope_output_write_pwm(chirp_envelope);
 #if !CMD_DEBUG_PIN_ENABLED
             if (ref_high) {
-                GPIO.out_w1ts = (1UL << CHIRP_REF_GPIO);
+                GPIO_FAST_SET(CHIRP_REF_GPIO);
             } else {
-                GPIO.out_w1tc = (1UL << CHIRP_REF_GPIO);
+                GPIO_FAST_CLR(CHIRP_REF_GPIO);
             }
 #endif
             continue;
@@ -384,6 +384,7 @@ static void IRAM_ATTR dsp_task(void* arg)
         } else if (src == AUDIO_SRC_AMTEST) {
             sample = 0.0f;   // unused - ssb_dsp_process_sample() is bypassed entirely for this mode too, see below
         } else {
+#if ADC_CAPTURE_ENABLED
             // Pops the next batch of raw samples from the ADC FIFO,
             // filters them (or passes through raw if bypassed), and
             // returns the latest value in ADC-code units - see
@@ -394,6 +395,12 @@ static void IRAM_ATTR dsp_task(void* arg)
             sample = (float)raw / 2048.0f - 1.0f;
             dc_estimate = dc_alpha * dc_estimate + (1.0f - dc_alpha) * sample;
             sample -= dc_estimate;
+#else
+            // ADC_CAPTURE_ENABLED=0 (config.h isolation test) - the driver
+            // was never started, so there's no FIFO to read from. Silence,
+            // same convention as AMTEST/FMTEST/ENVSTEP above.
+            sample = 0.0f;
+#endif
         }
         int64_t t_adc_done_us = esp_timer_get_time();
 
@@ -668,7 +675,11 @@ void setup()
     // Always started now, regardless of the initial audio source - needed
     // so the mic path is live and ready the moment a 't'/'s'/'m' serial
     // command switches source at runtime.
+#if ADC_CAPTURE_ENABLED
     adc_capture_init();
+#else
+    Serial.println("ADC_CAPTURE_ENABLED=0: ADC continuous driver NOT started (config.h isolation test) - mic source will read silence.");
+#endif
     envelope_output_init();
     envelope_interp_init();
 
@@ -833,7 +844,7 @@ void loop()
     // pin5 and test the "serial activity delays/disrupts gptimer's
     // alarm ISR" theory directly, rather than relying on manual timing.
     // Gated on CMD_DEBUG_PIN_ENABLED (config.h) - off by default now that
-    // this same physical pin (13) is the chirp test mode's square-wave
+    // this same physical pin (39) is the chirp test mode's square-wave
     // reference output (CHIRP_REF_GPIO); the two must never toggle it at
     // once. Flip CMD_DEBUG_PIN_ENABLED back to 1 to re-enable this marker.
     digitalWrite(TIMING_DEBUG_GPIO_CMD, HIGH);
@@ -847,7 +858,9 @@ void loop()
     // Keep adc_continuous's internal pool from filling up - see
     // adc_capture.h. Low priority, not time-critical - fine to do here
     // alongside the other loop() work.
+#if ADC_CAPTURE_ENABLED
     adc_capture_service();
+#endif
     int64_t t_adcsvc1 = esp_timer_get_time();
 
     // Throttled status/timing/adc diagnostic prints - see diagnostics.h.

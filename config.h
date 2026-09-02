@@ -68,6 +68,30 @@
 
 #define dac_task_enabled 0
 
+// ---- Master enable for the ADC continuous-mode driver (adc_capture_init()/
+// adc_capture_service(), adc_capture.cpp). Set to 0 to skip starting the
+// driver entirely - not just gate a debug pin, actually never call
+// adc_continuous_start()/register the on_conv_done callback, so its ISR
+// never fires at all. Added as an isolation test for the GPIO13 5kHz
+// pulse investigation (see ssb_mic_test_commands.md): the pulse rate
+// matches ADC_CONT_SAMPLE_FREQ_HZ/ADC_CONT_FRAME_SAMPLES (80000/16=5000Hz)
+// exactly, and adc_capture.cpp's own pin13 debug writes are already
+// confirmed compiled out (ADC_ISR_DEBUG_PIN_ENABLED=0) - so the working
+// theory is electrical coupling from the ADC driver's real DMA/ISR
+// activity onto the GPIO13 pad, independent of any code touching that pin.
+// Flip this to 0 (with the source in a mode that doesn't need the mic -
+// two-tone or chirp) and rescope the affected pin: if the 5kHz pulse
+// disappears, that confirms the ADC driver as the source rather than some
+// other 5kHz-ish activity - CONFIRMED on real hardware 2026-09-02, which is
+// also why TIMING_DEBUG_GPIO_ADC/CHIRP_REF_GPIO moved off GPIO13 to GPIO39
+// (see that define's own comment) - this flag stays for any future
+// pin/coupling investigation of the same shape. Defaults to 1 (normal
+// operation, no behavior change)
+// - mic-source audio silently reads as 0.0f (matching the existing
+// AMTEST/FMTEST/ENVSTEP "unused sample" convention) when disabled, rather
+// than calling into a driver that was never started.
+#define ADC_CAPTURE_ENABLED 1
+
 // ---- Timing debug pin: toggled high at the start of dsp_task's real work
 // and low at the end, so a scope on this pin directly measures the actual
 // loop iteration time on real hardware - much more trustworthy than
@@ -104,24 +128,47 @@
 // two back-to-back register writes take - negligible, sub-100ns).
 #define TIMING_DEBUG_GPIO_ISR  5   // toggled every gptimer alarm ISR fire (on_timer_alarm(), Core 1)
 
+// 2026-09-02: GPIO_FAST_SET/CLR - IRAM-safe register-level GPIO set/clear
+// that works across the FULL GPIO0-48 range on the S3. GPIO.out_w1ts/w1tc
+// (used directly at every raw-register toggle site below and in
+// adc_capture.cpp/the .ino) are only 32 bits wide and physically cover
+// GPIO0-31 - `1UL << 39` doesn't address a real bit in that register at
+// all, so a plain `GPIO.out_w1ts = (1UL << pin)` for any pin >= 32 silently
+// does nothing (or hits the wrong pin, depending how the shift amount gets
+// handled) rather than erroring at compile time. This is exactly what
+// happened when CHIRP_REF_GPIO/TIMING_DEBUG_GPIO_ADC moved from pin13 to
+// pin39 - the pin read permanently LOW on the scope because the toggle was
+// silently a no-op, not because anything was electrically wrong. GPIO32+
+// needs the separate GPIO.out1_w1ts/out1_w1tc register bank instead, at
+// bit (pin-32). These macros pick the right register at compile time (pin
+// is always a #define constant here, so the branch folds away - zero
+// runtime cost, still ISR-safe) so this can't silently break again the
+// next time a pin gets reassigned.
+// NOTE: GPIO.out_w1ts/out_w1tc (low bank, pin<32) accept a plain integer
+// assignment on this SDK, but GPIO.out1_w1ts/out1_w1tc (high bank, pin>=32)
+// are anonymous UNIONS here, not plain uint32_t - real hardware compile
+// (2026-09-02, esp32s3-libs 3.3.8) rejected `GPIO.out1_w1ts = mask` outright
+// ("no match for operator=") until routed through the union's `.val` member
+// instead. Left the low-bank assignments bare (already proven to compile)
+// rather than risk "fixing" something that wasn't broken.
+#define GPIO_FAST_SET(pin)  do { if ((pin) < 32) { GPIO.out_w1ts  = (1UL << (pin));      } \
+                                  else            { GPIO.out1_w1ts.val = (1UL << ((pin)-32)); } } while (0)
+#define GPIO_FAST_CLR(pin)  do { if ((pin) < 32) { GPIO.out_w1tc  = (1UL << (pin));      } \
+                                  else            { GPIO.out1_w1tc.val = (1UL << ((pin)-32)); } } while (0)
+
 // ADC_ISR_DEBUG_PIN_ENABLED gates adc_conv_done_cb()'s own toggle of
-// TIMING_DEBUG_GPIO_ADC (adc_capture.cpp) - set to 0 here because pin13 is
-// being TEMPORARILY REPURPOSED for the serial-activity-correlation test
+// TIMING_DEBUG_GPIO_ADC (adc_capture.cpp) - set to 0 here because this pin
+// is being TEMPORARILY REPURPOSED for the serial-activity-correlation test
 // (TIMING_DEBUG_GPIO_CMD below) instead: the ADC-ISR-vs-gptimer-alarm-ISR
 // contention question this pin was originally added to test is already
-// answered and fixed (intr_priority=3), and the board only has GPIO1-13
-// easily accessible - GPIO9-12 are taken by the AD9851, GPIO8 was
-// considered but rejected (still ADC1, like GPIO3 which broke the ADC
-// outright when toggled digitally - see the "TRIED GPIO3 FIRST" note
-// below), and GPIO1-7 are ADC1 or already spoken for (2=RSET PWM, 4/5=the
-// other two debug pins, 6=mic input). Two ISRs (adc_conv_done_cb() and
+// answered and fixed (intr_priority=3). Two ISRs (adc_conv_done_cb() and
 // the new loop()-context command-window marker) must never drive the same
 // physical pin at once - that would corrupt both signals - so this flag
 // keeps them mutually exclusive. Flip back to 1 (and TIMING_DEBUG_GPIO_CMD
 // back to its own pin, once one becomes available) if the ADC-ISR
 // contention question ever needs re-checking directly.
 #define ADC_ISR_DEBUG_PIN_ENABLED 0
-#define TIMING_DEBUG_GPIO_ADC  13  // toggled every ADC conv_done ISR fire (adc_conv_done_cb(), Core 1).
+#define TIMING_DEBUG_GPIO_ADC  39  // toggled every ADC conv_done ISR fire (adc_conv_done_cb(), Core 1).
                                    // TRIED GPIO3 FIRST, REVERTED: real hardware confirmed the ADC
                                    // continuous driver produced ZERO conversions the moment this pin's
                                    // toggling was enabled (actual sps=0, callbacks=0, both mic and
@@ -133,12 +180,25 @@
                                    // mic's ADC1_CH5 (GPIO6), so driving it digitally shouldn't in theory
                                    // disturb a different channel's sampling - but the correlation was
                                    // clean enough not to trust that theory over the real hardware result.
-                                   // Moved off the whole ADC1 channel range (GPIO1-10) instead of
-                                   // re-testing GPIO3 specifically or picking another ADC1 pin - GPIO13
-                                   // is ADC2 (never initialized by this project at all), which rules out
-                                   // channel-adjacency as a question entirely rather than hoping GPIO3
-                                   // was uniquely bad. If GPIO13 turns out inconvenient to probe, pick
-                                   // any other GPIO11+ instead, just stay off 1-10.
+                                   // Moved off the whole ADC1 channel range (GPIO1-10) to GPIO13 (ADC2)
+                                   // for that reason - but GPIO13 turned out to have the OPPOSITE problem:
+                                   // 2026-09-02, real hardware confirmed a regular 5kHz pulse on GPIO13
+                                   // matching ADC_CONT_SAMPLE_FREQ_HZ/ADC_CONT_FRAME_SAMPLES exactly
+                                   // (80000/16=5000Hz) - the ADC continuous driver's own DMA/ISR activity
+                                   // electrically coupling onto the pin, confirmed by adding
+                                   // ADC_CAPTURE_ENABLED (below) and showing the pulse vanishes when the
+                                   // driver never starts. So GPIO1-20 (ADC1 AND ADC2, both directions)
+                                   // are now a demonstrated-bad pin class on this board for anything that
+                                   // either drives noise into the ADC (GPIO3) or needs to stay quiet from
+                                   // it (GPIO13) - see ssb_mic_test_commands.md for the full writeup.
+                                   // Moved again, this time off the ADC entirely: GPIO39 has no ADC
+                                   // channel on the S3 (ADC1 stops at GPIO10, ADC2 at GPIO20), isn't one
+                                   // of the four strapping pins (0/3/45/46), isn't the UART0 console
+                                   // (43/44), and isn't already wired to the I2C DAC (47/48) - it's the
+                                   // default JTAG TCK line, but this project doesn't use external
+                                   // hardware JTAG (debugs over USB CDC serial), so that's free to reuse.
+                                   // Reachable on this board (ESP32-S3 Super Mini) via its small solder
+                                   // pads (39-48), not the main 1-13 header.
 
 // New leading suspect for the [timing] wakeup-jitter residual and the
 // pin5-bad-edge sightings that showed up even at the intr_priority=3-only
@@ -162,9 +222,8 @@
 // now" window to scope alongside pin5, instead of relying on "roughly
 // when I typed" - see the .ino's loop() and setup().
 //
-// Reuses TIMING_DEBUG_GPIO_ADC's physical pin (13) rather than a new one -
-// GPIO9-12 are taken by the AD9851 and GPIO8 was rejected as still-ADC1
-// (see ADC_ISR_DEBUG_PIN_ENABLED's comment above for the full reasoning).
+// Reuses TIMING_DEBUG_GPIO_ADC's physical pin (39, see that define's own
+// comment for why it lives there now) rather than a new one.
 // ADC_ISR_DEBUG_PIN_ENABLED=0 keeps adc_conv_done_cb() off this pin while
 // it's doing this job, so the two signals never collide on the wire.
 #define TIMING_DEBUG_GPIO_CMD  TIMING_DEBUG_GPIO_ADC   // toggled HIGH for the duration of
@@ -174,8 +233,8 @@
 
 // CMD_DEBUG_PIN_ENABLED gates the loop()-context toggle of
 // TIMING_DEBUG_GPIO_CMD above (same physical pin as TIMING_DEBUG_GPIO_ADC,
-// pin13) - set to 0 here for the same reason ADC_ISR_DEBUG_PIN_ENABLED is
-// 0 above: pin13 is being TEMPORARILY REPURPOSED again, this time as the
+// pin39) - set to 0 here for the same reason ADC_ISR_DEBUG_PIN_ENABLED is
+// 0 above: this pin is being TEMPORARILY REPURPOSED again, this time as the
 // sine-chirp test mode's square-wave reference output (CHIRP_REF_GPIO
 // below) for the external ADC-based transfer-function measurement rig.
 // Two things (the serial-activity-correlation marker this flag normally
@@ -202,7 +261,9 @@
 #define CHIRP_F1_HZ   20000.0f
 #define CHIRP_SWEEP_SEC   5.0f
 #define CHIRP_MUTE_SEC    0.03f
-#define CHIRP_REF_GPIO  TIMING_DEBUG_GPIO_ADC   // pin13 - square-wave reference channel for the
+#define CHIRP_REF_GPIO  TIMING_DEBUG_GPIO_ADC   // pin39 (was pin13, moved 2026-09-02 - see
+                                    // TIMING_DEBUG_GPIO_ADC's own comment above) - square-wave
+                                    // reference channel for the
                                     // TF measurement rig, in sync with the chirp's own
                                     // instantaneous frequency (see test_signals_generate_chirp()).
                                     // Mutually exclusive with TIMING_DEBUG_GPIO_CMD's use of this

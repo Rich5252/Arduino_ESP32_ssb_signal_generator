@@ -63,7 +63,7 @@ void IRAM_ATTR test_signals_generate_amtest(float master_gain_linear, float *out
 
 // Sine-chirp test mode ('w', AUDIO_SRC_CHIRP) - logarithmic sweep from
 // CHIRP_F0_HZ to CHIRP_F1_HZ (config.h) direct to the envelope output,
-// plus a synced square-wave reference bit for CHIRP_REF_GPIO (pin13) - for
+// plus a synced square-wave reference bit for CHIRP_REF_GPIO (pin39) - for
 // characterizing the analog envelope/PWM reconstruction filter's transfer
 // function against an external ADC-based measurement rig. Unlike
 // ENVSTEP/FMTEST/AMTEST above, this is called on EVERY fast tick (the full

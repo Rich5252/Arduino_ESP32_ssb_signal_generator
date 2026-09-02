@@ -50,7 +50,7 @@ typedef enum {
                                 // crosstalk somewhere physical, a distinct and worth-knowing finding.
     AUDIO_SRC_CHIRP = 6,        // logarithmic sine-chirp sweep (20Hz-20kHz by default, see config.h's
                                 // CHIRP_* constants) direct to the envelope/PWM (RSET) output, plus a
-                                // synced square-wave reference on CHIRP_REF_GPIO (pin13) - for
+                                // synced square-wave reference on CHIRP_REF_GPIO (pin39) - for
                                 // characterizing the analog reconstruction filter's transfer function
                                 // against an external ADC-based TF measurement rig. Bypasses
                                 // ssb_dsp_process_sample/envelope_floor/gdeq/relative_delay/AD9851/

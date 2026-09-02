@@ -166,7 +166,7 @@ void handle_serial_commands(void)
             // 'w' always starts a clean sweep from t=0 (mute period
             // first), never resuming mid-sweep from a previous session.
             // NOTE: CMD_DEBUG_PIN_ENABLED (config.h) must be 0 for the
-            // chirp's square-wave reference on pin13 to be glitch-free -
+            // chirp's square-wave reference on pin39 to be glitch-free -
             // it shares that physical pin with TIMING_DEBUG_GPIO_CMD.
             test_signals_chirp_reset();
             dsp_state_set_audio_source(AUDIO_SRC_CHIRP);

@@ -77,7 +77,7 @@ static bool IRAM_ATTR adc_conv_done_cb(adc_continuous_handle_t handle,
                                         const adc_continuous_evt_data_t *edata,
                                         void *user_data)
 {
-#if TIMING_DEBUG_ENABLED
+#if TIMING_DEBUG_ENABLED && ADC_ISR_DEBUG_PIN_ENABLED
     // Fs jitter hunt - see config.h's TIMING_DEBUG_GPIO_ISR comment.
     // Scope this against TIMING_DEBUG_GPIO_ISR to test whether THIS ISR
     // (also Core 1, firing every ADC_CONT_FRAME_SAMPLES/
@@ -92,13 +92,20 @@ static bool IRAM_ATTR adc_conv_done_cb(adc_continuous_handle_t handle,
     // a 100MHz scope to resolve, using time that was already being spent
     // here rather than adding any. Bonus: that width is itself a genuine
     // per-firing ISR-execution-time measurement.
-    GPIO.out_w1tc = (1UL << TIMING_DEBUG_GPIO_ADC);
+    //
+    // GATED OFF (ADC_ISR_DEBUG_PIN_ENABLED=0) while this pin (39, see
+    // config.h's TIMING_DEBUG_GPIO_ADC comment) is temporarily
+    // repurposed for the serial-activity-correlation test - see config.h's
+    // ADC_ISR_DEBUG_PIN_ENABLED comment. This ISR must not touch the pin
+    // while loop()'s command-window marker owns it, or the two would
+    // corrupt each other on the wire.
+    GPIO_FAST_CLR(TIMING_DEBUG_GPIO_ADC);
 #endif
 
     uint32_t n = edata->size / SOC_ADC_DIGI_DATA_BYTES_PER_CONV;
     if (n == 0) {
-#if TIMING_DEBUG_ENABLED
-        GPIO.out_w1ts = (1UL << TIMING_DEBUG_GPIO_ADC);   // close the pulse on this early-return path too
+#if TIMING_DEBUG_ENABLED && ADC_ISR_DEBUG_PIN_ENABLED
+        GPIO_FAST_SET(TIMING_DEBUG_GPIO_ADC);   // close the pulse on this early-return path too
 #endif
         return false;
     }
@@ -135,8 +142,8 @@ static bool IRAM_ATTR adc_conv_done_cb(adc_continuous_handle_t handle,
         head = next_head;
     }
     s_adc_fifo_head = head;
-#if TIMING_DEBUG_ENABLED
-    GPIO.out_w1ts = (1UL << TIMING_DEBUG_GPIO_ADC);   // rising edge = this callback's real work is done
+#if TIMING_DEBUG_ENABLED && ADC_ISR_DEBUG_PIN_ENABLED
+    GPIO_FAST_SET(TIMING_DEBUG_GPIO_ADC);   // rising edge = this callback's real work is done
 #endif
     return false;   // no higher-priority task needs waking from this event
 }
@@ -154,11 +161,15 @@ static bool IRAM_ATTR adc_pool_ovf_cb(adc_continuous_handle_t handle,
 
 void adc_capture_init(void)
 {
-#if TIMING_DEBUG_ENABLED
+#if TIMING_DEBUG_ENABLED && ADC_ISR_DEBUG_PIN_ENABLED
     // Fs jitter hunt - see config.h's TIMING_DEBUG_GPIO_ISR comment and
     // adc_conv_done_cb()'s own toggle below. Set up here, before the
     // driver starts (end of this function), so the pin is a valid OUTPUT
     // before the ISR could possibly fire.
+    //
+    // GATED OFF (ADC_ISR_DEBUG_PIN_ENABLED=0) - this pin's own init now
+    // happens in the .ino's setup() instead, as TIMING_DEBUG_GPIO_CMD -
+    // see config.h's ADC_ISR_DEBUG_PIN_ENABLED comment.
     pinMode(TIMING_DEBUG_GPIO_ADC, OUTPUT);
     digitalWrite(TIMING_DEBUG_GPIO_ADC, LOW);
 #endif
