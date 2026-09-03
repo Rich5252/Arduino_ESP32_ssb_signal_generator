@@ -230,6 +230,29 @@ been simulated so far; the DC-operating-point-dependence itself (measured
 on real hardware — see below) hasn't been independently checked against
 LTspice at the Lo/Hi bias points yet.
 
+**Explained artifact, 2026-09-01: small blips at 5kHz and its harmonics in
+the raw chirp-based TF sweeps (`EnvFilterTF*.txt`) are a measurement-rig
+artifact, not real filter behavior.** Traced to short (0.25-7µs), ~5kHz
+negative-going glitches on `CHIRP_REF_GPIO` (pin13) - confirmed present in
+EVERY audio mode (`t`/`m`, not chirp-specific), at a rate matching
+`adc_capture.h`'s `ADC_CONT_SAMPLE_FREQ_HZ`/`ADC_CONT_FRAME_SAMPLES` =
+80000/16 = 5000Hz exactly - i.e. `adc_conv_done_cb()`'s own DMA/ISR firing
+rate, most likely coupling electrically onto that specific pin rather than
+a deliberate GPIO write (both other users of the same physical pin are
+compiled out - `ADC_ISR_DEBUG_PIN_ENABLED`/`CMD_DEBUG_PIN_ENABLED` are both
+0). **Confirmed NOT present on the actual RSET/PWM signal line (GPIO2)** -
+scoped directly, nothing detected - so this only affects the reference/sync
+channel the external TF rig reads, never the signal actually being
+measured, and none of the group-delay/DC-dependence conclusions elsewhere
+in this document are affected by it. Should mostly be filtered out easily
+(a 0.25-7µs blip is tiny against most of the sweep's own edge-to-edge
+interval - e.g. ~1ms at 1kHz), possibly interacting with the reference's
+own high-frequency sampling-jitter limitation (see the chirp mode's
+`ssb_mic_test_commands.md` entry) right at the top of the sweep, where the
+true reference period itself approaches 200µs. Not chased further - the
+actual TF data was fine, this only explains a previously-unexplained
+cosmetic wrinkle in it.
+
 ### Status
 
 **2026-09-01, real-hardware result: far from decisive — leans toward "off."**
@@ -511,6 +534,139 @@ than more delay-equalizer iteration. The coefficients and
 for what they do (narrowband delay flattening) and cost nothing while
 disabled — this is a "don't reach for this tool on this filter" finding,
 not a "the fit was wrong" finding.
+
+## 2026-09-03 refit: real-hardware TFA data (Hi-Z buffered), fit band widened to 8000Hz
+
+Requested after two developments: (1) the TFA front end had a loading issue
+that was making measured phase inconsistent across the envelope's DC
+operating range — this is very plausibly the same effect the "DC-operating-
+point dependence" section below documents from LTspice-vs-hardware
+comparisons, or at least a contributor to it. Hi-Z buffers added to the TFA
+front end fixed it — phase now reads consistently across the envelope
+range. (2) Real `freq_dev_hz` excursions have been observed out to the
+`MAX_FREQ_DEV_HZ` clamp (8000Hz), well past the old 100-4300Hz fit grid's
+upper edge — the fit had never been asked to behave out there.
+
+Source data: `Group_delay_off__on_F_Phase.txt` (the same real-hardware TFA
+sine-chirp sweep already used for the 2026-09-03 same-day dispersion
+report in `ssb_mic_test_commands.md` — see the correction paragraph below).
+~1000 points, 0–24kHz, unwrapped phase, `g` off and `g` on both captured
+(the `g` on curve reflects the OLD/superseded 0.622515/0.622515
+coefficients, still compiled in at measurement time).
+
+### Method
+
+Same structure as every prior fit in this document (two cascaded
+`ssb_allpass1_t` sections, peak-to-peak minimization via grid search +
+Nelder-Mead polish, multiple starts) — only the source data and fit band
+changed:
+
+1. Parsed the raw TFA sweep's `g`-off phase column.
+2. Extracted group delay via `tau(f) = -(1/360) dPhase/dFreq`, Savitzky-
+   Golay smoothed before differentiating (same technique the earlier
+   same-day dispersion report used — but see the correction below on
+   smoothing-window choice).
+3. **Smoothing-window sensitivity check (new this round).** The real TFA
+   sweep is far denser (~1000 points/24kHz) and noisier point-to-point
+   than the LTspice sweeps every earlier fit in this document used. A
+   light window (31 points, ~700Hz span — matching this project's other
+   TFA chart work) leaves the extracted group-delay curve with tens-of-us
+   swings above ~2kHz that don't shrink monotonically the way a real
+   2-pole-plus-buffer-stage filter's phase should. Computed the residual
+   (raw phase minus smoothed) and its RMS (0.5–2.6° depending on band,
+   worst near 3–4.3kHz) — enough, once differentiated, to plausibly
+   produce swings that size from noise alone, not real filter structure.
+   Re-ran the fit's own analog-curve peak-to-peak across a range of
+   smoothing spans (61/91/121/151/181/221/261 points ≈ 1.4–6.1kHz span):
+   it stabilizes to within ~2us of its converged value from a 181-point
+   (~4.2kHz) span onward. Used 181 points as the fit target — wide enough
+   to be clear of the noise floor, not so wide it would smooth away a
+   genuine single in-band hump if the real filter has one.
+4. Fit grid: 100–8000Hz (dense, 800 points), replacing the old
+   100–4300Hz grid. `Fs=16000Hz` throughout (no other Fs refit this
+   round).
+
+### Result
+
+| | Peak-to-peak dispersion, 100–8000Hz | Mean delay |
+|---|---|---|
+| Analog filter alone (real hardware, Hi-Z-buffered TFA) | 71.2us | 71.2us |
+| **Two** sections, `a1=0.026173`, `a2=0.236810` | **18.5us** (~3.9x) | 196.5us |
+
+Mean added delay: ~125.4us (**2.006 samples @ 16000Hz**) — close to, and
+slightly less than, the superseded LTspice fit's 2.105 samples.
+`relative_delay_samples` needs re-tuning to roughly this new starting
+point if/when `g` is re-enabled for testing, same as every prior
+coefficient change in this file.
+
+Checked over the OLD 100–4300Hz sub-band with the NEW coefficients: 18.5us
+p-p — identical to the full-band figure (the equalized curve's worst-case
+points both happen to fall inside the old band already), so this refit is
+a strict widening of validated coverage, not a regression within the
+previously-fitted range.
+
+### Old coefficients applied to the new real-hardware analog data (context)
+
+Useful sanity check on why "just extend the old fit's claimed range"
+wouldn't have worked: applying the OLD (2026-09-01, LTspice-fit)
+`a1=a2=0.622515` to this same real analog curve —
+
+| Band | Analog alone (measured) | With OLD coefficients |
+|---|---|---|
+| 100–4300Hz (old fit's own band) | 36.8us p-p | 18.5us p-p (tracks the LTspice prediction of 41.1→13.7us reasonably well) |
+| 100–8000Hz (new band) | 71.2us p-p | **449.2us p-p** |
+
+The old coefficients still behave inside the band they were actually fit
+for. Outside it, they diverge badly — a first-order all-pass section's
+delay curve keeps changing all the way to Nyquist, and `a=0.622515` is
+steep enough that the un-fit region past 4300Hz was always going to blow
+up once anyone looked. This is the concrete argument for why extending
+frequency coverage needed a real re-fit, not a documentation change.
+
+### Correction to the same-day (2026-09-03) real-hardware dispersion report
+
+The dispersion numbers first delivered this session (146.1us→147.2us p-p
+over 100–4300Hz, "essentially no improvement from `g`", written up in
+`ssb_mic_test_commands.md`'s earlier 2026-09-03 entry and the accompanying
+chart) used the lighter 31-point/~700Hz smoothing window, the same one
+this project's other TFA analyses have used against much sparser LTspice
+data. Applied to this denser, noisier real-hardware sweep, that window
+was too fine — re-running the SAME `g`-off/`g`-on measured curves (not a
+model, the actual measured phase in both states) at the 181-point window
+justified above gives a materially different picture:
+
+| Band | `g` off (measured) | `g` on (measured, OLD coeffs) | |
+|---|---|---|---|
+| 100–4300Hz, 31-pt window (original report) | 146.1us p-p | 147.2us p-p | "no improvement" |
+| 100–4300Hz, 181-pt window (this correction) | 36.6us p-p | 14.3us p-p | **real ~61% reduction, close to the 41.1→13.7us LTspice prediction** |
+
+So the equalizer's OLD coefficients were doing closer to what they were
+designed to do within their own fit band all along — the original "no
+improvement" finding was substantially a smoothing-window artifact on
+noisy real data, not a genuine equalizer failure at 100–4300Hz. This does
+**not** overturn the separate, independently-confirmed 2026-09-01
+real-hardware IMD finding (that document's own repeatable, delay-swept
+3rd-order IMD measurements never depended on this phase-noise/smoothing
+question) — it only revises the group-delay/TFA side of the picture. Left
+the original entry in `ssb_mic_test_commands.md` in place with this
+correction appended rather than edited away, per this project's usual
+convention. Going forward, TFA group-delay analyses on real (not LTspice)
+hardware sweeps should default to a wider smoothing window and a
+convergence check like the one in the Method section above, not the
+31-point window carried over from the LTspice-fitting era.
+
+### Status
+
+Same as every fit in this file: numerically fit, not yet IMD-validated on
+real hardware. This refit directly addresses two of the four suspected
+causes behind the 2026-09-01 negative IMD result (the narrow 100-4300Hz
+fit window, and — pending confirmation — the DC-bias-point measurement
+inconsistency the Hi-Z buffers were added to fix); it does nothing about
+the other two (the unity-magnitude all-pass structure still can't correct
+this filter's real insertion-loss penalty; the `envelope_interp`/`'I'`
+confound). **`g` stays off by default** until the same real-hardware
+IMD3/IMD5 delay-sweep procedure documented above is re-run against these
+new coefficients — a better-fitted equalizer is not a re-validated one.
 
 ## Related: DC-operating-point dependence (envelope filter TF, not group delay)
 

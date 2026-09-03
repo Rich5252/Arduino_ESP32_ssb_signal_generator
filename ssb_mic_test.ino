@@ -286,7 +286,7 @@ static void IRAM_ATTR dsp_task(void* arg)
         // rest of this loop uses. A 20kHz chirp needs more than
         // SAMPLE_RATE_HZ's own 8kHz Nyquist, so this mode can't reuse the
         // normal 16kHz full-tick pipeline the way ENVSTEP/FMTEST/AMTEST
-        // do - it bypasses ADC/ssb_dsp_process_sample/envelope_floor/gdeq/
+        // do - it bypasses ADC/ssb_dsp_process_sample/envelope_floor/
         // relative_delay/AD9851/normal diagnostics, writing (almost)
         // straight to the PWM output and the reference GPIO instead. Raw
         // register writes for the reference pin (GPIO.out_w1ts/w1tc), not
@@ -299,16 +299,36 @@ static void IRAM_ATTR dsp_task(void* arg)
         // predistort) DC mapping is deliberately NOT skipped - see the
         // comment right before that call below for why, and 'u'/'j'/'i'/
         // 'k'/'D' in serial_commands.cpp for the knobs it wires in.
+        // 2026-09-02: envelope_gdeq_process() (the 'g' group-delay
+        // equalizer) is now wired in too - see its own comment below -
+        // specifically so the TF analyzer can measure the analog
+        // reconstruction filter's group delay WITH the digital
+        // equalizer's correction applied, not just the raw filter, and
+        // compare the two sweeps directly. envelope_floor stays skipped:
+        // it's a hard near-zero clamp aimed at squelching mic-path noise
+        // at silence, not something a swept-tone TF measurement exercises
+        // or benefits from measuring through.
         if (dsp_state_get_audio_source() == AUDIO_SRC_CHIRP) {
             float chirp_envelope;
             bool ref_high;
             test_signals_generate_chirp(dsp_state_get_master_gain_linear(), &chirp_envelope, &ref_high);
 
+            // Envelope-path group-delay equalizer - see envelope_gdeq.h.
+            // Same call, same 'g' toggle, same live on/off behavior as the
+            // normal full-tick pipeline's own envelope_gdeq_process() call
+            // below (envelope_gdeq_process() internally no-ops when
+            // disabled, so this is safe to call unconditionally here too -
+            // no separate gating needed). Run BEFORE the predistort/
+            // offset-scale mapping, matching that pipeline's own ordering,
+            // so 'g' reshapes the swept envelope itself rather than
+            // whatever the DC mapping already did to it.
+            chirp_envelope = envelope_gdeq_process(chirp_envelope);
+
             // Apply the SAME offset/scale (or predistort) DC mapping every
             // other source gets from the normal full-tick pipeline below -
-            // deliberately NOT skipped here, unlike envelope_floor/gdeq
-            // (see this block's own top comment for why those specific two
-            // stay skipped). Master gain ('+'/'-', already passed into
+            // deliberately NOT skipped here, unlike envelope_floor (see
+            // this block's own top comment for why that one stays
+            // skipped). Master gain ('+'/'-', already passed into
             // test_signals_generate_chirp() above) only scales the SWING
             // around AM_TEST_DEPTH's fixed mean (same convention as
             // AMTEST) - it moves how HARD the filter is driven, not WHERE

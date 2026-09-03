@@ -176,18 +176,30 @@
  * sections are steep enough that the un-fit region past 4300Hz was
  * always going to diverge once looked at.
  *
- * STILL NOT VALIDATED FOR IMD ON REAL HARDWARE. group_delay_fit_notes.md's
- * extensive 2026-09-01 real-hardware IMD testing (which found gdeq made
- * 3rd-order IMD 6-10dB WORSE on two-tone, and recommended leaving `g` off
- * by default) was run against the OLD coefficients, not these - it does
- * NOT automatically carry over. This refit directly addresses two of that
- * writeup's four suspected causes (fit-window mismatch and, possibly, the
- * DC-bias-point measurement inconsistency), but the other two (the
- * unity-magnitude all-pass structure still can't touch this filter's real
- * insertion-loss penalty; the envelope-interpolation confound) are
- * unchanged, and none of this replaces re-running the actual IMD
- * comparison. **`g` stays off by default until that re-test happens** -
- * this is a better-fitted equalizer, not a re-validated one.
+ * GROUP-DELAY SIDE CONFIRMED ON REAL HARDWARE, 2026-09-03 (same day): these
+ * coefficients were flashed to the board and re-measured with the TFA -
+ * measured 71.3us -> 20.3us p-p over 100-8000Hz (~3.5x), mean added delay
+ * 125.2us/2.003 samples, within ~1us of the prediction above and tracking
+ * the predicted curve to ~2us RMS across the whole band. See
+ * group_delay_fit_notes.md's matching entry for the full comparison and a
+ * data-provenance note (that measurement file's two columns came out
+ * swapped relative to the expected off/on order - resolved by a physical
+ * sanity check, documented there).
+ *
+ * STILL NOT VALIDATED FOR IMD ON REAL HARDWARE - the group-delay
+ * confirmation above is a different, narrower claim than IMD validation.
+ * group_delay_fit_notes.md's extensive 2026-09-01 real-hardware IMD
+ * testing (which found gdeq made 3rd-order IMD 6-10dB WORSE on two-tone,
+ * and recommended leaving `g` off by default) was run against the OLD
+ * coefficients, not these - it does NOT automatically carry over. This
+ * refit directly addresses two of that writeup's four suspected causes
+ * (fit-window mismatch and, possibly, the DC-bias-point measurement
+ * inconsistency), but the other two (the unity-magnitude all-pass
+ * structure still can't touch this filter's real insertion-loss penalty;
+ * the envelope-interpolation confound) are unchanged, and none of this
+ * replaces re-running the actual IMD comparison. **`g` stays off by
+ * default until that re-test happens** - this is a better-fitted AND
+ * now group-delay-validated equalizer, but not an IMD-validated one.
  *
  * IMPORTANT SIDE EFFECT (both filters): an all-pass filter can only ADD
  * delay, never subtract it - flattening this curve pushes the envelope

@@ -1,0 +1,389 @@
+<title>GDEQ Refit Validated</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --gridline:       #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --series-off:     #2a78d6;
+    --series-new:     #1baf7a;
+    --good:           #0ca30c;
+    --band-fill:      rgba(11,11,11,0.045);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --gridline:       #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --series-off:     #3987e5;
+      --series-new:     #199e70;
+      --good:           #0ca30c;
+      --band-fill:      rgba(255,255,255,0.05);
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --gridline:       #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --series-off:     #3987e5;
+    --series-new:     #199e70;
+    --good:           #0ca30c;
+    --band-fill:      rgba(255,255,255,0.05);
+  }
+
+  * { box-sizing: border-box; }
+  body { background: var(--page); margin: 0; }
+  .viz-root {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: var(--text-primary);
+    background: var(--page);
+    padding: 24px;
+    max-width: 980px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--text-secondary); font-size: 13px; margin: 0 0 20px; line-height: 1.5; }
+
+  .card {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .card.notice { border-left: 3px solid var(--good); }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .stat-tile {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .stat-tile .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px; }
+  .stat-tile .value { font-size: 20px; font-weight: 600; }
+  .stat-tile .delta { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+
+  .chart-title { font-size: 14px; font-weight: 600; margin: 0 0 2px; }
+  .chart-note { font-size: 12px; color: var(--text-secondary); margin: 0 0 14px; line-height: 1.5; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 18px; font-size: 12px; color: var(--text-secondary); margin-bottom: 8px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-swatch { width: 18px; height: 2px; border-radius: 1px; }
+  .legend-swatch.dotted { background: none; border-top: 2px dotted currentColor; height: 0; }
+
+  svg { display: block; overflow: visible; }
+  .gridline { stroke: var(--gridline); stroke-width: 1; }
+  .baseline { stroke: var(--baseline); stroke-width: 1; }
+  .axis-label { fill: var(--text-muted); font-size: 10px; }
+  .line-off { fill: none; stroke: var(--series-off); stroke-width: 2; }
+  .line-new { fill: none; stroke: var(--series-new); stroke-width: 2; }
+  .line-pred { fill: none; stroke: var(--text-muted); stroke-width: 1.5; stroke-dasharray: 1,3; }
+  .crosshair { stroke: var(--baseline); stroke-width: 1; pointer-events: none; }
+  .hover-dot { pointer-events: none; }
+
+  .tooltip {
+    position: absolute;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 12px;
+    pointer-events: none;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+    display: none;
+    min-width: 160px;
+  }
+  .tooltip .t-freq { color: var(--text-secondary); font-size: 11px; margin-bottom: 4px; }
+  .tooltip .t-row { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
+  .tooltip .t-key { width: 12px; height: 2px; flex-shrink: 0; }
+  .tooltip .t-val { font-weight: 600; color: var(--text-primary); }
+  .tooltip .t-name { color: var(--text-secondary); font-size: 11px; }
+
+  details.table-view { margin-top: 4px; }
+  details.table-view summary { cursor: pointer; font-size: 12px; color: var(--text-secondary); }
+  .table-scroll { max-height: 280px; overflow-y: auto; margin-top: 10px; border: 1px solid var(--border); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: right; padding: 5px 10px; font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child { text-align: left; }
+  th { position: sticky; top: 0; background: var(--surface-1); color: var(--text-muted); font-weight: 500; border-bottom: 1px solid var(--border); }
+  tr:not(:last-child) td { border-bottom: 1px solid var(--gridline); }
+
+  .caveat { font-size: 12px; color: var(--text-secondary); line-height: 1.6; }
+  .caveat b { color: var(--text-primary); }
+  .caveat + .caveat { margin-top: 10px; }
+</style>
+
+<div class="viz-root">
+  <h1>Refit coefficients: measured on real hardware</h1>
+  <p class="subtitle">New TFA sweep with the refit all-pass coefficients (<code>a1=0.026173</code>, <code>a2=0.236810</code>) actually loaded on the board. Dotted line is the model's prediction from the previous fit &mdash; shown to check the model against reality, not as a third measurement.</p>
+
+  <div class="card notice">
+    <p class="chart-title">Note on this file's column order</p>
+    <p class="caveat">
+      This upload's two phase columns come out swapped relative to the previous file's off-then-on convention &mdash; the
+      first column matches the previous <b>predicted equalized</b> curve almost exactly, and the second matches the
+      previous <b>measured analog-only</b> curve. Labels below are corrected for that (off = the curve matching the prior
+      analog measurement, on = the curve matching the prior equalized prediction). Flagging this so it's not lost if this
+      file gets revisited &mdash; worth checking the TFA channel routing before the next sweep.
+    </p>
+  </div>
+
+  <div class="stat-grid" id="statGrid"></div>
+
+  <div class="card">
+    <p class="chart-title">Group delay vs. frequency</p>
+    <p class="chart-note">Same 181-point Savitzky&ndash;Golay smoothing as the corrected analysis. Both solid lines are real measurements from this new sweep; the dotted line replays the earlier numeric prediction for comparison.</p>
+    <div class="legend" id="legendEl"></div>
+    <div style="position:relative">
+      <svg id="chart" viewBox="0 0 900 400" width="100%"></svg>
+      <div class="tooltip" id="tooltip"></div>
+    </div>
+    <details class="table-view">
+      <summary>View as table (every 12th point)</summary>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Freq (Hz)</th><th>Off (measured)</th><th>On, new coeffs (measured)</th><th>On, predicted</th></tr></thead>
+          <tbody id="tableBody"></tbody>
+        </table>
+      </div>
+    </details>
+  </div>
+
+  <div class="card">
+    <p class="chart-title">Reading this result</p>
+    <p class="caveat">
+      Over 100&ndash;8000&thinsp;Hz: analog alone <b>71.3&thinsp;&micro;s p-p</b> (essentially identical to the previous
+      session's 71.2&thinsp;&micro;s &mdash; the Hi-Z buffers are giving repeatable measurements) &rarr; with the new
+      coefficients, <b>20.3&thinsp;&micro;s p-p</b>, a real ~3.5&times; reduction. Mean added delay measured at
+      <b>125.2&thinsp;&micro;s (2.003 samples @ 16&thinsp;kHz)</b> &mdash; within 1&thinsp;&micro;s of the fit's own
+      125.4&thinsp;&micro;s/2.006-sample prediction. The predicted curve tracks the real measured "on" curve to within
+      ~2&thinsp;&micro;s RMS (4.4&thinsp;&micro;s worst-case) across the whole band &mdash; the numeric fit is behaving on
+      the bench essentially the way the model said it would.
+    </p>
+    <p class="caveat">
+      <b>What this validates, and what it doesn't:</b> the group-delay/dispersion side of the refit is now confirmed on
+      real hardware, not just predicted. It does <b>not</b> by itself confirm the equalizer helps IMD3 &mdash; the earlier
+      real-hardware finding that the old coefficients hurt IMD3 was driven by factors an all-pass delay fit can't touch
+      (insertion loss, a possible <code>'I'</code> interpolation confound), and those haven't been re-measured with these
+      coefficients. <code>g</code> stays off by default until that IMD delay-sweep is re-run.
+    </p>
+  </div>
+</div>
+
+<script>
+(function() {
+  const DATA = {"fmid": [11.7, 35.2, 58.6, 82.0, 105.5, 128.9, 152.3, 175.8, 199.2, 222.6, 246.1, 269.5, 292.9, 316.4, 339.8, 363.3, 386.7, 410.1, 433.6, 457.0, 480.4, 503.9, 527.3, 550.7, 574.2, 597.6, 621.0, 644.5, 667.9, 691.4, 714.8, 738.2, 761.7, 785.1, 808.5, 832.0, 855.4, 878.8, 902.3, 925.7, 949.1, 972.6, 996.0, 1019.5, 1042.9, 1066.3, 1089.8, 1113.2, 1136.6, 1160.1, 1183.5, 1206.9, 1230.4, 1253.8, 1277.2, 1300.7, 1324.1, 1347.6, 1371.0, 1394.4, 1417.9, 1441.3, 1464.7, 1488.2, 1511.6, 1535.0, 1558.5, 1581.9, 1605.3, 1628.8, 1652.2, 1675.7, 1699.1, 1722.5, 1746.0, 1769.4, 1792.8, 1816.3, 1839.7, 1863.1, 1886.6, 1910.0, 1933.4, 1956.9, 1980.3, 2003.8, 2027.2, 2050.6, 2074.1, 2097.5, 2120.9, 2144.4, 2167.8, 2191.2, 2214.7, 2238.1, 2261.5, 2285.0, 2308.4, 2331.8, 2355.3, 2378.7, 2402.2, 2425.6, 2449.0, 2472.5, 2495.9, 2519.3, 2542.8, 2566.2, 2589.6, 2613.1, 2636.5, 2659.9, 2683.4, 2706.8, 2730.3, 2753.7, 2777.1, 2800.6, 2824.0, 2847.4, 2870.9, 2894.3, 2917.7, 2941.2, 2964.6, 2988.0, 3011.5, 3034.9, 3058.4, 3081.8, 3105.2, 3128.7, 3152.1, 3175.5, 3199.0, 3222.4, 3245.8, 3269.3, 3292.7, 3316.1, 3339.6, 3363.0, 3386.5, 3409.9, 3433.3, 3456.8, 3480.2, 3503.6, 3527.1, 3550.5, 3573.9, 3597.4, 3620.8, 3644.2, 3667.7, 3691.1, 3714.6, 3738.0, 3761.4, 3784.9, 3808.3, 3831.7, 3855.2, 3878.6, 3902.0, 3925.5, 3948.9, 3972.3, 3995.8, 4019.2, 4042.7, 4066.1, 4089.5, 4113.0, 4136.4, 4159.8, 4183.3, 4206.7, 4230.1, 4253.6, 4277.0, 4300.4, 4323.9, 4347.3, 4370.8, 4394.2, 4417.6, 4441.1, 4464.5, 4487.9, 4511.4, 4534.8, 4558.2, 4581.7, 4605.1, 4628.5, 4652.0, 4675.4, 4698.9, 4722.3, 4745.7, 4769.2, 4792.6, 4816.0, 4839.5, 4862.9, 4886.3, 4909.8, 4933.2, 4956.6, 4980.1, 5003.5, 5027.0, 5050.4, 5073.8, 5097.3, 5120.7, 5144.1, 5167.6, 5191.0, 5214.4, 5237.9, 5261.3, 5284.7, 5308.2, 5331.6, 5355.1, 5378.5, 5401.9, 5425.4, 5448.8, 5472.2, 5495.7, 5519.1, 5542.5, 5566.0, 5589.4, 5612.8, 5636.3, 5659.7, 5683.1, 5706.6, 5730.0, 5753.5, 5776.9, 5800.3, 5823.8, 5847.2, 5870.6, 5894.1, 5917.5, 5940.9, 5964.4, 5987.8, 6011.2, 6034.7, 6058.1, 6081.6, 6105.0, 6128.4, 6151.9, 6175.3, 6198.7, 6222.2, 6245.6, 6269.0, 6292.5, 6315.9, 6339.3, 6362.8, 6386.2, 6409.7, 6433.1, 6456.5, 6480.0, 6503.4, 6526.8, 6550.3, 6573.7, 6597.1, 6620.6, 6644.0, 6667.4, 6690.9, 6714.3, 6737.8, 6761.2, 6784.6, 6808.1, 6831.5, 6854.9, 6878.4, 6901.8, 6925.2, 6948.7, 6972.1, 6995.5, 7019.0, 7042.4, 7065.9, 7089.3, 7112.7, 7136.2, 7159.6, 7183.0, 7206.5, 7229.9, 7253.3, 7276.8, 7300.2, 7323.6, 7347.1, 7370.5, 7394.0, 7417.4, 7440.8, 7464.3, 7487.7, 7511.1, 7534.6, 7558.0, 7581.4, 7604.9, 7628.3, 7651.7, 7675.2, 7698.6, 7722.1, 7745.5, 7768.9, 7792.4, 7815.8, 7839.2, 7862.7, 7886.1, 7909.5, 7933.0, 7956.4, 7979.8, 8003.3, 8026.7, 8050.2, 8073.6, 8097.0, 8120.5, 8143.9, 8167.3, 8190.8, 8214.2, 8237.6, 8261.1, 8284.5, 8307.9, 8331.4, 8354.8, 8378.3, 8401.7, 8425.1, 8448.6, 8472.0], "gd_off": [92.28, 92.71, 93.13, 93.54, 93.95, 94.35, 94.74, 95.13, 95.51, 95.88, 96.25, 96.61, 96.96, 97.31, 97.65, 97.99, 98.31, 98.63, 98.95, 99.25, 99.55, 99.85, 100.13, 100.41, 100.69, 100.95, 101.21, 101.47, 101.71, 101.95, 102.19, 102.41, 102.63, 102.85, 103.05, 103.25, 103.45, 103.63, 103.81, 103.99, 104.15, 104.31, 104.47, 104.62, 104.75, 104.89, 105.02, 105.13, 105.25, 105.36, 105.45, 105.55, 105.64, 105.71, 105.79, 105.86, 105.92, 105.97, 106.02, 106.06, 106.09, 106.12, 106.14, 106.15, 106.16, 106.16, 106.15, 106.14, 106.12, 106.09, 106.06, 106.02, 105.97, 105.92, 105.86, 105.79, 105.72, 105.64, 105.55, 105.46, 105.36, 105.25, 105.14, 105.02, 104.89, 104.76, 104.62, 104.47, 104.32, 104.16, 103.02, 105.3, 102.04, 103.66, 102.24, 101.94, 101.17, 100.65, 100.2, 98.35, 100.13, 100.41, 98.11, 97.85, 99.82, 98.89, 97.11, 99.22, 99.79, 96.35, 95.62, 96.22, 98.45, 98.7, 97.25, 96.21, 95.27, 96.06, 93.73, 94.05, 95.73, 94.85, 94.14, 94.45, 96.27, 95.03, 92.78, 94.45, 93.87, 89.04, 91.05, 92.15, 90.24, 87.29, 89.76, 91.98, 92.68, 90.5, 90.51, 88.8, 84.68, 85.01, 87.28, 86.87, 82.49, 84.3, 85.58, 84.45, 84.61, 84.83, 83.67, 82.45, 81.43, 82.78, 82.61, 80.48, 80.73, 83.15, 82.27, 82.04, 80.66, 78.03, 77.85, 78.83, 78.43, 77.13, 75.91, 77.58, 76.96, 76.01, 75.98, 76.52, 74.35, 75.67, 72.92, 69.11, 68.62, 70.51, 70.77, 70.73, 71.99, 72.5, 72.82, 72.63, 71.58, 69.13, 66.97, 65.71, 66.95, 65.65, 66.72, 66.34, 65.56, 64.61, 63.19, 64.2, 62.82, 63.75, 63.79, 62.1, 62.28, 61.55, 65.3, 67.24, 65.87, 66.4, 63.58, 59.89, 61.99, 65.11, 62.3, 61.69, 60.65, 58.65, 59.68, 60.5, 60.25, 59.03, 58.02, 58.86, 57.88, 57.13, 56.42, 55.05, 55.38, 57.25, 56.94, 54.98, 54.91, 54.36, 54.86, 54.47, 56.23, 53.48, 54.96, 55.47, 56.21, 52.5, 54.78, 52.0, 51.47, 52.72, 50.08, 49.89, 55.63, 49.18, 49.95, 49.7, 49.23, 49.85, 50.33, 47.67, 49.16, 50.66, 47.98, 52.03, 49.81, 52.11, 51.39, 38.94, 41.59, 41.57, 37.73, 43.14, 55.86, 45.4, 44.74, 40.81, 46.1, 46.84, 42.61, 43.69, 43.36, 43.15, 42.94, 42.73, 42.53, 42.32, 42.12, 41.93, 41.73, 41.54, 41.35, 41.17, 40.98, 40.8, 40.63, 40.45, 40.28, 40.1, 39.94, 39.77, 39.61, 39.45, 39.29, 39.14, 38.99, 38.84, 38.69, 38.55, 38.41, 38.27, 38.13, 38.0, 37.87, 37.74, 37.61, 37.49, 37.37, 37.25, 37.14, 37.02, 36.92, 36.81, 36.7, 36.6, 36.5, 36.4, 36.31, 36.22, 36.13, 36.05, 35.96, 35.88, 35.8, 35.73, 35.65, 35.58, 35.52, 35.45, 35.39, 35.33, 35.27, 35.22, 35.17, 35.12, 35.07, 35.03, 34.99, 34.95, 34.91, 34.88, 34.85, 34.82, 34.79, 34.77, 34.75, 34.73, 34.72, 34.71, 34.7, 34.69, 34.68, 34.68, 34.69, 34.69, 34.69, 34.7, 34.72, 34.73, 34.75, 34.76], "gd_on_new": [191.05, 191.44, 191.83, 192.22, 192.6, 192.97, 193.34, 193.71, 194.07, 194.42, 194.77, 195.12, 195.46, 195.79, 196.12, 196.45, 196.77, 197.09, 197.39, 197.7, 198.0, 198.3, 198.59, 198.87, 199.16, 199.43, 199.7, 199.97, 200.23, 200.49, 200.74, 200.98, 201.23, 201.46, 201.69, 201.92, 202.14, 202.36, 202.57, 202.78, 202.98, 203.18, 203.37, 203.56, 203.74, 203.92, 204.1, 204.26, 204.42, 204.59, 204.73, 204.88, 205.03, 205.16, 205.29, 205.43, 205.54, 205.66, 205.78, 205.88, 205.99, 206.09, 206.18, 206.27, 206.36, 206.43, 206.5, 206.58, 206.64, 206.7, 206.76, 206.8, 206.85, 206.88, 206.93, 206.95, 206.97, 207.0, 207.01, 207.02, 207.03, 207.02, 207.02, 207.02, 206.99, 206.97, 206.96, 206.92, 206.89, 206.85, 206.65, 207.52, 206.15, 206.8, 205.89, 206.42, 204.84, 204.63, 204.16, 203.0, 204.34, 205.22, 203.01, 202.67, 204.36, 203.67, 202.55, 204.48, 205.36, 201.37, 201.2, 202.46, 204.37, 204.64, 202.96, 201.58, 202.13, 202.66, 200.67, 200.95, 203.01, 201.9, 201.91, 201.99, 203.81, 203.39, 200.59, 203.49, 202.48, 197.63, 199.67, 201.29, 199.79, 195.32, 199.18, 203.29, 203.32, 201.33, 202.15, 200.31, 195.01, 195.1, 197.08, 197.08, 194.76, 195.56, 196.88, 195.77, 196.61, 197.05, 196.5, 195.42, 193.91, 196.74, 195.96, 194.56, 194.6, 197.28, 196.98, 196.34, 195.07, 192.82, 192.76, 194.31, 194.66, 193.62, 193.35, 193.64, 193.71, 193.14, 192.81, 193.68, 192.69, 193.8, 190.92, 188.07, 187.21, 189.33, 190.36, 190.71, 192.68, 193.12, 193.6, 193.39, 192.64, 190.8, 187.78, 188.1, 189.7, 189.3, 189.67, 190.16, 189.18, 188.65, 188.36, 188.36, 187.77, 189.25, 190.42, 187.87, 188.6, 188.38, 191.28, 193.58, 193.56, 193.92, 191.18, 190.87, 191.72, 191.32, 187.38, 188.4, 190.08, 191.95, 191.86, 191.78, 192.33, 191.38, 190.74, 191.57, 191.91, 190.64, 192.15, 190.6, 190.78, 192.33, 193.49, 192.18, 192.0, 191.1, 191.71, 192.22, 194.15, 191.47, 194.27, 195.36, 196.44, 193.66, 195.72, 192.97, 193.68, 193.69, 192.7, 193.05, 193.32, 199.99, 196.12, 194.95, 196.76, 194.81, 195.08, 191.54, 194.79, 196.72, 194.58, 193.84, 194.1, 207.31, 198.89, 190.67, 190.84, 191.54, 190.71, 194.0, 204.12, 196.27, 195.93, 194.93, 198.04, 199.31, 196.31, 196.8, 197.39, 197.49, 197.57, 197.66, 197.76, 197.84, 197.93, 198.02, 198.1, 198.2, 198.27, 198.36, 198.44, 198.53, 198.62, 198.69, 198.78, 198.86, 198.94, 199.03, 199.1, 199.18, 199.27, 199.34, 199.42, 199.5, 199.57, 199.65, 199.73, 199.8, 199.88, 199.96, 200.02, 200.11, 200.17, 200.24, 200.32, 200.39, 200.47, 200.53, 200.61, 200.67, 200.74, 200.81, 200.87, 200.94, 201.01, 201.08, 201.14, 201.21, 201.27, 201.33, 201.41, 201.46, 201.52, 201.59, 201.65, 201.71, 201.77, 201.84, 201.89, 201.95, 202.02, 202.07, 202.13, 202.18, 202.24, 202.3, 202.35, 202.4, 202.46, 202.52, 202.56, 202.63, 202.67, 202.72, 202.78, 202.82, 202.87, 202.93, 202.97, 203.02, 203.08, 203.12, 203.16, 203.21, 203.27, 203.3, 203.36, 203.39], "gd_on_predicted": [187.74, 188.16, 188.58, 188.99, 189.39, 189.79, 190.19, 190.58, 190.96, 191.34, 191.71, 192.08, 192.44, 192.8, 193.16, 193.5, 193.84, 194.18, 194.51, 194.84, 195.16, 195.48, 195.79, 196.1, 196.4, 196.69, 196.98, 197.27, 197.55, 197.82, 198.09, 198.36, 198.62, 198.87, 199.12, 199.36, 199.6, 199.84, 200.06, 200.29, 200.51, 200.72, 200.93, 201.13, 201.33, 201.52, 201.71, 201.89, 202.06, 202.24, 202.4, 202.56, 202.72, 202.87, 203.02, 203.16, 203.29, 203.42, 203.55, 203.67, 203.78, 203.9, 204.0, 204.1, 204.2, 204.29, 204.37, 204.45, 204.52, 204.59, 204.66, 204.72, 204.77, 204.82, 204.87, 204.91, 204.94, 204.97, 204.99, 205.01, 205.03, 205.04, 205.04, 205.04, 205.03, 205.02, 205.01, 204.98, 204.96, 204.93, 204.32, 204.27, 204.13, 204.95, 203.52, 203.94, 203.03, 202.82, 202.32, 200.93, 202.42, 203.39, 201.57, 201.32, 202.86, 201.85, 200.86, 203.19, 204.09, 199.78, 199.49, 200.52, 202.67, 203.14, 201.44, 199.94, 200.34, 201.11, 199.51, 199.72, 201.76, 200.13, 200.2, 200.65, 202.95, 202.12, 198.88, 201.62, 200.48, 196.38, 198.09, 199.86, 198.54, 195.11, 198.16, 201.31, 202.05, 199.89, 200.27, 198.21, 193.6, 193.76, 196.24, 196.35, 193.71, 194.91, 196.76, 194.99, 195.81, 196.52, 195.63, 194.58, 193.18, 195.61, 195.51, 193.52, 193.97, 196.11, 196.0, 195.81, 194.26, 191.94, 192.41, 194.1, 193.81, 192.32, 192.13, 193.31, 193.37, 191.69, 191.35, 192.4, 191.66, 193.92, 190.53, 187.1, 186.9, 188.88, 189.65, 189.92, 191.76, 192.12, 192.99, 192.73, 191.72, 190.15, 187.5, 187.08, 188.35, 188.29, 188.86, 188.88, 188.59, 187.7, 187.54, 188.38, 186.86, 188.11, 189.07, 186.83, 187.18, 186.8, 190.37, 192.52, 191.97, 192.84, 189.51, 188.65, 190.77, 191.74, 187.96, 189.1, 189.69, 189.86, 189.35, 190.32, 190.82, 189.64, 189.47, 190.56, 190.43, 189.2, 190.19, 188.28, 189.09, 190.77, 191.61, 189.61, 189.28, 189.37, 189.75, 190.33, 192.81, 190.19, 192.08, 192.72, 193.34, 191.62, 192.77, 190.79, 191.68, 191.22, 191.23, 190.1, 189.36, 198.08, 194.4, 191.97, 192.37, 193.5, 192.33, 189.18, 191.71, 194.22, 191.65, 190.43, 191.85, 205.56, 195.26, 187.11, 187.19, 187.85, 187.01, 190.07, 201.14, 193.69, 192.95, 191.56, 195.55, 196.81, 192.62, 193.65, 194.13, 194.27, 194.4, 194.54, 194.67, 194.81, 194.94, 195.08, 195.22, 195.36, 195.49, 195.63, 195.76, 195.9, 196.03, 196.16, 196.3, 196.43, 196.56, 196.69, 196.82, 196.95, 197.07, 197.2, 197.32, 197.44, 197.56, 197.67, 197.79, 197.9, 198.01, 198.12, 198.22, 198.33, 198.43, 198.52, 198.62, 198.71, 198.8, 198.88, 198.96, 199.04, 199.12, 199.19, 199.25, 199.32, 199.38, 199.44, 199.49, 199.54, 199.58, 199.62, 199.66, 199.69, 199.72, 199.74, 199.76, 199.77, 199.78, 199.79, 199.79, 199.79, 199.78, 199.77, 199.75, 199.73, 199.7, 199.67, 199.63, 199.59, 199.55, 199.5, 199.44, 199.39, 199.32, 199.25, 199.18, 199.1, 199.02, 198.93, 198.84, 198.74, 198.64, 198.54, 198.43, 198.31, 198.2, 198.07, 197.95, 197.82]};
+  const fmid = DATA.fmid, off = DATA.gd_off, onNew = DATA.gd_on_new, onPred = DATA.gd_on_predicted;
+
+  function bandStats(arr, lo, hi) {
+    const vals = [];
+    for (let i = 0; i < fmid.length; i++) {
+      if (fmid[i] >= lo && fmid[i] <= hi) vals.push(arr[i]);
+    }
+    const mn = Math.min(...vals), mx = Math.max(...vals);
+    const mean = vals.reduce((a,b)=>a+b,0) / vals.length;
+    return { mn, mx, pp: mx - mn, mean };
+  }
+  const sOff = bandStats(off, 100, 8000);
+  const sNew = bandStats(onNew, 100, 8000);
+  const addedUs = sNew.mean - sOff.mean;
+
+  const stats = [
+    { label: 'Analog alone (measured)', value: sOff.pp.toFixed(1) + ' µs p-p' },
+    { label: 'New coeffs (measured)', value: sNew.pp.toFixed(1) + ' µs p-p (~3.5×)' },
+    { label: 'Mean added delay (measured)', value: addedUs.toFixed(1) + ' µs', delta: (addedUs/1e6*16000).toFixed(3) + ' samples @ 16kHz' },
+  ];
+  const statGrid = document.getElementById('statGrid');
+  stats.forEach(s => {
+    const tile = document.createElement('div');
+    tile.className = 'stat-tile';
+    const l = document.createElement('div'); l.className = 'label'; l.textContent = s.label;
+    const v = document.createElement('div'); v.className = 'value'; v.textContent = s.value;
+    tile.appendChild(l); tile.appendChild(v);
+    if (s.delta) { const d = document.createElement('div'); d.className = 'delta'; d.textContent = s.delta; tile.appendChild(d); }
+    statGrid.appendChild(tile);
+  });
+
+  const legendEl = document.getElementById('legendEl');
+  const legendItems = [
+    { name: 'Analog only (measured)', color: 'var(--series-off)', dotted: false },
+    { name: 'g on, new coeffs (measured)', color: 'var(--series-new)', dotted: false },
+    { name: 'g on, new coeffs (predicted)', color: 'var(--text-muted)', dotted: true },
+  ];
+  legendItems.forEach(li => {
+    const item = document.createElement('div'); item.className = 'legend-item';
+    const sw = document.createElement('span');
+    sw.className = 'legend-swatch' + (li.dotted ? ' dotted' : '');
+    sw.style.background = li.dotted ? 'none' : li.color;
+    sw.style.color = li.color;
+    const name = document.createElement('span'); name.textContent = li.name;
+    item.appendChild(sw); item.appendChild(name);
+    legendEl.appendChild(item);
+  });
+
+  const svg = document.getElementById('chart');
+  const W = 900, H = 400, M = { top: 16, right: 20, bottom: 34, left: 46 };
+  const plotW = W - M.left - M.right, plotH = H - M.top - M.bottom;
+
+  const fMin = 0, fMax = Math.max(...fmid);
+  const gMin = 0, gMax = 220;
+
+  const xScale = f => M.left + (f - fMin) / (fMax - fMin) * plotW;
+  const yScale = g => M.top + plotH - (Math.min(g,gMax) - gMin) / (gMax - gMin) * plotH;
+
+  const svgns = 'http://www.w3.org/2000/svg';
+  function el(tag, attrs) {
+    const e = document.createElementNS(svgns, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+
+  const yTicks = 5;
+  for (let i = 0; i <= yTicks; i++) {
+    const g = gMin + (gMax - gMin) * i / yTicks;
+    const y = yScale(g);
+    svg.appendChild(el('line', { class: 'gridline', x1: M.left, x2: W - M.right, y1: y, y2: y }));
+    const t = el('text', { class: 'axis-label', x: M.left - 8, y: y + 3, 'text-anchor': 'end' });
+    t.textContent = Math.round(g);
+    svg.appendChild(t);
+  }
+  const xTicks = [0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000];
+  xTicks.forEach(f => {
+    if (f > fMax) return;
+    const x = xScale(f);
+    const t = el('text', { class: 'axis-label', x: x, y: H - M.bottom + 16, 'text-anchor': 'middle' });
+    t.textContent = (f / 1000) + 'k';
+    svg.appendChild(t);
+  });
+  svg.appendChild(el('line', { class: 'baseline', x1: M.left, x2: W - M.right, y1: M.top + plotH, y2: M.top + plotH }));
+
+  function pathFor(xs, ys) {
+    let d = '';
+    for (let i = 0; i < xs.length; i++) {
+      const x = xScale(xs[i]), y = yScale(ys[i]);
+      d += (i === 0 ? 'M' : 'L') + x.toFixed(2) + ',' + y.toFixed(2) + ' ';
+    }
+    return d.trim();
+  }
+  svg.appendChild(el('path', { class: 'line-pred', d: pathFor(fmid, onPred) }));
+  svg.appendChild(el('path', { class: 'line-off', d: pathFor(fmid, off) }));
+  svg.appendChild(el('path', { class: 'line-new', d: pathFor(fmid, onNew) }));
+
+  const crosshair = el('line', { class: 'crosshair', x1: 0, x2: 0, y1: M.top, y2: M.top + plotH, style: 'display:none' });
+  svg.appendChild(crosshair);
+  const dotOff = el('circle', { class: 'hover-dot', r: 4, fill: 'var(--series-off)', style: 'display:none' });
+  const dotNew = el('circle', { class: 'hover-dot', r: 4, fill: 'var(--series-new)', style: 'display:none' });
+  const dotPred = el('circle', { class: 'hover-dot', r: 3, fill: 'var(--text-muted)', style: 'display:none' });
+  svg.appendChild(dotOff); svg.appendChild(dotNew); svg.appendChild(dotPred);
+
+  const hitRect = el('rect', { x: M.left, y: M.top, width: plotW, height: plotH, fill: 'transparent' });
+  svg.appendChild(hitRect);
+
+  const tooltip = document.getElementById('tooltip');
+
+  function nearestIndex(f) {
+    let lo = 0, hi = fmid.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (fmid[mid] < f) lo = mid + 1; else hi = mid;
+    }
+    if (lo > 0 && Math.abs(fmid[lo-1] - f) < Math.abs(fmid[lo] - f)) return lo - 1;
+    return lo;
+  }
+
+  function showAt(clientX, svgRect) {
+    const px = clientX - svgRect.left;
+    const frac = px / svgRect.width;
+    const f = fMin + frac * (fMax - fMin);
+    if (f < fMin || f > fMax) { hideTooltip(); return; }
+    const idx = nearestIndex(f);
+    const fv = fmid[idx], gO = off[idx], gN = onNew[idx], gP = onPred[idx];
+    const x = xScale(fv);
+
+    crosshair.setAttribute('x1', x); crosshair.setAttribute('x2', x);
+    crosshair.style.display = '';
+    dotOff.setAttribute('cx', x); dotOff.setAttribute('cy', yScale(gO)); dotOff.style.display = '';
+    dotNew.setAttribute('cx', x); dotNew.setAttribute('cy', yScale(gN)); dotNew.style.display = '';
+    dotPred.setAttribute('cx', x); dotPred.setAttribute('cy', yScale(gP)); dotPred.style.display = '';
+
+    tooltip.innerHTML = '';
+    const fRow = document.createElement('div');
+    fRow.className = 't-freq';
+    fRow.textContent = Math.round(fv) + ' Hz';
+    tooltip.appendChild(fRow);
+
+    [
+      { name: 'analog only', val: gO, color: 'var(--series-off)' },
+      { name: 'new coeffs, measured', val: gN, color: 'var(--series-new)' },
+      { name: 'new coeffs, predicted', val: gP, color: 'var(--text-muted)' },
+    ].forEach(s => {
+      const row = document.createElement('div');
+      row.className = 't-row';
+      const key = document.createElement('span');
+      key.className = 't-key';
+      key.style.background = s.color;
+      const val = document.createElement('span');
+      val.className = 't-val';
+      val.textContent = s.val.toFixed(1) + ' µs';
+      const name = document.createElement('span');
+      name.className = 't-name';
+      name.textContent = s.name;
+      row.appendChild(key); row.appendChild(val); row.appendChild(name);
+      tooltip.appendChild(row);
+    });
+
+    const svgPxPerViewBoxUnit = svgRect.width / W;
+    tooltip.style.display = 'block';
+    let left = x * svgPxPerViewBoxUnit + 12;
+    if (left + 180 > svgRect.width) left = x * svgPxPerViewBoxUnit - 180;
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = '4px';
+  }
+  function hideTooltip() {
+    tooltip.style.display = 'none';
+    crosshair.style.display = 'none';
+    dotOff.style.display = 'none';
+    dotNew.style.display = 'none';
+    dotPred.style.display = 'none';
+  }
+
+  hitRect.addEventListener('pointermove', e => {
+    showAt(e.clientX, svg.getBoundingClientRect());
+  });
+  hitRect.addEventListener('pointerleave', hideTooltip);
+
+  const tbody = document.getElementById('tableBody');
+  for (let i = 0; i < fmid.length; i += 12) {
+    const tr = document.createElement('tr');
+    const c1 = document.createElement('td'); c1.textContent = Math.round(fmid[i]);
+    const c2 = document.createElement('td'); c2.textContent = off[i].toFixed(1);
+    const c3 = document.createElement('td'); c3.textContent = onNew[i].toFixed(1);
+    const c4 = document.createElement('td'); c4.textContent = onPred[i].toFixed(1);
+    tr.appendChild(c1); tr.appendChild(c2); tr.appendChild(c3); tr.appendChild(c4);
+    tbody.appendChild(tr);
+  }
+})();
+</script>

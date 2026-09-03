@@ -68,7 +68,19 @@
 // reintroduce this same bug somewhere else in this file.
 static void serial_reply(const char *fmt, ...)
 {
-    char buf[256];
+    // 2026-09-02: bumped 256 -> 512 - the 'w' reply (serial_commands.cpp's
+    // AUDIO_SRC_CHIRP handler) grew to ~500 bytes once it started reporting
+    // 'g' state too, real hardware confirmed this silently TRUNCATED the
+    // vsnprintf() output below (missing trailing \r\n - the exact symptom:
+    // "I see first response but no \r\n"). The follow-up "second w gives no
+    // response" is unrelated and NOT a bug: every source-switch command in
+    // this file (t/s/m/p/y/h/w) guards on `src != TARGET`, so re-sending
+    // 'w' while already in AUDIO_SRC_CHIRP is a deliberate, silent no-op -
+    // same behavior 't' or 'm' would show if sent twice in a row. 512 gives
+    // real headroom over every current reply in this file; the truncation
+    // guard below still fires and the debug print makes it visible if any
+    // future reply ever needs more.
+    char buf[512];
     va_list ap;
     va_start(ap, fmt);
     int len = vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -78,6 +90,10 @@ static void serial_reply(const char *fmt, ...)
         return;   // formatting error - nothing sane to send
     }
     if ((size_t)len >= sizeof(buf)) {
+        // Was a SILENT truncation until 2026-09-02 (see this function's own
+        // comment above for how that manifested) - now at least visible.
+        Serial.printf("[serial_reply] WARNING: reply truncated, needed %d bytes, buf is %u\r\n",
+                      len, (unsigned)sizeof(buf));
         len = (int)sizeof(buf) - 1;   // truncated - still send what fit
     }
 
@@ -158,25 +174,36 @@ void handle_serial_commands(void)
                           "expect ONLY fc+/-%.0fHz sideband pair, no FM content - "
                           "isolates RSET/PWM/filter path from AD9851/DSP)\r\n",
                           AM_TEST_MOD_HZ, AM_TEST_DEPTH * 200.0f, AM_TEST_MOD_HZ);
-        } else if (c == 'w' && src != AUDIO_SRC_CHIRP) {
+        } else if (c == 'w') {
             // Sine-chirp test mode - see test_signals.h/config.h's CHIRP_*
             // constants and the .ino's dsp_task early-intercept block.
             // Resets the sweep's phase/elapsed-time state on every entry
-            // (same reset-on-transition convention as 'g'/'I' above) so
-            // 'w' always starts a clean sweep from t=0 (mute period
+            // so 'w' always starts a clean sweep from t=0 (mute period
             // first), never resuming mid-sweep from a previous session.
+            //
+            // 2026-09-02: deliberately NOT gated on `src != AUDIO_SRC_CHIRP`
+            // the way every other source-switch command above is (t/s/m/p/
+            // y/h all no-op if already in their target mode) - real
+            // hardware use turned up a genuine reason 'w' needs to differ:
+            // the 'g' group-delay-equalizer A/B workflow (toggle 'g', then
+            // re-run 'w' to compare compensated vs raw TF) NEEDS a fresh,
+            // synced restart every time, even while already mid-sweep -
+            // otherwise you're stuck waiting up to the full CHIRP_SWEEP_SEC
+            // (5s) for the next natural mute/sync marker after toggling
+            // 'g', rather than getting an immediate clean trigger point for
+            // the TF rig. Re-sending 'w' while already sweeping is now a
+            // real, useful "restart now" action, not a redundant re-select.
             // NOTE: CMD_DEBUG_PIN_ENABLED (config.h) must be 0 for the
             // chirp's square-wave reference on pin39 to be glitch-free -
             // it shares that physical pin with TIMING_DEBUG_GPIO_CMD.
             test_signals_chirp_reset();
             dsp_state_set_audio_source(AUDIO_SRC_CHIRP);
-            serial_reply("-> sine chirp test (%.0fHz-%.0fHz log sweep, %.1fs, %.0fms mute/sync marker "
-                          "at each restart, square-wave ref on pin%d - characterizes the envelope/PWM "
-                          "filter's TF; runs at the full %dx fast-tick rate, bypasses the normal pipeline "
-                          "EXCEPT the 'u'/'j'/'i'/'k'/'D' DC mapping, which still applies - use those, "
-                          "not gain, to move the sweep's operating point on the duty range)\r\n",
+            serial_reply("-> sine chirp test (%.0fHz-%.0fHz, %.1fs sweep, %.0fms mute/sync, ref pin%d, "
+                          "%dx fast-tick); DC mapping ('u'/'j'/'i'/'k'/'D') still applies, gdeq ('g') "
+                          "currently %s - toggle 'g' + re-run 'w' to A/B compensated vs raw TF\r\n",
                           CHIRP_F0_HZ, CHIRP_F1_HZ, CHIRP_SWEEP_SEC, CHIRP_MUTE_SEC * 1000.0f,
-                          CHIRP_REF_GPIO, ENVELOPE_INTERP_FACTOR);
+                          CHIRP_REF_GPIO, ENVELOPE_INTERP_FACTOR,
+                          envelope_gdeq_get_enabled() ? "ON" : "OFF");
         } else if (c == 'T') {
             // Steps the two-tone pair through TWOTONE_BAND_PRESETS
             // (test_signals.cpp) - lets you sweep the pair across the

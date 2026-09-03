@@ -1,0 +1,421 @@
+<title>GDEQ Refit vs Measured</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --gridline:       #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --series-analog:  #2a78d6;
+    --series-old:     #eb6834;
+    --series-new:     #1baf7a;
+    --band-fill:      rgba(11,11,11,0.045);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --gridline:       #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --series-analog:  #3987e5;
+      --series-old:     #d95926;
+      --series-new:     #199e70;
+      --band-fill:      rgba(255,255,255,0.05);
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --gridline:       #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --series-analog:  #3987e5;
+    --series-old:     #d95926;
+    --series-new:     #199e70;
+    --band-fill:      rgba(255,255,255,0.05);
+  }
+
+  * { box-sizing: border-box; }
+  body { background: var(--page); margin: 0; }
+  .viz-root {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: var(--text-primary);
+    background: var(--page);
+    padding: 24px;
+    max-width: 980px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--text-secondary); font-size: 13px; margin: 0 0 20px; line-height: 1.5; }
+
+  .card {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .card.notice {
+    border-left: 3px solid var(--series-old);
+  }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .stat-tile {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .stat-tile .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px; }
+  .stat-tile .value { font-size: 20px; font-weight: 600; }
+  .stat-tile .delta { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+  .stat-tile .tag { display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; padding: 2px 6px; border-radius: 4px; margin-top: 6px; }
+  .tag.measured { color: var(--series-analog); background: color-mix(in srgb, var(--series-analog) 15%, transparent); }
+  .tag.predicted { color: var(--series-new); background: color-mix(in srgb, var(--series-new) 15%, transparent); }
+
+  .chart-title { font-size: 14px; font-weight: 600; margin: 0 0 2px; }
+  .chart-note { font-size: 12px; color: var(--text-secondary); margin: 0 0 14px; line-height: 1.5; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 18px; font-size: 12px; color: var(--text-secondary); margin-bottom: 8px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-swatch { width: 18px; height: 2px; border-radius: 1px; }
+  .legend-swatch.dashed { background: none; border-top: 2px dashed currentColor; height: 0; }
+
+  svg { display: block; overflow: visible; }
+  .gridline { stroke: var(--gridline); stroke-width: 1; }
+  .baseline { stroke: var(--baseline); stroke-width: 1; }
+  .axis-label { fill: var(--text-muted); font-size: 10px; }
+  .band-fill { fill: var(--band-fill); }
+  .band-label { fill: var(--text-muted); font-size: 10px; }
+  .cutoff-line { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 2,3; }
+  .cutoff-label { fill: var(--text-muted); font-size: 9px; }
+  .line-analog { fill: none; stroke: var(--series-analog); stroke-width: 2; }
+  .line-old { fill: none; stroke: var(--series-old); stroke-width: 2; }
+  .line-new { fill: none; stroke: var(--series-new); stroke-width: 2; stroke-dasharray: 5,3; }
+  .crosshair { stroke: var(--baseline); stroke-width: 1; pointer-events: none; }
+  .hover-dot { pointer-events: none; }
+
+  .tooltip {
+    position: absolute;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 12px;
+    pointer-events: none;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+    display: none;
+    min-width: 150px;
+  }
+  .tooltip .t-freq { color: var(--text-secondary); font-size: 11px; margin-bottom: 4px; }
+  .tooltip .t-row { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
+  .tooltip .t-key { width: 12px; height: 2px; flex-shrink: 0; }
+  .tooltip .t-val { font-weight: 600; color: var(--text-primary); }
+  .tooltip .t-name { color: var(--text-secondary); font-size: 11px; }
+
+  details.table-view { margin-top: 4px; }
+  details.table-view summary { cursor: pointer; font-size: 12px; color: var(--text-secondary); }
+  .table-scroll { max-height: 280px; overflow-y: auto; margin-top: 10px; border: 1px solid var(--border); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: right; padding: 5px 10px; font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child { text-align: left; }
+  th { position: sticky; top: 0; background: var(--surface-1); color: var(--text-muted); font-weight: 500; border-bottom: 1px solid var(--border); }
+  tr:not(:last-child) td { border-bottom: 1px solid var(--gridline); }
+
+  .caveat { font-size: 12px; color: var(--text-secondary); line-height: 1.6; }
+  .caveat b { color: var(--text-primary); }
+  .caveat + .caveat { margin-top: 10px; }
+</style>
+
+<div class="viz-root">
+  <h1>Group-delay equalizer: refit against real hardware, extended to 8&thinsp;kHz</h1>
+  <p class="subtitle">Same TFA sweep as before, re-read with a smoothing window sized for real (noisier) hardware data instead of the LTspice-era default &mdash; this corrects the previous chart's headline dispersion figures. New coefficients fit directly against the measured analog curve, target band widened 100&ndash;4300&thinsp;Hz &rarr; 100&ndash;8000&thinsp;Hz to match observed <code>freq_dev</code> excursions.</p>
+
+  <div class="card notice">
+    <p class="chart-title">Correction to the previous chart</p>
+    <p class="caveat">
+      The first pass at this data used a 31-point (~700&thinsp;Hz) smoothing window, which turned out to be too fine for this
+      denser, noisier real-hardware sweep &mdash; it reported <b>146.1&rarr;147.2&thinsp;&micro;s p-p</b> ("no improvement") over
+      100&ndash;4300&thinsp;Hz. A wider window (181 points, chosen from a convergence check), applied to the exact same measured
+      curves, gives <b>36.6&rarr;14.3&thinsp;&micro;s p-p</b> &mdash; a real ~61% reduction, close to the original LTspice
+      prediction (41.1&rarr;13.7&thinsp;&micro;s). The equalizer's old coefficients were doing close to what they were designed
+      to do all along, within their own fit band. This chart uses the corrected (181-point) smoothing throughout.
+    </p>
+  </div>
+
+  <div class="stat-grid" id="statGrid"></div>
+
+  <div class="card">
+    <p class="chart-title">Group delay vs. frequency</p>
+    <p class="chart-note">Analog-only and old-coefficient curves are directly <b>measured</b>. The new-coefficient curve is <b>predicted</b> &mdash; measured analog delay plus the new digital all-pass sections' computed delay &mdash; not yet re-measured on the bench with these coefficients loaded. The old-coefficient line stops at 4300&thinsp;Hz, the edge of the band it was actually fit for; past that it diverges to several hundred &micro;s (off this chart's scale) rather than something meaningful to compare.</p>
+    <div class="legend" id="legendEl"></div>
+    <div style="position:relative">
+      <svg id="chart" viewBox="0 0 900 400" width="100%"></svg>
+      <div class="tooltip" id="tooltip"></div>
+    </div>
+    <details class="table-view">
+      <summary>View as table (every 12th point)</summary>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Freq (Hz)</th><th>Analog (measured)</th><th>Old coeffs (measured)</th><th>New coeffs (predicted)</th></tr></thead>
+          <tbody id="tableBody"></tbody>
+        </table>
+      </div>
+    </details>
+  </div>
+
+  <div class="card">
+    <p class="chart-title">Reading this result</p>
+    <p class="caveat">
+      Over the new 100&ndash;8000&thinsp;Hz band, the analog filter alone measures <b>71.2&thinsp;&micro;s p-p</b>. The old
+      coefficients (fit only to 4300&thinsp;Hz) blow up to ~450&ndash;580&thinsp;&micro;s past that point &mdash; confirming a
+      real refit was needed, not just a wider claimed range. The new coefficients (<code>a1=0.026173</code>,
+      <code>a2=0.236810</code>), fit directly against this measured analog curve, predict <b>18.5&thinsp;&micro;s p-p</b> across
+      the full extended band (~3.9&times;), with ~125&thinsp;&micro;s mean added delay (2.006 samples @ 16&thinsp;kHz).
+    </p>
+    <p class="caveat">
+      <b>Still open:</b> this is a better-fitted equalizer, not a re-validated one. A separate, independently-confirmed
+      real-hardware IMD test (documented in <code>group_delay_fit_notes.md</code>) found the <i>old</i> coefficients made
+      3rd-order two-tone IMD 6&ndash;10&thinsp;dB worse, for reasons beyond narrowband delay flatness &mdash; the all-pass
+      structure can't touch this filter's real insertion-loss penalty, and a separate envelope-interpolation confound was
+      never fully ruled out. This refit answers two of that finding's four suspected causes (the narrow fit window, and
+      possibly the DC-bias measurement inconsistency the Hi-Z buffers were added to fix) but not the other two. <code>g</code>
+      stays off by default until the same IMD delay-sweep procedure is re-run against these new coefficients.
+    </p>
+  </div>
+</div>
+
+<script>
+(function() {
+  const DATA = {"fmid": [11.7, 35.2, 58.6, 82.0, 105.5, 128.9, 152.3, 175.8, 199.2, 222.6, 246.1, 269.5, 292.9, 316.4, 339.8, 363.3, 386.7, 410.1, 433.6, 457.0, 480.4, 503.9, 527.3, 550.7, 574.2, 597.6, 621.0, 644.5, 667.9, 691.4, 714.8, 738.2, 761.7, 785.1, 808.5, 832.0, 855.4, 878.8, 902.3, 925.7, 949.1, 972.6, 996.0, 1019.5, 1042.9, 1066.3, 1089.8, 1113.2, 1136.6, 1160.1, 1183.5, 1206.9, 1230.4, 1253.8, 1277.2, 1300.7, 1324.1, 1347.6, 1371.0, 1394.4, 1417.9, 1441.3, 1464.7, 1488.2, 1511.6, 1535.0, 1558.5, 1581.9, 1605.3, 1628.8, 1652.2, 1675.7, 1699.1, 1722.5, 1746.0, 1769.4, 1792.8, 1816.3, 1839.7, 1863.1, 1886.6, 1910.0, 1933.4, 1956.9, 1980.3, 2003.8, 2027.2, 2050.6, 2074.1, 2097.5, 2120.9, 2144.4, 2167.8, 2191.2, 2214.7, 2238.1, 2261.5, 2285.0, 2308.4, 2331.8, 2355.3, 2378.7, 2402.2, 2425.6, 2449.0, 2472.5, 2495.9, 2519.3, 2542.8, 2566.2, 2589.6, 2613.1, 2636.5, 2659.9, 2683.4, 2706.8, 2730.3, 2753.7, 2777.1, 2800.6, 2824.0, 2847.4, 2870.9, 2894.3, 2917.7, 2941.2, 2964.6, 2988.0, 3011.5, 3034.9, 3058.4, 3081.8, 3105.2, 3128.7, 3152.1, 3175.5, 3199.0, 3222.4, 3245.8, 3269.3, 3292.7, 3316.1, 3339.6, 3363.0, 3386.5, 3409.9, 3433.3, 3456.8, 3480.2, 3503.6, 3527.1, 3550.5, 3573.9, 3597.4, 3620.8, 3644.2, 3667.7, 3691.1, 3714.6, 3738.0, 3761.4, 3784.9, 3808.3, 3831.7, 3855.2, 3878.6, 3902.0, 3925.5, 3948.9, 3972.3, 3995.8, 4019.2, 4042.7, 4066.1, 4089.5, 4113.0, 4136.4, 4159.8, 4183.3, 4206.7, 4230.1, 4253.6, 4277.0, 4300.4, 4323.9, 4347.3, 4370.8, 4394.2, 4417.6, 4441.1, 4464.5, 4487.9, 4511.4, 4534.8, 4558.2, 4581.7, 4605.1, 4628.5, 4652.0, 4675.4, 4698.9, 4722.3, 4745.7, 4769.2, 4792.6, 4816.0, 4839.5, 4862.9, 4886.3, 4909.8, 4933.2, 4956.6, 4980.1, 5003.5, 5027.0, 5050.4, 5073.8, 5097.3, 5120.7, 5144.1, 5167.6, 5191.0, 5214.4, 5237.9, 5261.3, 5284.7, 5308.2, 5331.6, 5355.1, 5378.5, 5401.9, 5425.4, 5448.8, 5472.2, 5495.7, 5519.1, 5542.5, 5566.0, 5589.4, 5612.8, 5636.3, 5659.7, 5683.1, 5706.6, 5730.0, 5753.5, 5776.9, 5800.3, 5823.8, 5847.2, 5870.6, 5894.1, 5917.5, 5940.9, 5964.4, 5987.8, 6011.2, 6034.7, 6058.1, 6081.6, 6105.0, 6128.4, 6151.9, 6175.3, 6198.7, 6222.2, 6245.6, 6269.0, 6292.5, 6315.9, 6339.3, 6362.8, 6386.2, 6409.7, 6433.1, 6456.5, 6480.0, 6503.4, 6526.8, 6550.3, 6573.7, 6597.1, 6620.6, 6644.0, 6667.4, 6690.9, 6714.3, 6737.8, 6761.2, 6784.6, 6808.1, 6831.5, 6854.9, 6878.4, 6901.8, 6925.2, 6948.7, 6972.1, 6995.5, 7019.0, 7042.4, 7065.9, 7089.3, 7112.7, 7136.2, 7159.6, 7183.0, 7206.5, 7229.9, 7253.3, 7276.8, 7300.2, 7323.6, 7347.1, 7370.5, 7394.0, 7417.4, 7440.8, 7464.3, 7487.7, 7511.1, 7534.6, 7558.0, 7581.4, 7604.9, 7628.3, 7651.7, 7675.2, 7698.6, 7722.1, 7745.5, 7768.9, 7792.4, 7815.8, 7839.2, 7862.7, 7886.1, 7909.5, 7933.0, 7956.4, 7979.8, 8003.3, 8026.7, 8050.2, 8073.6, 8097.0, 8120.5, 8143.9, 8167.3, 8190.8, 8214.2, 8237.6, 8261.1, 8284.5, 8307.9, 8331.4, 8354.8, 8378.3, 8401.7, 8425.1, 8448.6, 8472.0], "gd_off": [89.86, 90.28, 90.7, 91.1, 91.5, 91.89, 92.28, 92.66, 93.04, 93.4, 93.76, 94.12, 94.47, 94.81, 95.14, 95.47, 95.79, 96.11, 96.42, 96.72, 97.02, 97.31, 97.59, 97.87, 98.14, 98.4, 98.66, 98.91, 99.16, 99.39, 99.63, 99.85, 100.07, 100.28, 100.49, 100.69, 100.88, 101.07, 101.25, 101.42, 101.59, 101.75, 101.9, 102.05, 102.19, 102.32, 102.46, 102.57, 102.69, 102.8, 102.9, 102.99, 103.09, 103.17, 103.24, 103.32, 103.38, 103.43, 103.49, 103.53, 103.57, 103.6, 103.62, 103.64, 103.66, 103.66, 103.66, 103.65, 103.63, 103.61, 103.59, 103.55, 103.51, 103.47, 103.42, 103.35, 103.29, 103.22, 103.14, 103.05, 102.96, 102.86, 102.76, 102.65, 102.53, 102.4, 102.28, 102.13, 102.0, 101.84, 101.12, 100.94, 100.68, 101.37, 99.81, 100.11, 99.07, 98.73, 98.1, 96.57, 97.93, 98.76, 96.8, 96.41, 97.8, 96.65, 95.51, 97.69, 98.45, 93.99, 93.55, 94.42, 96.42, 96.73, 94.87, 93.21, 93.45, 94.06, 92.3, 92.33, 94.21, 92.41, 92.31, 92.58, 94.71, 93.71, 90.29, 92.84, 91.52, 87.24, 88.76, 90.35, 88.84, 85.21, 88.08, 91.03, 91.57, 89.22, 89.4, 87.13, 82.32, 82.28, 84.55, 84.45, 81.6, 82.59, 84.22, 82.25, 82.84, 83.34, 82.23, 80.95, 79.33, 81.53, 81.2, 78.98, 79.19, 81.1, 80.76, 80.32, 78.54, 75.98, 76.2, 77.65, 77.1, 75.36, 74.93, 75.85, 75.66, 73.72, 73.12, 73.91, 72.91, 74.9, 71.25, 67.53, 67.07, 68.78, 69.28, 69.27, 70.83, 70.91, 71.49, 70.95, 69.66, 67.8, 64.85, 64.15, 65.12, 64.77, 65.04, 64.76, 64.17, 62.97, 62.51, 63.04, 61.21, 62.15, 62.8, 60.24, 60.28, 59.57, 62.83, 64.66, 63.78, 64.33, 60.67, 59.48, 61.27, 61.91, 57.8, 58.6, 58.85, 58.69, 57.83, 58.46, 58.62, 57.09, 56.58, 57.31, 56.84, 55.26, 55.89, 53.63, 54.09, 55.41, 55.89, 53.53, 52.85, 52.57, 52.59, 52.81, 54.93, 51.95, 53.47, 53.74, 53.99, 51.9, 52.69, 50.34, 50.86, 50.02, 49.66, 48.16, 47.03, 55.41, 51.34, 48.54, 48.56, 49.32, 47.78, 44.26, 46.41, 48.54, 45.6, 44.01, 45.03, 58.41, 47.73, 39.18, 38.91, 39.2, 38.0, 40.68, 51.4, 43.57, 42.47, 40.71, 44.35, 45.24, 40.7, 41.37, 41.5, 41.28, 41.06, 40.85, 40.64, 40.43, 40.22, 40.02, 39.82, 39.62, 39.42, 39.23, 39.04, 38.85, 38.67, 38.48, 38.3, 38.12, 37.95, 37.78, 37.61, 37.44, 37.28, 37.11, 36.95, 36.8, 36.64, 36.49, 36.34, 36.19, 36.05, 35.91, 35.77, 35.64, 35.5, 35.37, 35.24, 35.11, 34.99, 34.87, 34.75, 34.64, 34.52, 34.41, 34.3, 34.2, 34.1, 34.0, 33.9, 33.81, 33.71, 33.62, 33.54, 33.45, 33.37, 33.29, 33.21, 33.14, 33.07, 33.0, 32.93, 32.87, 32.81, 32.75, 32.69, 32.64, 32.59, 32.54, 32.49, 32.45, 32.41, 32.37, 32.33, 32.3, 32.27, 32.24, 32.22, 32.19, 32.17, 32.16, 32.14, 32.13, 32.12, 32.11, 32.11, 32.11, 32.11, 32.11, 32.12, 32.13], "gd_on_old": [124.22, 124.55, 124.89, 125.21, 125.54, 125.86, 126.17, 126.49, 126.79, 127.1, 127.4, 127.69, 127.98, 128.27, 128.56, 128.84, 129.11, 129.38, 129.65, 129.91, 130.17, 130.43, 130.68, 130.93, 131.17, 131.41, 131.65, 131.88, 132.11, 132.33, 132.55, 132.76, 132.98, 133.18, 133.39, 133.59, 133.78, 133.97, 134.16, 134.34, 134.52, 134.7, 134.87, 135.04, 135.2, 135.36, 135.52, 135.66, 135.81, 135.96, 136.09, 136.23, 136.36, 136.48, 136.61, 136.73, 136.84, 136.95, 137.07, 137.16, 137.26, 137.36, 137.45, 137.53, 137.62, 137.69, 137.77, 137.85, 137.91, 137.97, 138.03, 138.08, 138.13, 138.18, 138.23, 138.26, 138.3, 138.33, 138.35, 138.37, 138.4, 138.41, 138.42, 138.43, 138.43, 138.42, 138.43, 138.41, 138.4, 138.38, 137.83, 137.9, 137.67, 138.36, 137.34, 137.85, 136.27, 136.16, 135.66, 134.55, 136.12, 137.28, 134.56, 134.47, 136.11, 135.66, 134.26, 136.8, 136.86, 133.45, 133.14, 134.18, 136.2, 136.85, 135.41, 134.25, 134.71, 134.94, 132.52, 132.74, 134.79, 134.28, 133.85, 134.26, 136.07, 135.46, 133.11, 135.35, 134.9, 129.61, 132.97, 133.77, 131.99, 128.35, 132.27, 136.23, 136.62, 134.89, 134.88, 132.42, 127.62, 127.64, 130.24, 130.77, 127.64, 129.68, 130.56, 129.79, 130.28, 130.81, 130.17, 129.42, 128.08, 130.41, 129.87, 128.98, 129.06, 131.73, 131.45, 130.79, 129.56, 127.49, 127.76, 129.27, 129.81, 129.06, 128.3, 129.8, 128.91, 128.36, 128.63, 129.74, 128.59, 130.01, 127.66, 124.69, 124.16, 126.73, 128.23, 128.77, 130.62, 131.51, 132.05, 131.96, 131.18, 129.62, 127.15, 127.44, 129.59, 129.18, 130.28, 130.62, 129.48, 128.93, 129.24, 130.13, 129.24, 131.62, 132.35, 130.18, 131.37, 131.63, 134.7, 138.49, 137.59, 140.53, 136.0, 137.28, 138.87, 138.96, 135.84, 137.02, 139.34, 142.06, 141.05, 141.63, 143.96, 143.02, 143.52, 145.11, 145.34, 145.33, 146.94, 147.01, 148.14, 150.5, 152.46, 151.19, 152.07, 152.26, 153.96, 155.24, 159.3, 157.51, 162.33, 163.42, 165.99, 164.32, 168.61, 167.85, 169.14, 171.93, 171.13, 174.66, 182.06, 179.31, 179.7, 184.94, 191.35, 188.11, 191.86, 191.45, 200.88, 199.25, 200.73, 208.51, 207.91, 215.67, 218.51, 212.0, 215.99, 220.41, 221.87, 229.5, 245.24, 238.73, 244.19, 244.59, 252.7, 257.17, 258.05, 263.2, 255.64, 258.96, 262.31, 265.7, 269.15, 272.62, 276.14, 279.72, 283.32, 286.98, 290.66, 294.4, 298.18, 302.0, 305.88, 309.77, 313.73, 317.71, 321.75, 325.84, 329.94, 334.11, 338.33, 342.56, 346.85, 351.2, 355.56, 359.98, 364.46, 368.94, 373.49, 378.1, 382.71, 387.4, 392.1, 396.86, 401.66, 406.51, 411.41, 416.33, 421.32, 426.32, 431.37, 436.49, 441.62, 446.81, 452.03, 457.32, 462.62, 468.0, 473.38, 478.82, 484.32, 489.83, 495.4, 501.03, 506.67, 512.37, 518.11, 523.91, 529.71, 535.58, 541.52, 547.45, 553.47, 559.48, 565.56, 571.71, 577.86, 584.07, 590.32, 596.64, 602.95, 609.36, 615.75, 622.22, 628.75, 635.28, 641.87, 648.53, 655.19, 661.91, 668.7, 675.48, 682.33, 689.22, 696.18, 703.13, 710.18, 717.21], "gd_new_predicted": [187.74, 188.16, 188.58, 188.99, 189.39, 189.79, 190.19, 190.58, 190.96, 191.34, 191.71, 192.08, 192.44, 192.8, 193.16, 193.5, 193.84, 194.18, 194.51, 194.84, 195.16, 195.48, 195.79, 196.1, 196.4, 196.69, 196.98, 197.27, 197.55, 197.82, 198.09, 198.36, 198.62, 198.87, 199.12, 199.36, 199.6, 199.84, 200.06, 200.29, 200.51, 200.72, 200.93, 201.13, 201.33, 201.52, 201.71, 201.89, 202.06, 202.24, 202.4, 202.56, 202.72, 202.87, 203.02, 203.16, 203.29, 203.42, 203.55, 203.67, 203.78, 203.9, 204.0, 204.1, 204.2, 204.29, 204.37, 204.45, 204.52, 204.59, 204.66, 204.72, 204.77, 204.82, 204.87, 204.91, 204.94, 204.97, 204.99, 205.01, 205.03, 205.04, 205.04, 205.04, 205.03, 205.02, 205.01, 204.98, 204.96, 204.93, 204.32, 204.27, 204.13, 204.95, 203.52, 203.94, 203.03, 202.82, 202.32, 200.93, 202.42, 203.39, 201.57, 201.32, 202.86, 201.85, 200.86, 203.19, 204.09, 199.78, 199.49, 200.52, 202.67, 203.14, 201.44, 199.94, 200.34, 201.11, 199.51, 199.72, 201.76, 200.13, 200.2, 200.65, 202.95, 202.12, 198.88, 201.62, 200.48, 196.38, 198.09, 199.86, 198.54, 195.1, 198.16, 201.31, 202.05, 199.89, 200.27, 198.21, 193.6, 193.76, 196.24, 196.35, 193.7, 194.91, 196.76, 194.99, 195.81, 196.52, 195.63, 194.58, 193.18, 195.61, 195.51, 193.52, 193.97, 196.11, 196.0, 195.81, 194.26, 191.94, 192.41, 194.1, 193.81, 192.32, 192.13, 193.31, 193.37, 191.69, 191.35, 192.4, 191.66, 193.92, 190.53, 187.09, 186.9, 188.88, 189.65, 189.92, 191.76, 192.12, 192.99, 192.73, 191.72, 190.15, 187.49, 187.08, 188.35, 188.29, 188.86, 188.88, 188.59, 187.7, 187.54, 188.38, 186.86, 188.11, 189.07, 186.83, 187.18, 186.8, 190.37, 192.52, 191.97, 192.84, 189.51, 188.65, 190.77, 191.74, 187.96, 189.1, 189.69, 189.86, 189.35, 190.32, 190.82, 189.64, 189.47, 190.56, 190.43, 189.2, 190.19, 188.28, 189.09, 190.77, 191.61, 189.61, 189.28, 189.37, 189.75, 190.33, 192.81, 190.19, 192.08, 192.72, 193.34, 191.62, 192.77, 190.79, 191.68, 191.22, 191.23, 190.1, 189.35, 198.1, 194.4, 191.97, 192.37, 193.5, 192.33, 189.18, 191.71, 194.22, 191.65, 190.43, 191.82, 205.57, 195.27, 187.09, 187.19, 187.85, 187.01, 190.07, 201.15, 193.68, 192.95, 191.55, 195.55, 196.81, 192.62, 193.65, 194.13, 194.27, 194.4, 194.54, 194.67, 194.81, 194.94, 195.08, 195.22, 195.36, 195.49, 195.63, 195.76, 195.9, 196.03, 196.16, 196.3, 196.43, 196.56, 196.69, 196.82, 196.95, 197.07, 197.2, 197.32, 197.44, 197.56, 197.67, 197.79, 197.9, 198.01, 198.12, 198.22, 198.33, 198.43, 198.52, 198.62, 198.71, 198.8, 198.88, 198.96, 199.04, 199.12, 199.19, 199.25, 199.32, 199.38, 199.44, 199.49, 199.54, 199.58, 199.62, 199.66, 199.69, 199.72, 199.74, 199.76, 199.77, 199.78, 199.79, 199.79, 199.79, 199.78, 199.77, 199.75, 199.73, 199.7, 199.67, 199.63, 199.59, 199.55, 199.5, 199.44, 199.39, 199.32, 199.25, 199.18, 199.1, 199.02, 198.93, 198.84, 198.74, 198.64, 198.54, 198.43, 198.31, 198.2, 198.07, 197.95, 197.82]};
+  const fmid = DATA.fmid, off = DATA.gd_off, onOld = DATA.gd_on_old, newPred = DATA.gd_new_predicted;
+  const OLD_CUTOFF = 4300;
+
+  function bandStats(arr, lo, hi) {
+    const vals = [];
+    for (let i = 0; i < fmid.length; i++) {
+      if (fmid[i] >= lo && fmid[i] <= hi) vals.push(arr[i]);
+    }
+    const mn = Math.min(...vals), mx = Math.max(...vals);
+    const mean = vals.reduce((a,b)=>a+b,0) / vals.length;
+    return { mn, mx, pp: mx - mn, mean };
+  }
+  const sAnalog = bandStats(off, 100, 8000);
+  const sOld = bandStats(onOld, 100, 4300);
+  const sNew = bandStats(newPred, 100, 8000);
+
+  const stats = [
+    { label: 'Analog alone, 100–8000 Hz', value: sAnalog.pp.toFixed(1) + ' µs p-p', tag: 'measured' },
+    { label: 'Old coeffs, 100–4300 Hz (own fit band)', value: sOld.pp.toFixed(1) + ' µs p-p', tag: 'measured' },
+    { label: 'New coeffs, 100–8000 Hz', value: sNew.pp.toFixed(1) + ' µs p-p (~3.9×)', tag: 'predicted' },
+  ];
+  const statGrid = document.getElementById('statGrid');
+  stats.forEach(s => {
+    const tile = document.createElement('div');
+    tile.className = 'stat-tile';
+    const l = document.createElement('div'); l.className = 'label'; l.textContent = s.label;
+    const v = document.createElement('div'); v.className = 'value'; v.textContent = s.value;
+    const t = document.createElement('div'); t.className = 'tag ' + s.tag; t.textContent = s.tag;
+    tile.appendChild(l); tile.appendChild(v); tile.appendChild(t);
+    statGrid.appendChild(tile);
+  });
+
+  // legend
+  const legendEl = document.getElementById('legendEl');
+  const legendItems = [
+    { name: 'Analog only (measured)', color: 'var(--series-analog)', dashed: false },
+    { name: 'g on, old coeffs, 100–4300 Hz (measured)', color: 'var(--series-old)', dashed: false },
+    { name: 'g on, new coeffs (predicted)', color: 'var(--series-new)', dashed: true },
+  ];
+  legendItems.forEach(li => {
+    const item = document.createElement('div'); item.className = 'legend-item';
+    const sw = document.createElement('span');
+    sw.className = 'legend-swatch' + (li.dashed ? ' dashed' : '');
+    sw.style.background = li.dashed ? 'none' : li.color;
+    sw.style.color = li.color;
+    const name = document.createElement('span'); name.textContent = li.name;
+    item.appendChild(sw); item.appendChild(name);
+    legendEl.appendChild(item);
+  });
+
+  // ---- chart geometry ----
+  const svg = document.getElementById('chart');
+  const W = 900, H = 400, M = { top: 16, right: 20, bottom: 34, left: 46 };
+  const plotW = W - M.left - M.right, plotH = H - M.top - M.bottom;
+
+  const fMin = 0, fMax = Math.max(...fmid);
+  const gMin = 0, gMax = 220;
+
+  const xScale = f => M.left + (f - fMin) / (fMax - fMin) * plotW;
+  const yScale = g => M.top + plotH - (Math.min(g,gMax) - gMin) / (gMax - gMin) * plotH;
+
+  const svgns = 'http://www.w3.org/2000/svg';
+  function el(tag, attrs) {
+    const e = document.createElementNS(svgns, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+
+  // gridlines + y axis labels
+  const yTicks = 5;
+  for (let i = 0; i <= yTicks; i++) {
+    const g = gMin + (gMax - gMin) * i / yTicks;
+    const y = yScale(g);
+    svg.appendChild(el('line', { class: 'gridline', x1: M.left, x2: W - M.right, y1: y, y2: y }));
+    const t = el('text', { class: 'axis-label', x: M.left - 8, y: y + 3, 'text-anchor': 'end' });
+    t.textContent = Math.round(g);
+    svg.appendChild(t);
+  }
+  const xTicks = [0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000];
+  xTicks.forEach(f => {
+    if (f > fMax) return;
+    const x = xScale(f);
+    const t = el('text', { class: 'axis-label', x: x, y: H - M.bottom + 16, 'text-anchor': 'middle' });
+    t.textContent = (f / 1000) + 'k';
+    svg.appendChild(t);
+  });
+  svg.appendChild(el('line', { class: 'baseline', x1: M.left, x2: W - M.right, y1: M.top + plotH, y2: M.top + plotH }));
+
+  // old-fit cutoff marker
+  const cutX = xScale(OLD_CUTOFF);
+  svg.appendChild(el('line', { class: 'cutoff-line', x1: cutX, x2: cutX, y1: M.top, y2: M.top + plotH }));
+  const cutLabel = el('text', { class: 'cutoff-label', x: cutX + 4, y: M.top + 10 });
+  cutLabel.textContent = 'old fit boundary';
+  svg.appendChild(cutLabel);
+
+  function pathFor(xs, ys, filterFn) {
+    let d = '';
+    let started = false;
+    for (let i = 0; i < xs.length; i++) {
+      if (filterFn && !filterFn(xs[i])) { started = false; continue; }
+      const x = xScale(xs[i]), y = yScale(ys[i]);
+      d += (!started ? 'M' : 'L') + x.toFixed(2) + ',' + y.toFixed(2) + ' ';
+      started = true;
+    }
+    return d.trim();
+  }
+  svg.appendChild(el('path', { class: 'line-analog', d: pathFor(fmid, off) }));
+  svg.appendChild(el('path', { class: 'line-old', d: pathFor(fmid, onOld, f => f <= OLD_CUTOFF) }));
+  svg.appendChild(el('path', { class: 'line-new', d: pathFor(fmid, newPred) }));
+
+  // crosshair + hover dots
+  const crosshair = el('line', { class: 'crosshair', x1: 0, x2: 0, y1: M.top, y2: M.top + plotH, style: 'display:none' });
+  svg.appendChild(crosshair);
+  const dotA = el('circle', { class: 'hover-dot', r: 4, fill: 'var(--series-analog)', style: 'display:none' });
+  const dotO = el('circle', { class: 'hover-dot', r: 4, fill: 'var(--series-old)', style: 'display:none' });
+  const dotN = el('circle', { class: 'hover-dot', r: 4, fill: 'var(--series-new)', style: 'display:none' });
+  svg.appendChild(dotA); svg.appendChild(dotO); svg.appendChild(dotN);
+
+  const hitRect = el('rect', { x: M.left, y: M.top, width: plotW, height: plotH, fill: 'transparent' });
+  svg.appendChild(hitRect);
+
+  const tooltip = document.getElementById('tooltip');
+
+  function nearestIndex(f) {
+    let lo = 0, hi = fmid.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (fmid[mid] < f) lo = mid + 1; else hi = mid;
+    }
+    if (lo > 0 && Math.abs(fmid[lo-1] - f) < Math.abs(fmid[lo] - f)) return lo - 1;
+    return lo;
+  }
+
+  function showAt(clientX, svgRect) {
+    const px = clientX - svgRect.left;
+    const frac = px / svgRect.width;
+    const f = fMin + frac * (fMax - fMin);
+    if (f < fMin || f > fMax) { hideTooltip(); return; }
+    const idx = nearestIndex(f);
+    const fv = fmid[idx], gA = off[idx], gO = onOld[idx], gN = newPred[idx];
+    const x = xScale(fv);
+    const inOldBand = fv <= OLD_CUTOFF;
+
+    crosshair.setAttribute('x1', x); crosshair.setAttribute('x2', x);
+    crosshair.style.display = '';
+    dotA.setAttribute('cx', x); dotA.setAttribute('cy', yScale(gA)); dotA.style.display = '';
+    dotN.setAttribute('cx', x); dotN.setAttribute('cy', yScale(gN)); dotN.style.display = '';
+    if (inOldBand) {
+      dotO.setAttribute('cx', x); dotO.setAttribute('cy', yScale(gO)); dotO.style.display = '';
+    } else {
+      dotO.style.display = 'none';
+    }
+
+    tooltip.innerHTML = '';
+    const fRow = document.createElement('div');
+    fRow.className = 't-freq';
+    fRow.textContent = Math.round(fv) + ' Hz';
+    tooltip.appendChild(fRow);
+
+    const rows = [
+      { name: 'analog only', val: gA, color: 'var(--series-analog)' },
+      { name: 'new coeffs (pred.)', val: gN, color: 'var(--series-new)' },
+    ];
+    if (inOldBand) rows.splice(1, 0, { name: 'old coeffs', val: gO, color: 'var(--series-old)' });
+    rows.forEach(s => {
+      const row = document.createElement('div');
+      row.className = 't-row';
+      const key = document.createElement('span');
+      key.className = 't-key';
+      key.style.background = s.color;
+      const val = document.createElement('span');
+      val.className = 't-val';
+      val.textContent = s.val.toFixed(1) + ' µs';
+      const name = document.createElement('span');
+      name.className = 't-name';
+      name.textContent = s.name;
+      row.appendChild(key); row.appendChild(val); row.appendChild(name);
+      tooltip.appendChild(row);
+    });
+
+    const svgPxPerViewBoxUnit = svgRect.width / W;
+    tooltip.style.display = 'block';
+    let left = x * svgPxPerViewBoxUnit + 12;
+    if (left + 170 > svgRect.width) left = x * svgPxPerViewBoxUnit - 170;
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = '4px';
+  }
+  function hideTooltip() {
+    tooltip.style.display = 'none';
+    crosshair.style.display = 'none';
+    dotA.style.display = 'none';
+    dotO.style.display = 'none';
+    dotN.style.display = 'none';
+  }
+
+  hitRect.addEventListener('pointermove', e => {
+    showAt(e.clientX, svg.getBoundingClientRect());
+  });
+  hitRect.addEventListener('pointerleave', hideTooltip);
+
+  // ---- table (every 12th point) ----
+  const tbody = document.getElementById('tableBody');
+  for (let i = 0; i < fmid.length; i += 12) {
+    const tr = document.createElement('tr');
+    const c1 = document.createElement('td'); c1.textContent = Math.round(fmid[i]);
+    const c2 = document.createElement('td'); c2.textContent = off[i].toFixed(1);
+    const c3 = document.createElement('td'); c3.textContent = fmid[i] <= OLD_CUTOFF ? onOld[i].toFixed(1) : '—';
+    const c4 = document.createElement('td'); c4.textContent = newPred[i].toFixed(1);
+    tr.appendChild(c1); tr.appendChild(c2); tr.appendChild(c3); tr.appendChild(c4);
+    tbody.appendChild(tr);
+  }
+})();
+</script>
