@@ -207,6 +207,57 @@ float IRAM_ATTR ssb_allpass1_process(ssb_allpass1_t *f, float x)
     return f->y1;
 }
 
+// ---- Generic high-shelf biquad (magnitude equalizer primitive) ----
+// See ssb_dsp.h's ssb_shelf_biquad_t doc comment (including why it's named
+// ssb_shelf_biquad_t rather than ssb_biquad_t - a NAME COLLISION with
+// ssb_adc_filter.h's own, different, ssb_biquad_t caused a "multiple
+// definition" link error the first time this was added; renamed to fix
+// it). RBJ Audio EQ Cookbook high-shelf, S=1 (max slope, no
+// transition-band bump/dip) - same family of formula as this file's own
+// PRIVATE biquad_set_peaking() above, just the shelf variant instead of
+// the peaking/bell variant, and exposed publicly for reuse outside this
+// file (biquad_set_peaking/highpass stay private - they're wired one
+// specific way into the pre-Hilbert audio_fx chain below and don't need a
+// public API of their own).
+void ssb_shelf_biquad_set_highshelf(ssb_shelf_biquad_t *f, float fc, float fs, float gain_db)
+{
+    float A = powf(10.0f, gain_db / 40.0f);
+    float w0 = 2.0f * M_PI * fc / fs;
+    float cosw0 = cosf(w0);
+    float sinw0 = sinf(w0);
+    // S=1 shelf slope: (A + 1/A)*(1/S - 1) term vanishes, leaving the
+    // simplified alpha below (still the general RBJ formula, just with
+    // S=1 substituted in rather than exposed as a separate parameter -
+    // this project has no use yet for a shallower/steeper shelf, and a
+    // steeper-than-S=1 slope introduces a peak/dip right at the corner
+    // that would fight the point of a smooth, boring partial correction).
+    float alpha = (sinw0 / 2.0f) * sqrtf(2.0f);
+    float sqrtA = sqrtf(A);
+
+    float a0 =        (A + 1.0f) - (A - 1.0f) * cosw0 + 2.0f * sqrtA * alpha;
+    f->b0 = ( A * ((A + 1.0f) + (A - 1.0f) * cosw0 + 2.0f * sqrtA * alpha) ) / a0;
+    f->b1 = ( -2.0f * A * ((A - 1.0f) + (A + 1.0f) * cosw0) ) / a0;
+    f->b2 = ( A * ((A + 1.0f) + (A - 1.0f) * cosw0 - 2.0f * sqrtA * alpha) ) / a0;
+    f->a1 = ( 2.0f * ((A - 1.0f) - (A + 1.0f) * cosw0) ) / a0;
+    f->a2 = ( (A + 1.0f) - (A - 1.0f) * cosw0 - 2.0f * sqrtA * alpha ) / a0;
+    f->x1 = f->x2 = f->y1 = f->y2 = 0.0f;
+}
+
+void ssb_shelf_biquad_reset(ssb_shelf_biquad_t *f)
+{
+    f->x1 = f->x2 = f->y1 = f->y2 = 0.0f;
+}
+
+float IRAM_ATTR ssb_shelf_biquad_process(ssb_shelf_biquad_t *f, float x)
+{
+    float y = f->b0 * x + f->b1 * f->x1 + f->b2 * f->x2
+                         - f->a1 * f->y1 - f->a2 * f->y2;
+    y = flush_denorm(y);
+    f->x2 = flush_denorm(f->x1); f->x1 = flush_denorm(x);
+    f->y2 = f->y1; f->y1 = y;
+    return y;
+}
+
 // Feed-forward soft limiter above threshold, fixed ratio. No log/exp/pow
 // per sample - attack/release coefficients (which DO need one expf each)
 // are computed once at init/reconfigure, never per sample.

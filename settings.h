@@ -132,6 +132,15 @@ typedef struct
     // today's actual default, not v4's older one.
     envelope_interp_curve_t envelope_interp_curve;  // 'C' - envelope_interp.h
 
+    // Added when this lever was introduced (envelope-path magnitude/
+    // insertion-loss equalizer, envelope_ampeq.h) - appended at the END
+    // for the same reason every trailing field above was: every existing
+    // preset's POSITIONAL initializer list below still lines up
+    // unchanged (C zero-fills this to false, matching its off-by-default
+    // convention), only this one new trailing value needed adding to
+    // presets that want it deliberately on.
+    bool env_ampeq_enable;  // 'a' - envelope_ampeq.h, off by default
+
 } PersistentSettings;
 
 

@@ -394,6 +394,69 @@ void ssb_allpass1_reset(ssb_allpass1_t *f);
  */
 float IRAM_ATTR ssb_allpass1_process(ssb_allpass1_t *f, float x);
 
+/**
+ * @brief Generic second-order (biquad) high-shelf filter - RBJ Audio EQ
+ *        Cookbook formula, S=1 (the standard "no bump/dip in the
+ *        transition band" shelf slope). NOT specific to SSB modulation -
+ *        exposed as a reusable primitive for the SAME kind of job
+ *        ssb_allpass1_t does (equalizing an external ANALOG filter's
+ *        measured response), except this one corrects MAGNITUDE instead
+ *        of phase/delay. Unlike ssb_allpass1_t, this is NOT unity-gain -
+ *
+ *        NOTE: named ssb_shelf_biquad_t, NOT ssb_biquad_t - ssb_adc_filter.h
+ *        already defines a DIFFERENT ssb_biquad_t (Direct-Form-II-
+ *        Transposed, ADC low-pass use) that would otherwise collide at
+ *        link time (both .c files are compiled into the same sketch) -
+ *        confirmed the hard way via a "multiple definition" linker error
+ *        when this was first added under the ssb_biquad_t name.
+ *        that's the whole point: it approaches 0dB below its corner and a
+ *        fixed plateau gain (positive or negative) well above it, with a
+ *        smooth transition in between. See the caller (e.g.
+ *        ssb_mic_test.ino's ENV_AMPEQ_SHELF_FREQ_HZ/GAIN_DB) for a worked
+ *        example - a deliberately CAPPED/PARTIAL correction for the
+ *        envelope path's analog reconstruction filter's high-frequency
+ *        insertion loss, not a full inverse response (see
+ *        group_delay_fit_notes.md's 2026-09-03 insertion-loss entry for
+ *        why a full inverse was judged too risky to try first).
+ *
+ *        Reuses the same normalized-coefficient Direct-Form-I structure
+ *        (and the same one-time-division-at-init tradeoff) as the private
+ *        peaking-EQ biquad in ssb_dsp.c's own pre-Hilbert audio_fx chain -
+ *        this is a separate, public instance of that same well-known RBJ
+ *        cookbook math, not a refactor of the private one (kept private
+ *        to avoid touching working, already-shipped code for an unrelated
+ *        feature).
+ */
+typedef struct {
+    float b0, b1, b2, a1, a2;   ///< Normalized Direct-Form-I coefficients (a0 already divided out).
+    float x1, x2, y1, y2;       ///< Direct-Form-I state: previous two inputs/outputs.
+} ssb_shelf_biquad_t;
+
+/**
+ * @brief Set up a high-shelf biquad and zero its state. fc/fs pick the
+ *        shelf's corner (roughly where the response crosses half the
+ *        plateau gain, in dB), gain_db is the plateau gain reached well
+ *        above fc (positive = boost, negative = cut, 0.0f = flat/no-op).
+ *        Cheap - fine to call from task context at init, not intended to
+ *        be called from the per-sample path.
+ */
+void ssb_shelf_biquad_set_highshelf(ssb_shelf_biquad_t *f, float fc, float fs, float gain_db);
+
+/**
+ * @brief Zero the filter's state without touching its coefficients - same
+ *        reset-on-re-enable reasoning as ssb_allpass1_reset().
+ */
+void ssb_shelf_biquad_reset(ssb_shelf_biquad_t *f);
+
+/**
+ * @brief Process one sample. Standard Direct-Form-I biquad:
+ *        y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2, then shift the delay
+ *        lines. IRAM_ATTR/denormal-flushed the same way as
+ *        ssb_allpass1_process() - safe to call every tick from a
+ *        real-time task (not ISR-safe: float).
+ */
+float IRAM_ATTR ssb_shelf_biquad_process(ssb_shelf_biquad_t *f, float x);
+
 #ifdef __cplusplus
 }
 #endif

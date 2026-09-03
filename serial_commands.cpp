@@ -7,6 +7,7 @@
 #include "dsp_state.h"
 #include "adc_capture.h"
 #include "envelope_gdeq.h"
+#include "envelope_ampeq.h"
 #include "envelope_predistort.h"
 #include "envelope_floor.h"
 #include "envelope_output.h"
@@ -200,10 +201,12 @@ void handle_serial_commands(void)
             dsp_state_set_audio_source(AUDIO_SRC_CHIRP);
             serial_reply("-> sine chirp test (%.0fHz-%.0fHz, %.1fs sweep, %.0fms mute/sync, ref pin%d, "
                           "%dx fast-tick); DC mapping ('u'/'j'/'i'/'k'/'D') still applies, gdeq ('g') "
-                          "currently %s - toggle 'g' + re-run 'w' to A/B compensated vs raw TF\r\n",
+                          "currently %s, ampeq ('a') currently %s - toggle 'g'/'a' + re-run 'w' to A/B "
+                          "compensated vs raw TF (phase channel for 'g', amplitude channel for 'a')\r\n",
                           CHIRP_F0_HZ, CHIRP_F1_HZ, CHIRP_SWEEP_SEC, CHIRP_MUTE_SEC * 1000.0f,
                           CHIRP_REF_GPIO, ENVELOPE_INTERP_FACTOR,
-                          envelope_gdeq_get_enabled() ? "ON" : "OFF");
+                          envelope_gdeq_get_enabled() ? "ON" : "OFF",
+                          envelope_ampeq_get_enabled() ? "ON" : "OFF");
         } else if (c == 'T') {
             // Steps the two-tone pair through TWOTONE_BAND_PRESETS
             // (test_signals.cpp) - lets you sweep the pair across the
@@ -263,6 +266,18 @@ void handle_serial_commands(void)
             serial_reply("-> envelope group-delay equalizer %s%s\r\n", now_on ? "ON" : "off",
                           now_on ? " - re-tune relative delay ('['/']') from scratch, "
                                    "theoretical starting point ~+2.65 samples (see envelope_gdeq.h)" : "");
+        } else if (c == 'a') {
+            // Mirrors the 'g' handler above exactly - see envelope_ampeq.h.
+            // NOT YET VALIDATED on real hardware as of 2026-09-03; off by
+            // default. Re-run the 'w' chirp/TFA workflow (amplitude
+            // channel) to check the actual on-bench correction before
+            // trusting this on two-tone/mic IMD testing.
+            bool now_on = !envelope_ampeq_get_enabled();
+            envelope_ampeq_set_enabled(now_on);   // internally resets state on an off->on transition
+            serial_reply("-> envelope magnitude (insertion-loss) equalizer %s%s\r\n", now_on ? "ON" : "off",
+                          now_on ? " - modest high-shelf correction, NOT yet validated on real "
+                                   "hardware - re-run 'w' chirp/TFA (amplitude channel) to check "
+                                   "the actual on-bench correction (see envelope_ampeq.h)" : "");
         } else if (c == 'D') {
             bool now_on = !envelope_predistort_get_enabled();
             envelope_predistort_set_enabled(now_on);
@@ -475,7 +490,8 @@ void handle_serial_commands(void)
             // env_pwm_scale, env_gdeq_enable, adc_lpf_mode, eq_enable,
             // compressor_enable, master_gain_db, ad9851_output_enable,
             // env_predistort_enable, env_floor, freq_dev_slew_limit_hz,
-            // envelope_interp_enable, envelope_interp_curve) -
+            // envelope_interp_enable, envelope_interp_curve,
+            // env_ampeq_enable) -
             // wrapped in braces with a trailing comma so the whole line
             // can be pasted directly into settingsPresets[] in settings.h
             // as a new preset entry.
@@ -495,11 +511,17 @@ void handle_serial_commands(void)
             // whichever of the two (env_predistort_enable=false, or 'D'
             // toggled off live) happens first.
             //
-            // envelope_interp_curve ('C', envelope_interp.h v4.3/v4.4) is
-            // the newest trailing field - prints as the enum constant name
+            // envelope_interp_curve ('C', envelope_interp.h v4.3/v4.4) -
+            // prints as the enum constant name
             // (ENVELOPE_INTERP_CURVE_CATMULL_ROM/_LINEAR/_HOLD), same
             // convention as adc_lpf_mode below, so the pasted line compiles
             // directly.
+            //
+            // env_ampeq_enable ('a', envelope_ampeq.h) is the newest
+            // trailing field - a plain bool, same as env_gdeq_enable.
+            // NOT YET VALIDATED on real hardware as of 2026-09-03 - pasting
+            // "true" here into a new preset means that preset starts up
+            // with an unvalidated correction active.
 #if AD9851_ATTACHED
             float rel_delay = relative_delay_get_samples();
             bool rf_enabled = carrier_output_get_rf_enabled();
@@ -535,7 +557,7 @@ void handle_serial_commands(void)
                 "ENVELOPE_INTERP_CURVE_HOLD"
             };
             serial_reply("-> settings line (paste into settingsPresets[] in settings.h, then rename \"Live\"):\r\n");
-            serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s, %s },\r\n",
+            serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s, %s, %s },\r\n",
                           audio_source_enum_name(dsp_state_get_audio_source()),
                           rel_delay,
                           envelope_output_get_pwm_offset(),
@@ -550,7 +572,8 @@ void handle_serial_commands(void)
                           envelope_floor_get(),
                           slew_str,
                           envelope_interp_get_enabled() ? "true" : "false",
-                          k_interp_curve_enum_name[envelope_interp_get_curve()]);
+                          k_interp_curve_enum_name[envelope_interp_get_curve()],
+                          envelope_ampeq_get_enabled() ? "true" : "false");
         } else if (c >= '0' && c <= '9') {
             int preset = c - '0';
             const PersistentSettings& p = settingsPresets[preset];
@@ -607,6 +630,12 @@ void handle_serial_commands(void)
             // unconditionally on every preset load, same as adc_lpf_mode
             // above.
             envelope_interp_set_curve(p.envelope_interp_curve);
+
+            // Same reset-on-enable reasoning as the 'g'/'a' handlers -
+            // shared via envelope_ampeq_set_enabled() itself, so an
+            // off->on transition on preset load resets the shelf's state
+            // cleanly too, not just when toggled live.
+            envelope_ampeq_set_enabled(p.env_ampeq_enable);
 
             serial_reply("-> preset %d: %s\r\n", preset, p.name);
         }

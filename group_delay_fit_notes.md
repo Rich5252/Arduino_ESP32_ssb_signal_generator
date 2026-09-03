@@ -657,16 +657,170 @@ convergence check like the one in the Method section above, not the
 
 ### Status
 
-Same as every fit in this file: numerically fit, not yet IMD-validated on
-real hardware. This refit directly addresses two of the four suspected
-causes behind the 2026-09-01 negative IMD result (the narrow 100-4300Hz
-fit window, and — pending confirmation — the DC-bias-point measurement
-inconsistency the Hi-Z buffers were added to fix); it does nothing about
-the other two (the unity-magnitude all-pass structure still can't correct
-this filter's real insertion-loss penalty; the `envelope_interp`/`'I'`
-confound). **`g` stays off by default** until the same real-hardware
-IMD3/IMD5 delay-sweep procedure documented above is re-run against these
-new coefficients — a better-fitted equalizer is not a re-validated one.
+Numerically fit, not yet IMD-validated on real hardware (see the
+group-delay validation immediately below, which is a different, narrower
+claim than IMD validation). This refit directly addresses two of the four
+suspected causes behind the 2026-09-01 negative IMD result (the narrow
+100-4300Hz fit window, and — pending confirmation — the DC-bias-point
+measurement inconsistency the Hi-Z buffers were added to fix); it does
+nothing about the other two (the unity-magnitude all-pass structure still
+can't correct this filter's real insertion-loss penalty; the
+`envelope_interp`/`'I'` confound). **`g` stays off by default** until the
+same real-hardware IMD3/IMD5 delay-sweep procedure documented above is
+re-run against these new coefficients — a better-fitted equalizer is not
+a re-validated one.
+
+### 2026-09-03, same day: group-delay side confirmed on real hardware
+
+New coefficients (`a1=0.026173`, `a2=0.236810`) flashed to the board and
+re-measured with the TFA — a genuine third data point, not the same sweep
+re-analyzed. Source: `Group delay off  on F Phase Refit on TF meas.txt`.
+
+**Column-order note:** this file's two phase columns come out swapped
+relative to the earlier file's off-then-on convention — its first column
+matches the earlier *predicted* equalized curve almost exactly, and its
+second matches the earlier *measured* analog-only curve, not the labels
+the column order would otherwise suggest. Caught by a physical sanity
+check: interpreting the columns at face value gives a NEGATIVE mean added
+delay, which an all-pass network cannot produce (it can only add delay).
+Swapping the interpretation fixes that and lines up near-exactly with the
+independently-derived prediction — strong enough agreement that this
+isn't ambiguous, but worth checking the TFA channel routing before the
+next sweep so this doesn't have to be re-diagnosed from the data every
+time.
+
+| | Peak-to-peak, 100-8000Hz | Mean delay |
+|---|---|---|
+| Analog alone (this sweep) | 71.3us | 73.3us |
+| Analog alone (previous sweep, for comparison) | 71.2us | 71.2us |
+| **g on, new coefficients (measured)** | **20.3us** | 198.4us |
+| g on, new coefficients (predicted, from the fit above) | 18.5us | 196.5us |
+
+Mean added delay, measured: 125.2us (**2.003 samples @ 16000Hz**) — within
+1us of the fit's own 125.4us/2.006-sample prediction. The measured "on"
+curve tracks the predicted curve to within ~2.1us RMS (4.4us worst-case)
+across the whole 100-8000Hz band. The two independent analog-alone
+measurements (this sweep vs. the previous one) agree to within ~2.3us
+RMS too — good evidence the Hi-Z buffer fix is giving repeatable
+analog-filter measurements session to session, not just within one
+sweep.
+
+**What this does and doesn't confirm:** the group-delay/dispersion
+prediction from the refit above is now validated directly on the bench,
+not just modeled — both the shape (RMS agreement with the predicted
+curve) and the headline numbers (added delay within 1us, p-p within
+~2us) check out. This is NOT the same as IMD validation — see the Status
+note above and `envelope_gdeq.h`'s header comment: the 2026-09-01 finding
+that the OLD coefficients hurt 3rd-order IMD involved mechanisms (real
+insertion loss, the possible `'I'` confound) that a group-delay TFA sweep
+can't see either way. **`g` stays off by default** until the IMD
+delay-sweep is re-run against these coefficients specifically.
+
+## 2026-09-03, later same day: IMD delay-sweep with the NEW coefficients — real improvement, at a delay never tested before
+
+**New real-hardware finding, user-reported:** with the refit coefficients
+(`a1=0.026173`, `a2=0.236810`) on the bench, the optimum `relative_delay`
+now sits at roughly **4 samples** — and unlike the old-coefficient sweep,
+this optimum is consistent between two-tone and mic-noise stimuli (the
+2026-09-01 sweep never achieved that consistency). Other delay values
+still null specific higher-frequency products better, but the spread
+across delay settings is much narrower than it was with the old
+coefficients. Separately: **with `g` on at two-tone, the higher-order IMD
+products are now significantly reduced** — a real, user-observed
+improvement, not predicted or claimed by anything in this document before
+now.
+
+**This does not contradict the 2026-09-01 "closed-out" sweep.** That
+sweep (a1=a2=0.622515) tested delay 1.10→1.40→2.00 and confirmed
+everything got monotonically worse past 2.00 — but that result is
+specific to THOSE coefficients. The new coefficients are a materially
+different digital filter (much milder: 0.026/0.237 vs. 0.622/0.622), with
+its own delay-vs-IMD landscape. A ~4-sample optimum for this filter is a
+new, independent result, not a re-test of previously-explored territory —
+the old sweep's "past 2.00 always worse" finding was never in a position
+to rule this out, because it was never testing this filter.
+
+### Is this a magnitude (insertion-loss) compensation effect? No — mechanism ruled out by construction
+
+User's hypothesis, worth taking seriously: could the IMD improvement be
+`g` incidentally compensating for the analog filter's own gain roll-off,
+rather than (or in addition to) flattening group delay? **Ruled out
+analytically, not just empirically**: `ssb_allpass1_t` implements
+`H(z) = (a + z⁻¹)/(1 + a·z⁻¹)`, and for any real `|a| < 1` this has
+`|H(e^jω)| = 1` at every frequency — a true all-pass network, unity
+magnitude BY CONSTRUCTION, independent of the coefficient value. Two
+cascaded sections are still unity magnitude (product of two unity-
+magnitude responses). There is no mechanism by which `envelope_gdeq_process()`
+can be altering the envelope's amplitude spectrum, only its phase — so it
+cannot be responsible for compensating the insertion-loss shape measured
+below, on this filter or any other. (A real DSP implementation has
+floating-point rounding, but that's a many-orders-of-magnitude-too-small
+effect to explain an audible/measurable IMD change — not a real
+candidate mechanism.)
+
+**Working explanation instead:** the ~4-sample delay region simply wasn't
+part of the 2026-09-01 sweep (which used a different, steeper filter and
+stopped exploring past 2.00 samples once every metric was getting worse
+there). The new, milder coefficients' own optimum landscape is different,
+and this real-hardware result says the group-delay flattening this
+equalizer does IS paying off for IMD now that the right operating delay
+has been found for it — consistent with, not contradicting, the original
+design intent. Left as a working explanation rather than a closed case:
+the mechanism is plausible and the magnitude explanation is ruled out,
+but a full re-run of the old delay-sweep/IMD-table methodology (this time
+around the ~4-sample region, both two-tone and mic-noise, both sidebands)
+would turn this from "user observed it and here's why it's probably real"
+into the same level of confirmed-and-quantified result the earlier
+(negative) finding had. Not yet done — recommended next step whenever
+there's bench time, since it would let `g`'s default flip from off to on
+with actual evidence behind it, not just a promising anecdote.
+
+### Real-hardware insertion-loss measurement (amplitude+phase TF, `g` off)
+
+Separate from the IMD question but raised in the same message: the
+analog filter's gain roll-off itself, now measured directly (not just
+LTspice-predicted). Source: `TF meas.txt` — same sweep as the very first
+group-delay TFA file (phase columns match point-for-point), now exported
+with its amplitude channel included. Amplitude column is a linear ratio;
+converted to dB and referenced to the 100–300Hz passband average (a flat
+gain offset there reads as 0dB, so this table is already "excess loss
+above the passband," no separate attenuator-baseline correction needed
+the way the LTspice comparison in the 2026-09-01 section required).
+Light smoothing (31-point Savitzky-Golay — residual RMS 0.05–0.48dB
+depending on band, much cleaner than the phase channel needed):
+
+| Frequency | Role | Measured loss (real hardware) | LTspice prediction (2026-09-01, PNP+attn) |
+|---|---|---|---|
+| 700Hz | two-tone f1 | -0.45dB | — |
+| 1900Hz | two-tone f2 | -1.85dB | — |
+| 500Hz | IMD3 lower offset | -0.28dB | ~-2.56dB raw / -0.03dB excess-only |
+| 1700Hz | IMD5 lower offset | -1.55dB | ~-3.27dB raw / -0.42dB excess-only |
+| 3100Hz | IMD3 upper offset | -4.52dB | ~-6.29dB raw / -1.41dB excess-only |
+| 4300Hz | IMD5 upper offset, old fit-band edge | -8.75dB | ~-10.42dB raw / -2.41dB excess-only |
+| 8000Hz | `MAX_FREQ_DEV_HZ` limit | **-21.70dB** | ~-22.65dB raw |
+
+Real hardware and the LTspice sim agree well at the high end (8000Hz:
+-21.7 measured vs. -22.65 predicted) and are in the same ballpark
+through the middle of the band, with real hardware showing somewhat less
+loss at the low-to-mid frequencies than the sim's raw (non-excess-
+corrected) numbers — consistent with the sim's raw figures including the
+gate attenuator's flat offset, which this measurement's passband-relative
+referencing already excludes by construction. Bottom line: the roll-off
+is real, confirmed on the bench, and substantial — nearly 22dB down by
+8000Hz, the same frequency the null-transient content and `freq_dev`
+excursions live at.
+
+**Not yet compensated.** A magnitude correction would need an actual
+gain-shaping filter (shelf/peaking IIR, or similar) — `ssb_allpass1_t`
+structurally cannot do this (see above). A full inverse response would
+need up to ~+22dB of boost at 8000Hz relative to the passband, which
+raises real questions before building it: how much of that boost is
+actually recoverable headroom vs. how much just raises the noise floor
+and quantization/PWM-resolution noise at exactly the frequencies where
+`freq_dev` already pushes hardest, and whether a full inverse or a
+capped/partial shelf is the better real-world tradeoff. Parked here as
+the next concrete step — see the accompanying conversation for the
+scoping question before implementation starts.
 
 ## Related: DC-operating-point dependence (envelope filter TF, not group delay)
 
@@ -684,3 +838,93 @@ with DC operating point too if this turns out to matter enough to chase
 further. Parked here since it's the same underlying analog filter this
 whole document is about, even though it surfaced from the TF measurement
 work rather than the group-delay refit itself.
+
+## 2026-09-03, later same day: envelope magnitude equalizer built (`envelope_ampeq.h`/`.cpp`, key `a`) — NOT YET VALIDATED
+
+Follow-up to the insertion-loss measurement section above. Discussed the
+scoping question directly: a full inverse response needs up to ~+22dB of
+boost at 8000Hz, which risks trading a well-characterized amplitude
+problem for an unknown noise-floor/PWM-quantization/headroom problem —
+agreed to start with something more modest at the high end and measure
+before going further.
+
+**Why a shelf, not the same shape as the existing presence EQ.** Before
+picking a filter shape, checked whether the existing pre-Hilbert
+audio-path presence EQ (`biquad_set_peaking`, `ssb_dsp.c`, an RBJ
+peaking/bell biquad — currently fc=2200Hz, Q=1.0, +4dB, the "4dB presence
+increase" setting) could do this job. Computed its response directly
+(not assumed): it peaks at +4.00dB at 2200Hz, crosses half-gain (+2dB) at
+roughly 1412Hz and 3264Hz, and is back to +0.00dB by 8000Hz. A peaking
+filter is symmetric and returns to unity gain on both sides of its
+center by construction — it cannot address a loss that keeps climbing
+monotonically out to 8000Hz. The measured insertion loss (previous
+section) is monotonic, not a dip, so the right shape is a shelf: constant
+plateau gain above its corner, not a bump that decays away again.
+
+**The new primitive.** Added a public `ssb_shelf_biquad_t` (Direct-Form-I,
+RBJ cookbook coefficients) to `ssb_dsp.h`/`.c`, alongside the existing
+`ssb_allpass1_t` — `ssb_shelf_biquad_set_highshelf()`,
+`ssb_shelf_biquad_reset()`, `ssb_shelf_biquad_process()`. Named
+`ssb_shelf_biquad_t` rather than the more obvious `ssb_biquad_t` because
+`ssb_adc_filter.h` already defines its own, differently-shaped
+`ssb_biquad_t` (Direct-Form-II-Transposed, used for the ADC low-pass
+filters) — the first version of this code used `ssb_biquad_t` and hit a
+"multiple definition" link error at compile time, caught immediately when
+the user tried to flash it; renamed to fix. Kept separate from the private peaking-EQ biquad
+already in `ssb_dsp.c` (that one stays wired one specific way into the
+pre-Hilbert audio_fx chain; this one is the general-purpose public
+primitive, reused for the envelope-path shelf below). Unlike
+`ssb_allpass1_t`, this is explicitly NOT unity-gain — that's the whole
+point.
+
+**The chosen shelf.** `envelope_ampeq.h`/`.cpp` (mirrors
+`envelope_gdeq.h`/`.cpp`'s structure — same `#if SAMPLE_RATE_HZ ==
+16000 && ENV_FILTER_VARIANT == ENV_FILTER_PNP_BC327_ATTN ... #error`
+gating, so this shelf can't silently get applied to a different
+filter/Fs it wasn't chosen for). Corner `ENV_AMPEQ_SHELF_FREQ_HZ =
+2500Hz`, plateau gain `ENV_AMPEQ_SHELF_GAIN_DB = 6.0dB`, RBJ high-shelf
+S=1. Chosen by inspection against the measured loss table, not by
+numerical optimization (there's no obvious single objective for a
+2-parameter shelf the way there was for the 2-parameter all-pass
+group-delay fit). Net (measured loss + shelf gain) at the table's key
+frequencies:
+
+| Frequency | Measured loss alone | Shelf gain | Net (residual) loss |
+|---|---|---|---|
+| 500Hz | -0.28dB | +0.01dB | -0.27dB |
+| 700Hz | -0.45dB | +0.03dB | -0.42dB |
+| 1700Hz | -1.55dB | +0.95dB | -0.60dB |
+| 1900Hz | -1.85dB | +1.38dB | -0.47dB |
+| 3100Hz | -4.52dB | +4.41dB | -0.11dB |
+| 4300Hz | -8.75dB | +5.69dB | -3.06dB |
+| 8000Hz | -21.70dB | +6.00dB | -15.70dB |
+
+Recovers most of the loss through the two-tone/IMD-offset region
+(500–3100Hz), meaningfully reduces it at the old 4300Hz gdeq fit-band
+edge, and deliberately leaves most of the 8000Hz-region loss
+uncorrected — the conservative "modest" step, not a full inverse.
+
+**Wiring.** New key `a` (serial_commands.cpp) toggles it, mirroring `g`
+exactly, including reset-on-off→on-transition. Applied in the main
+`dsp_task` pipeline right after `envelope_gdeq_process()` (order doesn't
+matter — both LTI — placed there purely for code locality) and in the
+`AUDIO_SRC_CHIRP` early-intercept path right after gdeq's own chirp-path
+call, so the `w` chirp/TFA workflow's amplitude channel can validate this
+shelf's actual on-bench correction directly, the same way the phase
+channel already validated gdeq's refit. `PersistentSettings` gained a
+new trailing field `env_ampeq_enable` (off by default, same zero-fill-
+safe convention as every other trailing field); the `P` dump and preset-
+load paths were updated to match.
+
+**Interaction with gdeq.** Both LTI, so cascade order doesn't change the
+combined response mathematically. Unlike `ssb_allpass1_t`, a high-shelf
+biquad's magnitude isn't flat, so it does have its own (uncharacterized)
+small group-delay contribution near its corner — not yet folded into
+gdeq's fit. If the combined on-bench group delay measurably diverges from
+the gdeq-alone prediction once `a` is enabled, that's the first place to
+look.
+
+**Status: NOT YET VALIDATED ON REAL HARDWARE.** Off by default. Next
+step is a `w` chirp/TFA sweep with `a` ON to check the amplitude channel
+against the predicted net-correction table above, then real two-tone/mic
+IMD testing — same validation sequence gdeq went through.

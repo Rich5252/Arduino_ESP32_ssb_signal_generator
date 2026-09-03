@@ -119,6 +119,7 @@
 #include "adc_capture.h"
 #include "test_signals.h"
 #include "envelope_gdeq.h"
+#include "envelope_ampeq.h"
 #include "envelope_predistort.h"
 #include "envelope_floor.h"
 #if AD9851_ATTACHED
@@ -304,10 +305,13 @@ static void IRAM_ATTR dsp_task(void* arg)
         // specifically so the TF analyzer can measure the analog
         // reconstruction filter's group delay WITH the digital
         // equalizer's correction applied, not just the raw filter, and
-        // compare the two sweeps directly. envelope_floor stays skipped:
-        // it's a hard near-zero clamp aimed at squelching mic-path noise
-        // at silence, not something a swept-tone TF measurement exercises
-        // or benefits from measuring through.
+        // compare the two sweeps directly. 2026-09-03: envelope_ampeq_
+        // process() (the 'a' magnitude equalizer) is wired in the same
+        // way, for the same reason on the sweep's AMPLITUDE channel
+        // instead. envelope_floor stays skipped: it's a hard near-zero
+        // clamp aimed at squelching mic-path noise at silence, not
+        // something a swept-tone TF measurement exercises or benefits
+        // from measuring through.
         if (dsp_state_get_audio_source() == AUDIO_SRC_CHIRP) {
             float chirp_envelope;
             bool ref_high;
@@ -323,6 +327,14 @@ static void IRAM_ATTR dsp_task(void* arg)
             // so 'g' reshapes the swept envelope itself rather than
             // whatever the DC mapping already did to it.
             chirp_envelope = envelope_gdeq_process(chirp_envelope);
+
+            // Envelope-path magnitude equalizer - see envelope_ampeq.h.
+            // Same reasoning/wiring as gdeq just above, toggle 'a' - this
+            // is what lets the chirp/TFA workflow measure the shelf's
+            // actual on-bench correction directly via the sweep's
+            // AMPLITUDE channel, the same way gdeq's phase channel
+            // already validated its own refit.
+            chirp_envelope = envelope_ampeq_process(chirp_envelope);
 
             // Apply the SAME offset/scale (or predistort) DC mapping every
             // other source gets from the normal full-tick pipeline below -
@@ -457,6 +469,13 @@ static void IRAM_ATTR dsp_task(void* arg)
         // why that's useful rather than a shortcut). Off by default,
         // toggle via 'g'.
         envelope = envelope_gdeq_process(envelope);
+
+        // Envelope-path magnitude (insertion-loss) equalizer - see
+        // envelope_ampeq.h. Same unconditional-across-every-source
+        // reasoning as gdeq just above; placed right after it purely for
+        // code locality (order between the two doesn't matter - both are
+        // LTI filters). Off by default, toggle via 'a'.
+        envelope = envelope_ampeq_process(envelope);
 
         // envelope is roughly [0,1] for typical mic levels but not
         // rigorously bounded - clamp before handing off either way.
@@ -691,6 +710,11 @@ void setup()
     // Initialized (states zeroed) regardless of its enabled default, so
     // enabling it later via 'g' doesn't need a separate init path.
     envelope_gdeq_init();
+
+    // Envelope magnitude (insertion-loss) equalizer - see
+    // envelope_ampeq.h. Same "always init, regardless of enabled
+    // default" reasoning as envelope_gdeq_init() just above.
+    envelope_ampeq_init();
 
     // Always started now, regardless of the initial audio source - needed
     // so the mic path is live and ready the moment a 't'/'s'/'m' serial
