@@ -341,7 +341,7 @@
                                  // timing residual - see relative_delay.h's fractional delay
                                  // line, added specifically to test that instead. Must stay ODD
                                  // if changed again.
-#define MAX_FREQ_DEV_HZ    8000.0f  // Originally raised from 2800.0f for a diagnostic A/B test -
+#define MAX_FREQ_DEV_HZ    20000.0f  // Originally raised from 2800.0f for a diagnostic A/B test -
                                      // real hardware showed a consistent ~+100Hz offset on BOTH
                                      // tones of a 700/1900Hz two-tone test (landed at 800/1999Hz)
                                      // while a single 1000Hz tone was exactly on frequency;
