@@ -329,8 +329,9 @@ static void IRAM_ATTR dsp_task(void* arg)
             chirp_envelope = envelope_gdeq_process(chirp_envelope);
 
             // Envelope-path magnitude equalizer - see envelope_ampeq.h.
-            // Same reasoning/wiring as gdeq just above, toggle 'a' - this
-            // is what lets the chirp/TFA workflow measure the shelf's
+            // Same reasoning/wiring as gdeq just above, toggle 'a' (shelf 1)
+            // / 'A' (shelf 2, added 2026-09-04, independent flag) - this
+            // is what lets the chirp/TFA workflow measure either shelf's
             // actual on-bench correction directly via the sweep's
             // AMPLITUDE channel, the same way gdeq's phase channel
             // already validated its own refit.
@@ -474,7 +475,8 @@ static void IRAM_ATTR dsp_task(void* arg)
         // envelope_ampeq.h. Same unconditional-across-every-source
         // reasoning as gdeq just above; placed right after it purely for
         // code locality (order between the two doesn't matter - both are
-        // LTI filters). Off by default, toggle via 'a'.
+        // LTI filters). Two independent stages, both off by default:
+        // shelf 1 via 'a', shelf 2 via 'A' (split 2026-09-04).
         envelope = envelope_ampeq_process(envelope);
 
         // envelope is roughly [0,1] for typical mic levels but not
