@@ -20,8 +20,25 @@
  * that's now a first-order consideration rather than a footnote).
  * Originally a single stage (2026-09-03); a second stage was added
  * 2026-09-04 specifically to extend the correction further toward
- * 8000Hz (Nyquist at this Fs) - both stages share the one 'a' enable
- * flag/toggle, there is no separate on/off for each.
+ * 8000Hz (Nyquist at this Fs). ---- 2026-09-04, later same day: split into
+ * INDEPENDENT enable flags ---- Real-hardware validation of shelf2
+ * (`ga_Trial2_TF.txt`, see the dated entry below) confirmed the predicted
+ * magnitude gain (+6.7dB real at 8000Hz) but also confirmed dispersion
+ * roughly doubles (75.7us->157.5us p-p), and the resulting two-tone IMD
+ * came back marginally WORSE than shelf1 alone - so shelf1 and shelf2
+ * were split into two independently-toggleable flags ('a' for shelf1,
+ * 'A' for shelf2 - serial_commands.cpp) instead of one combined flag,
+ * specifically so shelf1-only vs shelf1+shelf2 (the exact two configs
+ * just A/B'd on the bench) can be re-selected from the serial console
+ * without a reflash, for the wider IMD comparison the user wants to
+ * record before deciding whether to keep pursuing shelf2 (e.g. after a
+ * gdeq refit - see "Interaction with gdeq" below). Both default OFF,
+ * same as before the split. Order in envelope_ampeq_process() is fixed
+ * (shelf1 then shelf2 when both are on) but doesn't matter mathematically
+ * - both LTI - so "shelf2 only, shelf1 off" is also a reachable, valid
+ * combination via 'A' alone, even though that specific combination hasn't
+ * been bench-tested (only off / shelf1-only / shelf1+shelf2 have real
+ * data so far).
  *
  * ---- Why this exists ----
  * 2026-09-03: real-hardware amplitude+phase TF measurement
@@ -92,19 +109,31 @@
  * `ga_Trial1_TF.txt`): enabling 'a' alone reintroduced measured dispersion
  * from 19.4us to 81.7us peak-to-peak even though mean delay barely moved,
  * because gdeq's coefficients were fit against the analog filter ALONE.
- * The 2026-09-04 second shelf stage makes this larger still (see that
- * entry in the #if block below for the numbers) - gdeq is now overdue for
- * a refit against the combined analog+shelf1+shelf2 phase response, the
- * same numerically-fit-against-real-data method already used twice for
- * smaller reasons (see envelope_gdeq.h's history). NOT YET DONE.
+ * CONFIRMED WORSE STILL on real hardware 2026-09-04 with shelf2 also on
+ * (`ga_Trial2_TF.txt`): dispersion roughly DOUBLED again (measured
+ * 75.7us->157.5us p-p, one consistent re-analysis pipeline for both
+ * trials), and real two-tone IMD came back marginally worse than
+ * shelf1-only - gdeq is overdue for a refit against the combined
+ * analog+shelf1+shelf2 phase response, the same numerically-fit-against-
+ * real-data method already used twice for smaller reasons (see
+ * envelope_gdeq.h's history). NOT YET DONE. See group_delay_fit_notes.md's
+ * matching 2026-09-04 entries for the full numbers and
+ * gdeq_ampeq_delay_chart_v6.html for the real Trial1-vs-Trial2 chart.
  *
  * ---- Status ----
- * NOT YET VALIDATED ON REAL HARDWARE. Off by default, same convention as
- * 'g' - toggle via 'a' (serial_commands.cpp) to A/B it, ideally re-run
- * through the 'w' chirp/TFA workflow first (the amplitude channel will
- * show the actual on-bench correction directly, the same way the phase
- * channel already validated gdeq's refit) before trusting it on
- * two-tone/mic IMD testing.
+ * Shelf1: VALIDATED on real hardware 2026-09-03 (magnitude tracked
+ * prediction to a few tenths of a dB; real IMD benefit confirmed, though
+ * it does reintroduce the dispersion above). Shelf2: VALIDATED on real
+ * hardware 2026-09-04 (magnitude gain real but somewhat short of
+ * predicted; dispersion roughly doubles again; real IMD came back
+ * marginally WORSE when combined with shelf1, in this still-unrefit-gdeq
+ * state). Both OFF by default, independently toggled - 'a' for shelf1,
+ * 'A' for shelf2 (serial_commands.cpp). Current recommendation (as of
+ * 2026-09-04): run with 'a' ON / 'A' OFF (shelf1-only - the better real
+ * compromise found so far) while a wider IMD comparison across both
+ * configs is recorded; re-run through the 'w' chirp/TFA workflow any time
+ * either flag changes to see the actual on-bench correction directly
+ * before trusting a new config on two-tone/mic IMD testing.
  */
 
 #include <stdbool.h>
@@ -213,6 +242,24 @@
   // gdeq's own history shows real hardware occasionally surprises), THEN
   // decide whether the resulting IMD change on two-tone is worth a gdeq
   // refit to recover flat delay.
+  //
+  // REAL-HARDWARE RESULT, 2026-09-04 (`ga_Trial2_TF.txt`, same day):
+  // magnitude gain at 8000Hz was real but a bit short of predicted
+  // (+6.7dB measured vs. +10.0dB modeled - net -9.30dB vs. the -5.70dB
+  // predicted above). Delay dispersion roughly DOUBLED again on top of
+  // shelf 1's own already-measured increase (75.7us->157.5us p-p,
+  // consistent re-analysis of both trials), and matched this stage's own
+  // predicted delay shape closely except at 8000Hz itself, where the real
+  // jump (+85.1us) exceeded the +62.3us analytic prediction - real
+  // hardware runs a bit worse than the idealized model right at the band
+  // edge. Real two-tone IMD with both stages on: marginally WORSE than
+  // shelf 1 alone. Per-stage enable flags were split as a result (see the
+  // header-comment note above) so shelf 1-only vs shelf 1+shelf 2 can be
+  // re-selected without a reflash - `'a'` still controls this stage
+  // (shelf 1) exactly as before; shelf 2 below now has its own flag.
+  // Current recommendation: leave shelf 2 OFF (via 'A') until a gdeq
+  // refit makes a fair comparison possible - see group_delay_fit_notes.md's
+  // matching entry and gdeq_ampeq_delay_chart_v6.html.
   #define ENV_AMPEQ_SHELF2_FREQ_HZ  6000.0f
   #define ENV_AMPEQ_SHELF2_GAIN_DB  10.0f
 #else
@@ -220,27 +267,36 @@
 #endif
 
 // Zeroes BOTH shelf biquads' state and (re)applies the coefficients above.
-// Call once from setup() - always, regardless of the enabled default, so
-// enabling later via 'a' only ever needs envelope_ampeq_set_enabled(),
+// Call once from setup() - always, regardless of either enabled default,
+// so enabling either stage later only ever needs its own _set_enabled(),
 // not a separate init path (same convention as envelope_gdeq_init()).
 void envelope_ampeq_init(void);
 
-// If enabled, runs `envelope` through BOTH high-shelf biquads in cascade
-// (shelf 1 then shelf 2 - order doesn't affect the result, both LTI) and
-// returns the result; otherwise returns it unchanged. Call unconditionally
-// from dsp_task, once per tick, for every audio source (same rationale as
+// Runs `envelope` through whichever of the two high-shelf biquads are
+// currently enabled, in cascade (shelf 1 then shelf 2 when both are on -
+// order doesn't affect the result, both LTI), and returns the result;
+// unchanged if neither is enabled. Call unconditionally from dsp_task,
+// once per tick, for every audio source (same rationale as
 // envelope_gdeq_process() - see that file - including ENVSTEP/AMTEST so
 // those isolation tests exercise the real combined response).
 float IRAM_ATTR envelope_ampeq_process(float envelope);
 
+// ---- Shelf 1 (2500Hz/+6dB) - 'a' in serial_commands.cpp ----
+// Same enable/disable API and reset-on-off->on-transition behavior this
+// module has had since 2026-09-03 (see envelope_gdeq_set_enabled() for
+// the reasoning) - unchanged by the 2026-09-04 flag split below, existing
+// callers/presets/settings fields keep working as-is.
 bool envelope_ampeq_get_enabled(void);
-
-// Sets the enabled flag for BOTH shelf stages (there is no independent
-// per-stage toggle). On an off->on transition, also resets both biquads'
-// state (avoids feeding stale x1/x2/y1/y2 from however long it's been
-// since this was last on, or since boot, into the first sample after
-// re-enabling - same reasoning as envelope_gdeq_set_enabled()'s reset). A
-// no-op transition does NOT reset state, for the same reason gdeq's
-// doesn't (continuous operation across preset switches that both have
-// this on).
 void envelope_ampeq_set_enabled(bool enable);
+
+// ---- Shelf 2 (6000Hz/+10dB) - 'A' in serial_commands.cpp ----
+// Added 2026-09-04 as an INDEPENDENT flag (see the header-comment note
+// above for why: shelf1-only vs shelf1+shelf2 needed to be A/B-able from
+// the serial console without a reflash, once real hardware showed shelf2
+// makes two-tone IMD marginally worse in this still-unrefit-gdeq state).
+// Same reset-on-off->on-transition behavior, applied to shelf 2's own
+// biquad state only - toggling shelf 2 does NOT reset shelf 1's state and
+// vice versa, so either can be flipped independently without disturbing
+// the other's continuity.
+bool envelope_ampeq_shelf2_get_enabled(void);
+void envelope_ampeq_shelf2_set_enabled(bool enable);

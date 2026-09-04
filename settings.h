@@ -141,6 +141,17 @@ typedef struct
     // presets that want it deliberately on.
     bool env_ampeq_enable;  // 'a' - envelope_ampeq.h, off by default
 
+    // Added 2026-09-04 when ampeq's shelf 1 and shelf 2 were split into
+    // independently-toggleable flags (envelope_ampeq.h - real hardware
+    // showed shelf1-only and shelf1+shelf2 needed to be A/B-able without a
+    // reflash). Appended at the END, same reasoning as env_ampeq_enable
+    // above and every trailing field before it - existing presets'
+    // positional initializers zero-fill this to false (shelf 2 off),
+    // matching env_ampeq_enable's own off-by-default convention and this
+    // project's current recommendation (shelf1-only, shelf2 off, pending
+    // a gdeq refit - see group_delay_fit_notes.md's 2026-09-04 entries).
+    bool env_ampeq_shelf2_enable;  // 'A' - envelope_ampeq.h, off by default
+
 } PersistentSettings;
 
 
@@ -248,10 +259,8 @@ SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM },
 // Preset 6 -
 { "V4 Two tone tuned", AUDIO_SRC_TWOTONE, 2.15f, 0.20f, 0.90f, false, ADC_LPF_MODE_OFF, false, false, 0.6f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, true, ENVELOPE_INTERP_CURVE_CATMULL_ROM },
 // Preset 7 -
- { "V6+a1+g+eq", AUDIO_SRC_TWOTONE, 2.00f, 0.20f, 0.90f, true, ADC_LPF_MODE_OFF, false, false, -1.4f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM},
-
-    
-    // Preset 8 -
+{ "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.96f, 0.40f, 0.46f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
+// Preset 8 -
 { "FM Env 2.2", AUDIO_SRC_FMTEST, 2.96f, 0.12f, 0.48f, true, ADC_LPF_MODE_OFF, false, false, 0.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
 // Preset 9 -
 { "AM Env = 1.6 - 2.9", AUDIO_SRC_AMTEST, 3.04f, 0.28f, 0.70f, true, ADC_LPF_MODE_OFF, true, true, -4.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM }  // was 1.90f @ 10000Hz; adc_lpf_bypass=true

@@ -1519,3 +1519,79 @@ improve the higher IMDs" — right now, testing shelf1+shelf2 on two-tone
 IMD without refitting gdeq would conflate two effects (more amplitude
 correction vs. more delay dispersion) and wouldn't cleanly answer the
 question asked.
+
+---
+
+## 2026-09-04, later same day — shelf2 validated on real hardware (`ga_Trial2_TF.txt`): magnitude gain confirmed, dispersion roughly doubled, IMD marginally worse
+
+**What was measured.** Same TFA sweep method as `ga_Trial1_TF.txt`
+(`'g'`+`'a'` both on), this time with the two-stage `ampeq` (shelf1+shelf2)
+flashed. Re-parsed both files with an identical pipeline (100–300Hz
+passband-average magnitude reference; phase unwrapped, then 181-point
+Savitzky–Golay smoothed, then `-dphase/domega` for group delay — same
+convention as every other real-hardware analysis in this project) so
+Trial1 and Trial2 are a clean apples-to-apples comparison, not just each
+compared separately to its own prediction. Note: re-running this pipeline
+from scratch on Trial1 gives 75.7µs p-p (vs. the 81.7µs previously
+reported) — a small, expected difference from minor smoothing/derivative
+implementation details between passes, not a real change in the
+measurement; flagging this explicitly per this project's own past mistake
+of conflating two different metric definitions (see the 2026-09-03 "own
+analytical error" entry above) — the important number here is the
+Trial1-vs-Trial2 RATIO, computed with one consistent pipeline, not the
+absolute p-p figure compared across different analysis passes.
+
+**Magnitude — real, substantial, a bit short of predicted.** Net loss at
+8000Hz: Trial1 (shelf1-only) measured -16.03dB (matches the -15.70dB
+prediction to 0.33dB, consistent with the original validation). Trial2
+(shelf1+shelf2) measured -9.30dB — a real **+6.7dB** improvement from
+adding shelf2, genuine and large, but short of the +10.00dB/net -5.70dB
+the analytic model predicted (a ~3.6dB shortfall at the single most
+aggressive point in the design — expected some gap here given shelf2 sits
+closest to Nyquist of anything tried yet, but worth a closer look if this
+stage is revisited). Mid-band (500–1900Hz) essentially unchanged between
+trials, as designed. 3100Hz measured net actually improved slightly beyond
+prediction here too (Trial1 +0.12dB overshoot → Trial2 -0.43dB, prediction
+was -0.02dB) — real point-to-point measurement noise at the few-tenths-dB
+level, not a concern.
+
+**Group delay — dispersion roughly doubled, and the top end grew MORE than
+predicted.** p-p over 100–8000Hz: 75.7µs (Trial1) → 157.5µs (Trial2), a
+**2.1×** increase — matches the qualitative prediction (combining Trial1's
+own measured dispersion with shelf2's analytic contribution projected to
+~167µs, see `gdeq_ampeq_delay_chart_v5.html`) closely. Point-by-point delta
+(Trial2 minus Trial1) tracks shelf2's own predicted delay curve well in
+shape and sign across most of the band (500Hz -8.4µs vs. predicted
+-10.85µs; 1900Hz -11.4 vs. -13.34; 3100Hz -21.0 vs. -19.44 — a very close
+match; 4300Hz -36.0 vs. -32.34), but **at 8000Hz the real jump (+85.1µs)
+notably exceeds the analytic prediction (+62.27µs)** — real hardware shows
+more top-end delay growth than the idealized shelf model right at the edge
+of the band, worth remembering if this stage's gain is ever pushed higher
+still. Mean delay barely moved either time (197.1µs → 196.4µs), consistent
+with both shelf stages' near-zero predicted mean contribution.
+
+**IMD — marginally worse, and that result is itself informative.** User's
+real two-tone report: shelf1+shelf2 IMD was marginally worse than
+shelf1-only, not dramatically worse. Read against the numbers above, that
+means roughly +6.7dB of amplitude correction and roughly +82µs of extra
+p-p dispersion landed close to a wash on two-tone IMD in this UNREFIT
+state — neither effect cleanly dominated. That's consistent with (not
+proof of) this project's working model built up over this session's
+earlier findings that IMD depends on both amplitude symmetry (the `eq`
+finding, 2026-09-03) and delay/phase behavior near envelope
+nulls/transients (the null-floor/`freq_dev` findings, same day) — it's
+exactly why testing shelf2 without a gdeq refit first was flagged in the
+entry above as not a clean test of "does more amplitude correction help":
+both variables moved together, and a genuinely fair test needs the delay
+side held flat.
+
+**Decision, as stated by the user 2026-09-04:** revert to shelf1-only as
+the better real-world compromise for now, while recording a wider range of
+IMD products to compare between the two configurations before deciding
+anything further. Shelf2 itself is NOT being removed from the firmware —
+still selected via the same `'a'` flag alongside shelf1 (see
+`envelope_ampeq.h`/`.cpp`) — this is a config/testing decision, not a code
+reversion, so shelf2 stays available to re-test later, ideally after the
+still-outstanding gdeq refit against the combined analog+shelf1+shelf2
+phase response. Chart: `gdeq_ampeq_delay_chart_v6.html` (real Trial1 vs.
+real Trial2, magnitude and group delay side by side).

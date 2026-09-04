@@ -201,12 +201,14 @@ void handle_serial_commands(void)
             dsp_state_set_audio_source(AUDIO_SRC_CHIRP);
             serial_reply("-> sine chirp test (%.0fHz-%.0fHz, %.1fs sweep, %.0fms mute/sync, ref pin%d, "
                           "%dx fast-tick); DC mapping ('u'/'j'/'i'/'k'/'D') still applies, gdeq ('g') "
-                          "currently %s, ampeq ('a') currently %s - toggle 'g'/'a' + re-run 'w' to A/B "
-                          "compensated vs raw TF (phase channel for 'g', amplitude channel for 'a')\r\n",
+                          "currently %s, ampeq shelf 1 ('a') currently %s, ampeq shelf 2 ('A') currently "
+                          "%s - toggle 'g'/'a'/'A' + re-run 'w' to A/B compensated vs raw TF (phase "
+                          "channel for 'g', amplitude channel for 'a'/'A')\r\n",
                           CHIRP_F0_HZ, CHIRP_F1_HZ, CHIRP_SWEEP_SEC, CHIRP_MUTE_SEC * 1000.0f,
                           CHIRP_REF_GPIO, ENVELOPE_INTERP_FACTOR,
                           envelope_gdeq_get_enabled() ? "ON" : "OFF",
-                          envelope_ampeq_get_enabled() ? "ON" : "OFF");
+                          envelope_ampeq_get_enabled() ? "ON" : "OFF",
+                          envelope_ampeq_shelf2_get_enabled() ? "ON" : "OFF");
         } else if (c == 'T') {
             // Steps the two-tone pair through TWOTONE_BAND_PRESETS
             // (test_signals.cpp) - lets you sweep the pair across the
@@ -268,22 +270,40 @@ void handle_serial_commands(void)
                                    "theoretical starting point ~+2.65 samples (see envelope_gdeq.h)" : "");
         } else if (c == 'a') {
             // Mirrors the 'g' handler above exactly - see envelope_ampeq.h.
-            // Single-shelf design NOT YET VALIDATED on real hardware as of
-            // 2026-09-03 (magnitude side confirmed close to prediction on
-            // the g+a trial; group-delay side reintroduced real dispersion
-            // because gdeq hasn't been refit against it). A second shelf
-            // stage was added 2026-09-04, extending correction further
-            // toward 8000Hz at the cost of MORE group-delay dispersion,
-            // not yet measured on real hardware at all - see
-            // envelope_ampeq.h's 2026-09-04 entry before trusting IMD
-            // results with this on. Off by default.
+            // Shelf 1 (2500Hz/+6dB) ONLY - shelf 2 has its own independent
+            // 'A' toggle below (split 2026-09-04 after real-hardware
+            // testing showed shelf1-only vs shelf1+shelf2 needed to be
+            // A/B-able without a reflash). VALIDATED on real hardware
+            // 2026-09-03: magnitude tracked prediction closely; real IMD
+            // benefit confirmed; does reintroduce measured group-delay
+            // dispersion because gdeq hasn't been refit against it (see
+            // envelope_ampeq.h). Off by default - currently this
+            // project's recommended config (shelf 1 on, shelf 2 off).
             bool now_on = !envelope_ampeq_get_enabled();
-            envelope_ampeq_set_enabled(now_on);   // internally resets state on an off->on transition
-            serial_reply("-> envelope magnitude (insertion-loss) equalizer %s%s\r\n", now_on ? "ON" : "off",
-                          now_on ? " - two-stage high-shelf correction (now extended toward 8000Hz), "
-                                   "NOT yet validated on real hardware in this form - re-run 'w' "
-                                   "chirp/TFA (amplitude AND phase channels) to check the actual "
-                                   "on-bench correction and delay cost (see envelope_ampeq.h)" : "");
+            envelope_ampeq_set_enabled(now_on);   // internally resets shelf 1's state on an off->on transition
+            serial_reply("-> envelope magnitude (insertion-loss) equalizer, shelf 1 (2500Hz/+6dB) %s%s\r\n", now_on ? "ON" : "off",
+                          now_on ? " - validated on real hardware 2026-09-03 (magnitude tracks "
+                                   "prediction, real IMD benefit, reintroduces some group-delay "
+                                   "dispersion - see envelope_ampeq.h). Shelf 2 ('A') is separate." : "");
+        } else if (c == 'A') {
+            // Shelf 2 (6000Hz/+10dB), independent of 'a' above - see
+            // envelope_ampeq.h's 2026-09-04 entries. VALIDATED on real
+            // hardware 2026-09-04 (`ga_Trial2_TF.txt`): real magnitude
+            // gain at 8000Hz (+6.7dB, short of the +10dB predicted), but
+            // group-delay dispersion roughly DOUBLED again on top of
+            // shelf 1's own increase, and real two-tone IMD came back
+            // marginally WORSE with both stages on than shelf 1 alone -
+            // in this still-unrefit-gdeq state. Off by default; current
+            // recommendation is to leave this off until gdeq is refit
+            // against the combined analog+shelf1+shelf2 phase response.
+            bool now_on = !envelope_ampeq_shelf2_get_enabled();
+            envelope_ampeq_shelf2_set_enabled(now_on);   // internally resets shelf 2's state on an off->on transition
+            serial_reply("-> envelope magnitude (insertion-loss) equalizer, shelf 2 (6000Hz/+10dB) %s%s\r\n", now_on ? "ON" : "off",
+                          now_on ? " - real hardware 2026-09-04: more magnitude recovery toward "
+                                   "8000Hz, but dispersion roughly doubles again and two-tone IMD "
+                                   "came back marginally WORSE combined with shelf 1 in this "
+                                   "unrefit-gdeq state (see envelope_ampeq.h / group_delay_fit_notes.md) "
+                                   "- re-run 'w' chirp/TFA to check the current combined response" : "");
         } else if (c == 'D') {
             bool now_on = !envelope_predistort_get_enabled();
             envelope_predistort_set_enabled(now_on);
@@ -497,7 +517,7 @@ void handle_serial_commands(void)
             // compressor_enable, master_gain_db, ad9851_output_enable,
             // env_predistort_enable, env_floor, freq_dev_slew_limit_hz,
             // envelope_interp_enable, envelope_interp_curve,
-            // env_ampeq_enable) -
+            // env_ampeq_enable, env_ampeq_shelf2_enable) -
             // wrapped in braces with a trailing comma so the whole line
             // can be pasted directly into settingsPresets[] in settings.h
             // as a new preset entry.
@@ -523,11 +543,22 @@ void handle_serial_commands(void)
             // convention as adc_lpf_mode below, so the pasted line compiles
             // directly.
             //
-            // env_ampeq_enable ('a', envelope_ampeq.h) is the newest
-            // trailing field - a plain bool, same as env_gdeq_enable.
-            // NOT YET VALIDATED on real hardware as of 2026-09-03 - pasting
-            // "true" here into a new preset means that preset starts up
-            // with an unvalidated correction active.
+            // env_ampeq_enable ('a', envelope_ampeq.h, shelf 1) - a plain
+            // bool, same as env_gdeq_enable. VALIDATED on real hardware
+            // 2026-09-03 (magnitude tracks prediction, real IMD benefit,
+            // reintroduces some group-delay dispersion pending a gdeq
+            // refit).
+            //
+            // env_ampeq_shelf2_enable ('A', envelope_ampeq.h, shelf 2) is
+            // the newest trailing field, added 2026-09-04 when shelf 1/2
+            // were split into independent flags. VALIDATED on real
+            // hardware the same day: more magnitude recovery toward
+            // 8000Hz, but dispersion roughly doubles again and two-tone
+            // IMD came back marginally WORSE combined with shelf 1 in
+            // this still-unrefit-gdeq state - pasting "true" here means
+            // that preset starts up with shelf 2 active; current project
+            // recommendation is "false" (shelf 1 only) until gdeq is
+            // refit.
 #if AD9851_ATTACHED
             float rel_delay = relative_delay_get_samples();
             bool rf_enabled = carrier_output_get_rf_enabled();
@@ -563,7 +594,7 @@ void handle_serial_commands(void)
                 "ENVELOPE_INTERP_CURVE_HOLD"
             };
             serial_reply("-> settings line (paste into settingsPresets[] in settings.h, then rename \"Live\"):\r\n");
-            serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s, %s, %s },\r\n",
+            serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s, %s, %s, %s },\r\n",
                           audio_source_enum_name(dsp_state_get_audio_source()),
                           rel_delay,
                           envelope_output_get_pwm_offset(),
@@ -579,7 +610,8 @@ void handle_serial_commands(void)
                           slew_str,
                           envelope_interp_get_enabled() ? "true" : "false",
                           k_interp_curve_enum_name[envelope_interp_get_curve()],
-                          envelope_ampeq_get_enabled() ? "true" : "false");
+                          envelope_ampeq_get_enabled() ? "true" : "false",
+                          envelope_ampeq_shelf2_get_enabled() ? "true" : "false");
         } else if (c >= '0' && c <= '9') {
             int preset = c - '0';
             const PersistentSettings& p = settingsPresets[preset];
@@ -637,11 +669,14 @@ void handle_serial_commands(void)
             // above.
             envelope_interp_set_curve(p.envelope_interp_curve);
 
-            // Same reset-on-enable reasoning as the 'g'/'a' handlers -
-            // shared via envelope_ampeq_set_enabled() itself, so an
-            // off->on transition on preset load resets both shelves' state
-            // cleanly too, not just when toggled live.
+            // Same reset-on-enable reasoning as the 'g'/'a'/'A' handlers -
+            // shared via each shelf's own _set_enabled(), so an off->on
+            // transition on preset load resets that shelf's state cleanly
+            // too, not just when toggled live. Independent as of
+            // 2026-09-04 (see envelope_ampeq.h) - each preset now controls
+            // shelf 1 and shelf 2 separately.
             envelope_ampeq_set_enabled(p.env_ampeq_enable);
+            envelope_ampeq_shelf2_set_enabled(p.env_ampeq_shelf2_enable);
 
             serial_reply("-> preset %d: %s\r\n", preset, p.name);
         }

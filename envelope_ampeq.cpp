@@ -6,7 +6,8 @@
 
 static ssb_shelf_biquad_t s_env_ampeq_shelf1;
 static ssb_shelf_biquad_t s_env_ampeq_shelf2;
-static volatile bool s_env_ampeq_enable = false;
+static volatile bool s_env_ampeq_shelf1_enable = false;
+static volatile bool s_env_ampeq_shelf2_enable = false;
 
 void envelope_ampeq_init(void)
 {
@@ -18,8 +19,10 @@ void envelope_ampeq_init(void)
 
 float IRAM_ATTR envelope_ampeq_process(float envelope)
 {
-    if (s_env_ampeq_enable) {
+    if (s_env_ampeq_shelf1_enable) {
         envelope = ssb_shelf_biquad_process(&s_env_ampeq_shelf1, envelope);
+    }
+    if (s_env_ampeq_shelf2_enable) {
         envelope = ssb_shelf_biquad_process(&s_env_ampeq_shelf2, envelope);
     }
     return envelope;
@@ -27,15 +30,28 @@ float IRAM_ATTR envelope_ampeq_process(float envelope)
 
 bool envelope_ampeq_get_enabled(void)
 {
-    return s_env_ampeq_enable;
+    return s_env_ampeq_shelf1_enable;
 }
 
 void envelope_ampeq_set_enabled(bool enable)
 {
-    bool was_on = s_env_ampeq_enable;
-    s_env_ampeq_enable = enable;
+    bool was_on = s_env_ampeq_shelf1_enable;
+    s_env_ampeq_shelf1_enable = enable;
     if (enable && !was_on) {
         ssb_shelf_biquad_reset(&s_env_ampeq_shelf1);
+    }
+}
+
+bool envelope_ampeq_shelf2_get_enabled(void)
+{
+    return s_env_ampeq_shelf2_enable;
+}
+
+void envelope_ampeq_shelf2_set_enabled(bool enable)
+{
+    bool was_on = s_env_ampeq_shelf2_enable;
+    s_env_ampeq_shelf2_enable = enable;
+    if (enable && !was_on) {
         ssb_shelf_biquad_reset(&s_env_ampeq_shelf2);
     }
 }
