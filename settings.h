@@ -248,8 +248,10 @@ SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM },
 // Preset 6 -
 { "V4 Two tone tuned", AUDIO_SRC_TWOTONE, 2.15f, 0.20f, 0.90f, false, ADC_LPF_MODE_OFF, false, false, 0.6f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, true, ENVELOPE_INTERP_CURVE_CATMULL_ROM },
 // Preset 7 -
-{ "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.96f, 0.40f, 0.46f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
-// Preset 8 -
+ { "V6+a1+g+eq", AUDIO_SRC_TWOTONE, 2.00f, 0.20f, 0.90f, true, ADC_LPF_MODE_OFF, false, false, -1.4f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM},
+
+    
+    // Preset 8 -
 { "FM Env 2.2", AUDIO_SRC_FMTEST, 2.96f, 0.12f, 0.48f, true, ADC_LPF_MODE_OFF, false, false, 0.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
 // Preset 9 -
 { "AM Env = 1.6 - 2.9", AUDIO_SRC_AMTEST, 3.04f, 0.28f, 0.70f, true, ADC_LPF_MODE_OFF, true, true, -4.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM }  // was 1.90f @ 10000Hz; adc_lpf_bypass=true
