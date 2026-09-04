@@ -176,18 +176,79 @@
  * sections are steep enough that the un-fit region past 4300Hz was
  * always going to diverge once looked at.
  *
- * STILL NOT VALIDATED FOR IMD ON REAL HARDWARE. group_delay_fit_notes.md's
- * extensive 2026-09-01 real-hardware IMD testing (which found gdeq made
- * 3rd-order IMD 6-10dB WORSE on two-tone, and recommended leaving `g` off
- * by default) was run against the OLD coefficients, not these - it does
- * NOT automatically carry over. This refit directly addresses two of that
- * writeup's four suspected causes (fit-window mismatch and, possibly, the
- * DC-bias-point measurement inconsistency), but the other two (the
- * unity-magnitude all-pass structure still can't touch this filter's real
- * insertion-loss penalty; the envelope-interpolation confound) are
- * unchanged, and none of this replaces re-running the actual IMD
- * comparison. **`g` stays off by default until that re-test happens** -
- * this is a better-fitted equalizer, not a re-validated one.
+ * GROUP-DELAY SIDE CONFIRMED ON REAL HARDWARE, 2026-09-03 (same day): these
+ * coefficients were flashed to the board and re-measured with the TFA -
+ * measured 71.3us -> 20.3us p-p over 100-8000Hz (~3.5x), mean added delay
+ * 125.2us/2.003 samples, within ~1us of the prediction above and tracking
+ * the predicted curve to ~2us RMS across the whole band. See
+ * group_delay_fit_notes.md's matching entry for the full comparison and a
+ * data-provenance note (that measurement file's two columns came out
+ * swapped relative to the expected off/on order - resolved by a physical
+ * sanity check, documented there).
+ *
+ * STILL NOT VALIDATED FOR IMD ON REAL HARDWARE - the group-delay
+ * confirmation above is a different, narrower claim than IMD validation.
+ * group_delay_fit_notes.md's extensive 2026-09-01 real-hardware IMD
+ * testing (which found gdeq made 3rd-order IMD 6-10dB WORSE on two-tone,
+ * and recommended leaving `g` off by default) was run against the OLD
+ * coefficients, not these - it does NOT automatically carry over. This
+ * refit directly addresses two of that writeup's four suspected causes
+ * (fit-window mismatch and, possibly, the DC-bias-point measurement
+ * inconsistency), but the other two (the unity-magnitude all-pass
+ * structure still can't touch this filter's real insertion-loss penalty;
+ * the envelope-interpolation confound) are unchanged, and none of this
+ * replaces re-running the actual IMD comparison. **`g` stays off by
+ * default until that re-test happens** - this is a better-fitted AND
+ * now group-delay-validated equalizer, but not an IMD-validated one.
+ *
+ * ---- 2026-09-04: a second, 'a'+'A'-specific candidate fit exists,
+ * NOT active by default ---- Once envelope_ampeq.h's shelf1+shelf2 both
+ * got real-hardware use, the coefficients above (fit against the bare
+ * analog filter alone) were confirmed to pass both shelves' own delay
+ * dispersion straight through uncorrected (2026-09-03 g+a trial: 19.4us ->
+ * 81.7us p-p; 2026-09-04 with shelf2 too: up to 157.5us p-p). Requested by
+ * the user after directly confirming on the bench that envelope nulls
+ * scope quicker and deeper with shelf1, quicker/deeper still with shelf2
+ * (matching the candidate mechanism written up in
+ * group_delay_fit_notes.md) - "maybe we should refine the grp delay again
+ * to optimise that for the a+A case." A candidate refit
+ * (a1=a2=-0.139115) was derived WITHOUT a new hardware sweep: the bare
+ * (no-gdeq) analog+shelf1+shelf2 phase curve was reconstructed from the
+ * existing `ga_Trial2_TF.txt` measurement by subtracting the ABOVE
+ * coefficients' own exactly-known analytic phase (valid LTI cascade
+ * algebra - gdeq runs purely digitally, earlier in the same chain the TFA
+ * sweep measures end-to-end), then validated by self-consistency
+ * (re-adding the above coefficients' phase to the reconstruction
+ * reproduces the real Trial2 measurement almost exactly).
+ *
+ * Result: 157.5us -> 72.6us p-p (~2.2x) - real, but nowhere near the ~4x
+ * flattening achieved above for the simpler analog-alone curve, and
+ * confirmed to be a hard ceiling for this filter type (2/3/4-section
+ * searches all landed on the same ~71-73us p-p floor) - the
+ * analog+shelf1+shelf2 curve has two interior extrema plus a steep
+ * near-Nyquist edge (shelf2's own delay signature peaks +86.3us right at
+ * 7037Hz) that a cascaded single-real-pole all-pass can't fully track.
+ * **The improvement is NOT uniform** - it fixes 8000Hz dramatically
+ * (290.5us -> 217.9us) but ADDS 24-66us of delay at 500-3100Hz (the
+ * two-tone's own fundamental frequencies) relative to the coefficients
+ * above - a real redistribution, not a free improvement, and whether that
+ * redistribution actually helps real IMD needs a bench test, not just a
+ * smaller p-p number. See group_delay_fit_notes.md's matching 2026-09-04
+ * entry for the full trade-off table and `gdeq_refit_a_A_candidate_v7.html`
+ * for the chart.
+ *
+ * Selected via `ENV_GDEQ_USE_AA_CANDIDATE` in the `#if` block below - 0
+ * (default) keeps the coefficients above active; flip to 1 only when
+ * bench-testing with `'a'` AND `'A'` both on. **NOT YET VALIDATED ON REAL
+ * HARDWARE for the a+A case specifically** - this is a candidate derived
+ * from a reconstructed curve, not a fresh direct `'g'` OFF + `'a'`+`'A'`
+ * ON sweep (the self-consistency check is strong, but every other fit in
+ * this file was confirmed against a fresh direct measurement before being
+ * trusted - recommended here too before drawing firm conclusions). Mean
+ * added delay for the candidate: ~124.4us (1.990 samples @ 16000Hz) -
+ * close to the default's 125.4us/2.006 samples, so switching between the
+ * two should need only a small `'['`/`']'` nudge, not a from-scratch
+ * relative-delay search.
  *
  * IMPORTANT SIDE EFFECT (both filters): an all-pass filter can only ADD
  * delay, never subtract it - flattening this curve pushes the envelope
@@ -238,6 +299,49 @@
     #define ENV_GDEQ_A1  -0.023900f
     #define ENV_GDEQ_A2   0.447131f
   #elif ENV_FILTER_VARIANT == ENV_FILTER_PNP_BC327_ATTN
+    // ---- 2026-09-04: a SECOND fit exists now, specific to the 'a'+'A'
+    // ampeq case (both shelf1 AND shelf2 on) - see group_delay_fit_notes.md's
+    // matching entry for the full derivation, the reconstructed-curve
+    // method (no new hardware sweep was needed - the bare analog+shelf1+
+    // shelf2 phase was recovered from the existing ga_Trial2_TF.txt
+    // measurement by subtracting the CURRENT coefficients' exactly-known
+    // analytic phase, validated by self-consistency), and IMPORTANTLY the
+    // trade-off table showing the improvement is NOT uniform (fixes
+    // 8000Hz a lot, ADDS 24-66us of delay at 500-3100Hz - the two-tone's
+    // own fundamentals - relative to the values below). That candidate
+    // (a1=a2=-0.139115) is NOT the active default - it would make things
+    // WORSE for the 'g'-alone and 'g'+'a'-only cases the values below were
+    // actually fit for (this filter type only supports ONE fixed pair at
+    // compile time; see the open architectural question in
+    // group_delay_fit_notes.md about whether that should ever become
+    // runtime-selectable). Flip ENV_GDEQ_USE_AA_CANDIDATE to 1 below ONLY
+    // when specifically bench-testing with 'a' AND 'A' both on - flip it
+    // back to 0 (or just leave it, since testing sessions have been ending
+    // with a revert-and-record-more-data pattern all through this project)
+    // before trusting 'g'/'g'+'a' results again. NEITHER value below has
+    // been re-measured on real hardware for the a+A case specifically -
+    // this is a candidate to bench-test, not a confirmed result.
+    #define ENV_GDEQ_USE_AA_CANDIDATE 0
+
+    #if ENV_GDEQ_USE_AA_CANDIDATE
+      // Grid search + global (differential-evolution) search + Nelder-Mead
+      // refinement, same discipline as every fit in this file, against the
+      // reconstructed analog+shelf1+shelf2 bare curve (88.4us p-p, 71.1us
+      // mean over 100-8000Hz). 2/3/4-section searches all converged to
+      // essentially the same ~71-73us p-p floor (a real ceiling for this
+      // filter type on this curve shape - see group_delay_fit_notes.md for
+      // why: two interior extrema plus a steep near-Nyquist edge from
+      // shelf2's own delay signature), so 2 sections (same architecture as
+      // below) was kept rather than adding more for a diminishing-returns
+      // ~1-2us gain. Result: 157.5us -> 72.6us p-p (~2.2x) relative to
+      // what applying the OTHER (default) coefficients to this same bare
+      // curve would give - NOT a ~4x flattening like the original
+      // analog-alone fit below achieved, and NOT uniform - see the header
+      // comment above and group_delay_fit_notes.md's trade-off table
+      // before drawing IMD conclusions from just this p-p number.
+      #define ENV_GDEQ_A1  -0.139115f
+      #define ENV_GDEQ_A2  -0.139115f
+    #else
     // Refitted 2026-09-03 against REAL HARDWARE TFA data
     // (Group_delay_off__on_F_Phase.txt, Hi-Z-buffered measurement rig),
     // fit band widened to 100-8000Hz (was 100-4300Hz) - see the header
@@ -246,7 +350,12 @@
     // the correction to this project's own same-day dispersion report.
     // Grid-search + Nelder-Mead cross-checked (multiple starts converged
     // to the same point), same discipline as every fit in this file.
-    // STILL NOT IMD-VALIDATED ON REAL HARDWARE - see header comment.
+    // STILL NOT IMD-VALIDATED ON REAL HARDWARE - see header comment. Also
+    // known (2026-09-03 g+a trial, then again 2026-09-04 with shelf2 too)
+    // to NOT flatten well once ampeq's shelf(s) are on - these values were
+    // fit against the bare analog filter ALONE, before either shelf
+    // existed - see the ENV_GDEQ_USE_AA_CANDIDATE block above for the
+    // shelf1+shelf2-specific alternative.
     #define ENV_GDEQ_A1   0.026173f
     #define ENV_GDEQ_A2   0.236810f
     // For reference/history (NOT active) - 2026-09-01 LTspice-only fit,
@@ -254,6 +363,7 @@
     // if evaluated past 4300Hz, which is exactly why this needed a real
     // re-fit rather than just widening the old coefficients' claimed
     // range - see header comment.
+    #endif
   #else
     #error "ENV_GDEQ_A1/A2 have only been fitted for ENV_FILTER_BC337 or ENV_FILTER_PNP_BC327_ATTN at SAMPLE_RATE_HZ=16000 - see group_delay_fit_notes.md for the fitting method to add another"
   #endif

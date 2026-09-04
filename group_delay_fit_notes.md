@@ -1595,3 +1595,243 @@ reversion, so shelf2 stays available to re-test later, ideally after the
 still-outstanding gdeq refit against the combined analog+shelf1+shelf2
 phase response. Chart: `gdeq_ampeq_delay_chart_v6.html` (real Trial1 vs.
 real Trial2, magnitude and group delay side by side).
+
+Shortly after, shelf1 and shelf2 were split into independent enable flags
+(`'a'`/`'A'`, see `envelope_ampeq.h`'s matching entry and
+`serial_commands.cpp`) specifically so this comparison could continue
+without reflashing between configs.
+
+---
+
+## 2026-09-04, later still — `A` (shelf2) preliminary IMD report: a candidate mechanism, unconfirmed
+
+**The report, verbatim:** "A mixed bag so far. Reduces HF IMDs with eq off
+but otherwise not a lot of change." First real use of the newly-independent
+`'A'` toggle. Two observations to explain: (1) `eq` OFF + `A` ON reduces
+HF IMDs; (2) otherwise (implicitly, `eq` ON, or other conditions not yet
+specified) `A` does little.
+
+**Why this is surprising at first glance.** `envelope_ampeq` (both shelves)
+only ever touches the `envelope` value - the amplitude signal that drives
+the RSET/PWM/analog-filter path. It has no access to, and cannot affect,
+`freq_dev_hz` - the instantaneous-frequency signal that goes straight to
+the AD9851 over SPI, entirely bypassing `envelope_ampeq`/`envelope_gdeq`.
+The two are computed from the same analytic signal `z(t)` but diverge
+immediately after (`envelope = |z(t)|`, `freq_dev` from `angle(z(t))`'s
+derivative) and are never recombined in the digital domain - they only
+combine physically, at the RF output, as (RSET-driven PA gain) ×
+(AD9851's instantaneous-frequency-modulated carrier). This project's
+established null/"nemesis" mechanism (see the dated entries elsewhere in
+this file) is that with `eq` OFF, a true envelope null causes `freq_dev`
+to violently sign-flip - a PHASE-domain event. `envelope_ampeq` cannot
+prevent that flip; it never sees `freq_dev` at all. So how could enabling
+`A` change the resulting IMDs?
+
+**Candidate mechanism (NOT YET CONFIRMED - needs a real test, not just
+this reasoning):** the RF output's actual amplitude at the null instant is
+set by the PHYSICAL RSET/PWM/analog-filter chain's response to the digital
+`envelope` value, not the digital value itself. The analog filter's own
+severe high-frequency roll-off (the entire reason `envelope_ampeq` exists)
+doesn't just attenuate steady-state high frequencies - it also SLOWS the
+physical envelope's response to FAST transients, and a null's cusp
+(a brief, sharp dip when `eq` is off) is exactly this kind of fast,
+high-frequency-rich event. Before `A`: the physical RSET-driven PA gain
+may not be dropping all the way to the digital envelope's true near-zero
+value AT the null instant - filter lag smears/softens the dip in time,
+so the gain trace sits somewhat higher, for somewhat longer, around the
+null than the digital envelope itself specifies. If that's true, the
+erratic `freq_dev` energy occurring at that same instant gets multiplied
+by a not-quite-zero gain and leaks into the RF output as IMD. Enabling `A`
+restores high-frequency fidelity to the envelope path (that's its whole
+purpose), which could let the physical RSET-driven gain track the true
+digital envelope more precisely and more quickly - meaning it actually
+DROPS closer to zero, and does so more promptly, right when the null (and
+its `freq_dev` transient) occurs. That would tighten the physical
+"gate" on the erratic phase energy at exactly the moment it matters,
+without `A` ever touching `freq_dev` directly - an AMPLITUDE-domain fix
+for a problem whose ROOT CAUSE is in the phase domain, working by
+tightening how well amplitude suppresses phase garbage at the RF stage,
+not by preventing the phase garbage from existing.
+
+**Why this predicts observation (2) as well, which is a good consistency
+check (not proof):** with `eq` ON, there's no true null and no `freq_dev`
+sign-flip to begin with (the presence-peak amplitude asymmetry already
+keeps the envelope minimum well above zero - see the 2026-09-03 entries).
+If the mechanism above is right, `A`'s benefit specifically depends on
+there being erratic phase energy AT a null for the tightened gate to
+suppress - with `eq` on, there isn't any, so `A` would be expected to do
+"not a lot" - matching the user's second observation. A hypothesis that
+predicts BOTH halves of an odd-looking report from one mechanism is worth
+taking seriously, but two data points is not confirmation - still needs a
+real test.
+
+**What would confirm or kill this, not yet run:**
+- Same two-tone test, `eq` off, `A` off vs on, scoping the RSET/envelope
+  output directly right at a null crossing (same technique already used to
+  see the null-floor phenomenon in the `eq` investigation) - if the
+  mechanism is right, `A` on should show the physical envelope trough
+  reaching visibly closer to zero, faster, than `A` off.
+- A direct look at which IMD PRODUCTS specifically improved ("HF IMDs" is
+  currently just the user's own characterization, not a specific
+  frequency/order list) - the mechanism above predicts improvement should
+  be concentrated at higher-order products (further from carrier), which
+  are the ones most sensitive to a brief, wideband instant of leakage,
+  rather than a broad, even improvement across all orders.
+- Whether `g` was on or off during these particular runs, and at what
+  relative-delay setting - not recorded yet, and relevant because `g`'s
+  timing changes exactly when the envelope path's own event (including a
+  null) lines up against `freq_dev`'s event in time.
+- A repeat under identical conditions to rule out run-to-run/level-setting
+  noise before treating "reduces HF IMDs" as a settled real effect.
+
+**2026-09-04, confirmed on the bench:** user scoped the RSET/envelope
+output directly and reports the null IS quicker and deeper with shelf 1,
+and quicker/deeper still with shelf 2 - exactly the first prediction
+above. This is real, independent confirmation of the candidate mechanism
+(better HF envelope-path fidelity -> the physical RSET-driven gain tracks
+the true digital envelope more precisely and faster at a null, tightening
+how well amplitude gates the `freq_dev` transient) - upgraded from
+hypothesis to bench-confirmed. Still open: the IMD-product-specificity and
+same-conditions `eq`-on comparison items above.
+
+---
+
+## 2026-09-04 — refitting gdeq for the `a`+`A` case: real improvement, but a genuine trade-off, not a clean win
+
+**Why:** user's own framing, following the null-depth confirmation above -
+"Maybe we should refine the grp delay again to optimise that for the a+A
+case." This is the gdeq refit flagged as outstanding since the shelf2
+work began (envelope_ampeq.h's "Interaction with gdeq" note, and the
+2026-09-04 entries above) - gdeq's current coefficients
+(a1=0.026173, a2=0.236810) were fit against the bare analog filter alone,
+before either shelf existed, and are known to pass both shelves'
+dispersion straight through uncorrected.
+
+**Method - no new hardware sweep needed.** Rather than requesting a fresh
+`'g'` OFF + `'a'`+`'A'` ON TFA sweep, the "bare" (analog+shelf1+shelf2,
+NO gdeq) phase curve was reconstructed directly from the existing
+`ga_Trial2_TF.txt` measurement: since gdeq is a purely digital cascade
+applied earlier in the same signal chain the TFA sweep measures end-to-end,
+and its current coefficients are exactly known, `phase_bare = phase_measured
+- phase_gdeq_analytic` is valid by straightforward LTI cascade algebra (all
+stages are linear time-invariant, so phases simply add in a cascade).
+**Validated by self-consistency**, not just asserted: re-adding the
+current coefficients' analytic phase to the reconstructed bare curve
+reproduces the real Trial2 measurement almost exactly - p-p 157.5us and
+mean 196.4us either way, matching the direct measurement from the
+2026-09-04 Trial2 entry above to the digit. Reconstructed bare curve: p-p
+88.4us, mean 71.1us over 100-8000Hz - the mean matching the previously-
+established analog-alone mean (71.2us) almost exactly is a second,
+independent consistency check (both shelves have near-zero predicted mean
+delay contribution, so total mean should track analog-alone's, and it
+does).
+
+**Optimization result - a real ceiling, not a coefficient-search failure.**
+Grid search + Nelder-Mead (same method as every prior gdeq fit), 2/3/4
+cascaded `ssb_allpass1_t` sections, minimizing p-p group delay over
+100-8000Hz against the reconstructed bare curve:
+
+| Sections | Best p-p achievable | Coefficients |
+|---|---|---|
+| 2 | 72.6us | a1=a2=-0.139115 |
+| 3 | 71.3us | all three ≈ -0.08750 |
+| 4 | 70.7us | all four ≈ -0.06398 |
+
+More sections barely help - each additional section converges to a
+smaller, near-identical coefficient rather than a meaningfully different
+curve shape, meaning the achievable floor for THIS filter type (cascaded
+single-real-pole all-pass) sits around ~71-73us p-p for this particular
+bare curve shape, confirmed via both a coarse grid search and a global
+differential-evolution search (both landed on the same floor
+independently). **2 sections is therefore the right choice** - same
+architecture already in envelope_gdeq.h, just new coefficients, and
+extra sections buy essentially nothing here.
+
+**Why the ceiling is so much higher than the original analog-alone fit's
+(18.5us):** the bare curve here has a materially harder shape - it rises
+from 100Hz to a first local peak near 3100Hz (~82us), FALLS to a local
+minimum near 5000Hz (~39us), then rises sharply to a second, higher peak
+near 7800Hz (~125us) right at the edge of Nyquist (8000Hz at this Fs).
+That's two interior extrema plus a steep near-Nyquist edge, vs. the
+original analog-only curve's single smooth hump. A first-order all-pass
+section's own delay curve (`(1-a^2)/(1+2a*cos(w)+a^2)`) is smooth and can
+only produce ONE hump over the full band - cascading sections helps when
+each section can be given a genuinely different shape/location, but here
+the optimizer keeps landing on near-identical coefficients per section,
+meaning this curve's shape doesn't offer that flexibility to exploit. The
+steep near-Nyquist rise is shelf2's own signature (its predicted delay
+peaks at +86.3us right at 7037Hz, see the 2026-09-04 shelf2 entry above) -
+consistent with shelf2 being the harder half of this curve to flatten.
+
+**The trade-off - improvement is NOT uniform across frequency, read this
+before flashing anything:**
+
+| Freq | current (old gdeq coeffs) | candidate refit (a1=a2=-0.139115) | delta |
+|---|---|---|---|
+| 500Hz | 142.9us | 209.0us | +66.1us (worse) |
+| 700Hz | 147.4us | 212.0us | +64.6us (worse) |
+| 1700Hz | 167.1us | 218.7us | +51.6us (worse) |
+| 1900Hz | 170.4us | 218.7us | +48.3us (worse) |
+| 3100Hz | 191.3us | 214.6us | +23.3us (worse) |
+| 4300Hz | 179.3us | 174.3us | -5.0us (~same) |
+| 8000Hz | 290.5us | 217.9us | -72.6us (much better) |
+
+The refit lowers OVERALL p-p by flattening the curve around a higher
+common level, which concretely means it fixes the 8000Hz peak dramatically
+but ADDS 24-66us of delay at 500-3100Hz relative to what's flashed right
+now - and 500-1900Hz are the two-tone's own fundamental frequencies (700,
+1900Hz) plus the IMD3-lower offset (500Hz). Since real IMD very plausibly
+depends on the exact relative TIMING between the envelope and `freq_dev`
+paths at the frequencies that carry the actual signal power (not just on
+minimizing an abstract p-p number across the whole band equally), this
+redistribution needs a real two-tone IMD comparison on the bench to judge
+- a smaller p-p number is not automatically a "better" result for IMD, only
+a flatter one on paper. A restricted-band variant (fit only over
+100-4300Hz) was also tried for comparison: it flattens that sub-band
+beautifully (27.3us p-p there) but drives 8000Hz UP to 311us - WORSE than
+doing nothing - confirming the same fundamental tension from the opposite
+direction and ruling that option out as a serious candidate.
+
+**Mean delay barely moves** (196.4us -> 195.5us, about -1us), so `'['`/`']'`
+relative-delay re-tuning should need only a small nudge if this is tried,
+not a from-scratch search the way the very first gdeq introduction needed.
+
+**Not yet done:** implementing this in `envelope_gdeq.h` (would need a
+decision on HOW - see the open question below), a real `'g'` OFF +
+`'a'`+`'A'` ON TFA sweep to directly confirm the reconstructed bare curve
+(the self-consistency check above is strong, but every other gdeq fit in
+this project has been validated against a fresh direct sweep before
+trusting it, not just reconstructed from an existing one), and the actual
+two-tone IMD comparison once flashed. Chart:
+`gdeq_refit_a_A_candidate_v7.html`.
+
+**Open architectural question, not yet resolved:** gdeq's coefficients are
+currently a single fixed compile-time pair per filter/Fs combination
+(`#if`/`#elif` on `SAMPLE_RATE_HZ`/`ENV_FILTER_VARIANT`). The RIGHT
+coefficients now depend on ampeq's shelf state too - analog-alone (current
+values, correct for `'a'`/`'A'` both off), analog+shelf1 (`'a'` on, `'A'`
+off - never separately refit, still uses the analog-alone values, known
+suboptimal per the 2026-09-03 g+a entry), and analog+shelf1+shelf2 (`'a'`+
+`'A'` both on - this entry's new candidate). Three genuinely different
+optimal pairs for three reachable configurations. Options for handling
+this, not yet decided: (a) keep one fixed pair as a compromise (accepting
+it's not optimal for every ampeq state); (b) make gdeq's coefficients
+runtime-selectable, chosen automatically from `a`/`A`'s current state
+(more correct, more code); (c) leave the `#define`s as a manually-edited
+value swapped in only when specifically bench-testing the `a`+`A`
+combination, same way different firmware variants have already been
+swapped in and out through this session.
+
+**Implemented, 2026-09-04, same day: option (c).** `envelope_gdeq.h` now
+has both coefficient pairs in the file at once, gated by a new
+`ENV_GDEQ_USE_AA_CANDIDATE` compile-time flag (0 = default, the existing
+2026-09-03 analog-alone fit; 1 = this entry's a+A candidate). Chosen over
+(a)/(b) because the a+A candidate is still an unconfirmed, non-uniform
+trade-off (see the table above) that would actively regress the
+currently-recommended default config (`'a'` on, `'A'` off) if it silently
+replaced the existing values - a manual, obvious, one-line flip keeps the
+validated default safe while making the candidate one edit away to
+bench-test, consistent with how every other A/B comparison in this session
+(slew-rate limits, ampeq shelf states) has been done. Revisit (b) - real
+runtime switching - if the a+A candidate proves out on the bench and ends
+up wanted as a standing option rather than an occasional test.

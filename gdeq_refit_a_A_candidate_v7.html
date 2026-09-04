@@ -1,0 +1,352 @@
+<title>gdeq refit for a+A</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --gridline:       #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --series-bare:    #898781;
+    --series-current: #d0632a;
+    --series-refit:   #2a9d5c;
+    --good:           #0ca30c;
+    --warn:           #b8860b;
+    --band-fill:      rgba(11,11,11,0.045);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --gridline:       #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --series-bare:    #6f6d67;
+      --series-current: #e0793f;
+      --series-refit:   #3fb579;
+      --good:           #0ca30c;
+      --warn:           #d4a017;
+      --band-fill:      rgba(255,255,255,0.05);
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --gridline:       #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --series-bare:    #6f6d67;
+    --series-current: #e0793f;
+    --series-refit:   #3fb579;
+    --good:           #0ca30c;
+    --warn:           #d4a017;
+    --band-fill:      rgba(255,255,255,0.05);
+  }
+
+  * { box-sizing: border-box; }
+  body { background: var(--page); margin: 0; }
+  .viz-root {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: var(--text-primary);
+    background: var(--page);
+    padding: 24px;
+    max-width: 980px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--text-secondary); font-size: 13px; margin: 0 0 20px; line-height: 1.5; }
+
+  .card {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .card.notice { border-left: 3px solid var(--warn); }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .stat-tile {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .stat-tile .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px; }
+  .stat-tile .value { font-size: 20px; font-weight: 600; }
+  .stat-tile .delta { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+
+  .chart-title { font-size: 14px; font-weight: 600; margin: 0 0 2px; }
+  .chart-note { font-size: 12px; color: var(--text-secondary); margin: 0 0 14px; line-height: 1.5; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 18px; font-size: 12px; color: var(--text-secondary); margin-bottom: 8px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-swatch { width: 18px; height: 2px; border-radius: 1px; }
+  .legend-swatch.dotted { background: none; border-top: 2px dotted currentColor; height: 0; }
+
+  svg { display: block; overflow: visible; }
+  .gridline { stroke: var(--gridline); stroke-width: 1; }
+  .baseline { stroke: var(--baseline); stroke-width: 1; }
+  .axis-label { fill: var(--text-muted); font-size: 10px; }
+  .line-bare { fill: none; stroke: var(--series-bare); stroke-width: 1.5; stroke-dasharray: 1,3; }
+  .line-current { fill: none; stroke: var(--series-current); stroke-width: 2; }
+  .line-refit { fill: none; stroke: var(--series-refit); stroke-width: 2; }
+  .crosshair { stroke: var(--baseline); stroke-width: 1; pointer-events: none; }
+  .hover-dot { pointer-events: none; }
+
+  .tooltip {
+    position: absolute;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 12px;
+    pointer-events: none;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+    display: none;
+    min-width: 190px;
+  }
+  .tooltip .t-freq { color: var(--text-secondary); font-size: 11px; margin-bottom: 4px; }
+  .tooltip .t-row { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
+  .tooltip .t-key { width: 12px; height: 2px; flex-shrink: 0; }
+  .tooltip .t-val { font-weight: 600; color: var(--text-primary); }
+  .tooltip .t-name { color: var(--text-secondary); font-size: 11px; }
+
+  .caveat { font-size: 12px; color: var(--text-secondary); line-height: 1.6; }
+  .caveat b { color: var(--text-primary); }
+  .caveat + .caveat { margin-top: 10px; }
+</style>
+
+<div class="viz-root">
+  <h1>A candidate gdeq refit for the a+A case</h1>
+  <p class="subtitle">Not a new measurement: the "bare" (no gdeq) curve is reconstructed by subtracting the CURRENT gdeq's exactly-known analytic phase from the real <code>ga_Trial2_TF.txt</code> sweep (which had 'g'+shelf1+shelf2 all on). Validated: re-adding the current coefficients to this reconstruction reproduces Trial2's real measured curve almost exactly (self-consistency check, see notes).</p>
+
+  <div class="card notice">
+    <p class="chart-title">Real improvement, but not the ~4x flattening the original gdeq fit achieved</p>
+    <p class="caveat">
+      Best achievable with 2 (or even 3-4) all-pass sections: <b>157.5&thinsp;&micro;s &rarr; 72.6&thinsp;&micro;s p-p</b>
+      (~2.2&times;) over 100-8000Hz, new coefficients a1=a2&asymp;-0.1391. More sections barely help (3 sections: 71.3&micro;s,
+      4 sections: 70.7&micro;s) - this shape has a ceiling this filter type can't get past. The improvement is NOT uniform:
+      it fixes 8000Hz dramatically (290.5&rarr;217.9&micro;s) but actually ADDS 24-66&micro;s of delay at 500-3100Hz relative
+      to the current (mismatched) coefficients - a real trade-off between the two-tone fundamentals and the 8000Hz edge,
+      not a free lunch. Mean delay barely changes (196.4&rarr;195.5&micro;s), so '['/']' shouldn't need much re-tuning.
+    </p>
+  </div>
+
+  <div class="stat-grid" id="statGrid"></div>
+
+  <div class="card">
+    <p class="chart-title">Group delay vs. frequency</p>
+    <p class="chart-note">Dashed: reconstructed bare curve (no gdeq at all, analog+shelf1+shelf2 only). Solid orange: current gdeq coefficients (what's actually flashed now). Solid green: candidate refit.</p>
+    <div class="legend" id="legendEl"></div>
+    <div style="position:relative">
+      <svg id="chart" viewBox="0 0 900 400" width="100%"></svg>
+      <div class="tooltip" id="tooltip"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <p class="chart-title">Why this is a trade-off, not a clean win</p>
+    <p class="caveat">
+      Shelf2's own delay curve has a sharp feature right near Nyquist (8000Hz) - a single-real-pole all-pass section's
+      delay curve is smooth and can only produce one "hump" over the full band; cascading more of them barely adds
+      capability here (each extra section converges to a near-identical, smaller coefficient - see the analysis notes) so
+      there's a real ceiling on how well THIS filter type can track a curve shaped like the analog+shelf1+shelf2 combination.
+      Flattening the whole band pulls delay away from 8000Hz and redistributes it into the 500-3100Hz region - exactly
+      where the two-tone fundamentals and lower-order IMD products live - so whether this refit actually helps real IMD
+      needs a bench test, not just a smaller p-p number. This is an estimate from a reconstructed curve, not a fresh
+      'g'-off/'a'+'A'-on measurement - recommended before fully trusting it, though the self-consistency check above is
+      a strong sign the reconstruction is right.
+    </p>
+  </div>
+</div>
+
+<script>
+(function() {
+  const DATA = {"fmid": [117.2, 210.9, 304.7, 398.4, 492.1, 585.9, 679.6, 773.4, 867.1, 960.9, 1054.6, 1148.3, 1242.1, 1335.8, 1429.6, 1523.3, 1617.1, 1710.8, 1804.5, 1898.3, 1992.0, 2085.8, 2179.5, 2273.3, 2367.0, 2460.7, 2554.5, 2648.2, 2742.0, 2835.7, 2929.5, 3023.2, 3116.9, 3210.7, 3304.4, 3398.2, 3491.9, 3585.7, 3679.4, 3773.1, 3866.9, 3960.6, 4054.4, 4148.1, 4241.9, 4335.6, 4429.3, 4523.1, 4616.8, 4710.6, 4804.3, 4898.1, 4991.8, 5085.5, 5179.3, 5273.0, 5366.8, 5460.5, 5554.3, 5648.0, 5741.7, 5835.5, 5929.2, 6023.0, 6116.7, 6210.5, 6304.2, 6397.9, 6491.7, 6585.4, 6679.2, 6772.9, 6866.7, 6960.4, 7054.1, 7147.9, 7241.6, 7335.4, 7429.1, 7522.9, 7616.6, 7710.3, 7804.1, 7897.8, 7991.6, 8085.3, 8179.0, 8272.8, 8366.5, 8460.3], "bare": [36.8, 38.8, 40.8, 42.8, 44.8, 46.6, 48.5, 50.3, 52.0, 53.7, 55.4, 57.0, 58.6, 60.1, 61.6, 63.0, 64.4, 65.8, 67.0, 68.3, 69.5, 70.6, 72.5, 72.7, 74.6, 76.0, 77.5, 80.1, 79.4, 81.5, 83.4, 81.4, 79.6, 83.0, 77.8, 77.6, 79.3, 76.0, 75.4, 71.8, 70.2, 67.4, 65.0, 58.0, 57.3, 54.4, 50.2, 46.6, 43.6, 40.6, 44.5, 41.9, 39.3, 40.5, 40.0, 43.0, 45.6, 47.0, 51.4, 53.8, 60.1, 60.8, 65.6, 74.0, 67.3, 80.5, 82.2, 86.3, 86.8, 91.1, 93.8, 96.4, 101.2, 106.8, 108.7, 107.8, 110.9, 113.5, 113.0, 119.0, 122.1, 121.0, 125.0, 124.2, 123.4, 124.3, 125.6, 122.4, 124.9, 123.9], "current": [134.7, 136.8, 138.8, 140.9, 142.9, 144.9, 146.9, 148.9, 150.8, 152.7, 154.6, 156.4, 158.3, 160.1, 161.9, 163.6, 165.3, 167.1, 168.7, 170.4, 172.0, 173.7, 176.0, 176.7, 179.2, 181.2, 183.2, 186.4, 186.4, 189.2, 191.8, 190.5, 189.4, 193.6, 189.2, 189.8, 192.4, 190.0, 190.3, 187.6, 187.0, 185.3, 183.8, 177.9, 178.4, 176.6, 173.5, 171.1, 169.4, 167.7, 172.8, 171.5, 170.3, 172.9, 173.8, 178.2, 182.2, 185.1, 191.0, 194.8, 202.6, 204.8, 211.1, 221.0, 215.8, 230.4, 233.6, 239.1, 241.0, 246.6, 250.7, 254.6, 260.6, 267.3, 270.2, 270.4, 274.4, 277.8, 278.1, 284.7, 288.3, 287.6, 291.9, 291.3, 290.5, 291.4, 292.6, 289.1, 291.2, 289.7], "refit": [202.1, 204.0, 205.8, 207.5, 209.0, 210.4, 211.7, 212.9, 214.0, 214.9, 215.7, 216.4, 217.1, 217.6, 218.0, 218.3, 218.5, 218.7, 218.7, 218.7, 218.6, 218.4, 219.0, 217.8, 218.3, 218.4, 218.4, 219.6, 217.6, 218.2, 218.8, 215.4, 212.2, 214.2, 207.6, 206.0, 206.4, 201.8, 199.9, 195.0, 192.2, 188.2, 184.5, 176.3, 174.5, 170.5, 165.2, 160.5, 156.5, 152.5, 155.3, 151.7, 148.3, 148.6, 147.2, 149.3, 151.1, 151.8, 155.4, 157.1, 162.6, 162.7, 166.8, 174.7, 167.4, 180.0, 181.2, 184.8, 184.8, 188.7, 191.0, 193.3, 197.7, 203.0, 204.5, 203.4, 206.2, 208.6, 208.0, 213.9, 216.8, 215.6, 219.6, 218.7, 217.9, 218.8, 220.2, 217.0, 219.6, 218.7]};
+  const fmid = DATA.fmid;
+
+  function bandStats(arr, lo, hi) {
+    const vals = [];
+    for (let i = 0; i < fmid.length; i++) {
+      if (fmid[i] >= lo && fmid[i] <= hi) vals.push(arr[i]);
+    }
+    const mn = Math.min(...vals), mx = Math.max(...vals);
+    const mean = vals.reduce((a,b)=>a+b,0) / vals.length;
+    return { mn, mx, pp: mx - mn, mean };
+  }
+  const sCur = bandStats(DATA.current, 100, 8000);
+  const sRefit = bandStats(DATA.refit, 100, 8000);
+
+  const stats = [
+    { label: 'Current (old gdeq coeffs)', value: sCur.pp.toFixed(1) + ' \u00b5s p-p' },
+    { label: 'Candidate refit', value: sRefit.pp.toFixed(1) + ' \u00b5s p-p', delta: (sCur.pp/sRefit.pp).toFixed(1) + '\u00d7 better' },
+    { label: 'Mean delay shift', value: (sRefit.mean-sCur.mean>=0?'+':'') + (sRefit.mean-sCur.mean).toFixed(1) + ' \u00b5s', delta: 'minimal re-tune expected' },
+  ];
+  const statGrid = document.getElementById('statGrid');
+  stats.forEach(s => {
+    const tile = document.createElement('div');
+    tile.className = 'stat-tile';
+    const l = document.createElement('div'); l.className = 'label'; l.textContent = s.label;
+    const v = document.createElement('div'); v.className = 'value'; v.textContent = s.value;
+    tile.appendChild(l); tile.appendChild(v);
+    if (s.delta) { const d = document.createElement('div'); d.className = 'delta'; d.textContent = s.delta; tile.appendChild(d); }
+    statGrid.appendChild(tile);
+  });
+
+  const legendEl = document.getElementById('legendEl');
+  const legendItems = [
+    { name: 'Bare (no gdeq, reconstructed)', color: 'var(--series-bare)', dotted: true },
+    { name: 'Current gdeq coeffs (flashed now)', color: 'var(--series-current)', dotted: false },
+    { name: 'Candidate refit (a1=a2=-0.1391)', color: 'var(--series-refit)', dotted: false },
+  ];
+  legendItems.forEach(li => {
+    const item = document.createElement('div'); item.className = 'legend-item';
+    const sw = document.createElement('span');
+    sw.className = 'legend-swatch' + (li.dotted ? ' dotted' : '');
+    sw.style.background = li.dotted ? 'none' : li.color;
+    sw.style.color = li.color;
+    const name = document.createElement('span'); name.textContent = li.name;
+    item.appendChild(sw); item.appendChild(name);
+    legendEl.appendChild(item);
+  });
+
+  const svg = document.getElementById('chart');
+  const W = 900, H = 400, M = { top: 16, right: 20, bottom: 34, left: 50 };
+  const plotW = W - M.left - M.right, plotH = H - M.top - M.bottom;
+
+  const fMin = 0, fMax = Math.max(...fmid);
+  const gMin = 0, gMax = 320;
+
+  const xScale = f => M.left + (f - fMin) / (fMax - fMin) * plotW;
+  const yScale = g => M.top + plotH - (Math.min(Math.max(g,gMin),gMax) - gMin) / (gMax - gMin) * plotH;
+
+  const svgns = 'http://www.w3.org/2000/svg';
+  function el(tag, attrs) {
+    const e = document.createElementNS(svgns, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+
+  const yTicks = 8;
+  for (let i = 0; i <= yTicks; i++) {
+    const g = gMin + (gMax - gMin) * i / yTicks;
+    const y = yScale(g);
+    svg.appendChild(el('line', { class: 'gridline', x1: M.left, x2: W - M.right, y1: y, y2: y }));
+    const t = el('text', { class: 'axis-label', x: M.left - 8, y: y + 3, 'text-anchor': 'end' });
+    t.textContent = Math.round(g);
+    svg.appendChild(t);
+  }
+  const xTicks = [0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000];
+  xTicks.forEach(f => {
+    if (f > fMax) return;
+    const x = xScale(f);
+    const t = el('text', { class: 'axis-label', x: x, y: H - M.bottom + 16, 'text-anchor': 'middle' });
+    t.textContent = (f / 1000) + 'k';
+    svg.appendChild(t);
+  });
+  svg.appendChild(el('line', { class: 'baseline', x1: M.left, x2: W - M.right, y1: M.top + plotH, y2: M.top + plotH }));
+
+  function pathFor(ys) {
+    let d = '';
+    for (let i = 0; i < fmid.length; i++) {
+      const x = xScale(fmid[i]), y = yScale(ys[i]);
+      d += (i === 0 ? 'M' : 'L') + x.toFixed(2) + ',' + y.toFixed(2) + ' ';
+    }
+    return d.trim();
+  }
+  svg.appendChild(el('path', { class: 'line-bare', d: pathFor(DATA.bare) }));
+  svg.appendChild(el('path', { class: 'line-current', d: pathFor(DATA.current) }));
+  svg.appendChild(el('path', { class: 'line-refit', d: pathFor(DATA.refit) }));
+
+  const crosshair = el('line', { class: 'crosshair', x1: 0, x2: 0, y1: M.top, y2: M.top + plotH, style: 'display:none' });
+  svg.appendChild(crosshair);
+  const dotBare = el('circle', { class: 'hover-dot', r: 3, fill: 'var(--series-bare)', style: 'display:none' });
+  const dotCur = el('circle', { class: 'hover-dot', r: 4, fill: 'var(--series-current)', style: 'display:none' });
+  const dotRefit = el('circle', { class: 'hover-dot', r: 4, fill: 'var(--series-refit)', style: 'display:none' });
+  svg.appendChild(dotBare); svg.appendChild(dotCur); svg.appendChild(dotRefit);
+
+  const hitRect = el('rect', { x: M.left, y: M.top, width: plotW, height: plotH, fill: 'transparent' });
+  svg.appendChild(hitRect);
+
+  const tooltip = document.getElementById('tooltip');
+
+  function nearestIndex(f) {
+    let lo = 0, hi = fmid.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (fmid[mid] < f) lo = mid + 1; else hi = mid;
+    }
+    if (lo > 0 && Math.abs(fmid[lo-1] - f) < Math.abs(fmid[lo] - f)) return lo - 1;
+    return lo;
+  }
+
+  function showAt(clientX, svgRect) {
+    const px = clientX - svgRect.left;
+    const frac = px / svgRect.width;
+    const f = fMin + frac * (fMax - fMin);
+    if (f < fMin || f > fMax) { hideTooltip(); return; }
+    const idx = nearestIndex(f);
+    const fv = fmid[idx], vB = DATA.bare[idx], vC = DATA.current[idx], vR = DATA.refit[idx];
+    const x = xScale(fv);
+
+    crosshair.setAttribute('x1', x); crosshair.setAttribute('x2', x);
+    crosshair.style.display = '';
+    dotBare.setAttribute('cx', x); dotBare.setAttribute('cy', yScale(vB)); dotBare.style.display = '';
+    dotCur.setAttribute('cx', x); dotCur.setAttribute('cy', yScale(vC)); dotCur.style.display = '';
+    dotRefit.setAttribute('cx', x); dotRefit.setAttribute('cy', yScale(vR)); dotRefit.style.display = '';
+
+    tooltip.innerHTML = '';
+    const fRow = document.createElement('div');
+    fRow.className = 't-freq';
+    fRow.textContent = Math.round(fv) + ' Hz';
+    tooltip.appendChild(fRow);
+
+    [
+      { name: 'bare (no gdeq)', val: vB, color: 'var(--series-bare)' },
+      { name: 'current gdeq', val: vC, color: 'var(--series-current)' },
+      { name: 'candidate refit', val: vR, color: 'var(--series-refit)' },
+    ].forEach(s => {
+      const row = document.createElement('div');
+      row.className = 't-row';
+      const key = document.createElement('span'); key.className = 't-key'; key.style.background = s.color;
+      const val = document.createElement('span'); val.className = 't-val'; val.textContent = s.val.toFixed(1) + ' \u00b5s';
+      const name = document.createElement('span'); name.className = 't-name'; name.textContent = s.name;
+      row.appendChild(key); row.appendChild(val); row.appendChild(name);
+      tooltip.appendChild(row);
+    });
+
+    const svgPxPerViewBoxUnit = svgRect.width / W;
+    tooltip.style.display = 'block';
+    let left = x * svgPxPerViewBoxUnit + 12;
+    if (left + 200 > svgRect.width) left = x * svgPxPerViewBoxUnit - 200;
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = '4px';
+  }
+  function hideTooltip() {
+    tooltip.style.display = 'none';
+    crosshair.style.display = 'none';
+    dotBare.style.display = 'none';
+    dotCur.style.display = 'none';
+    dotRefit.style.display = 'none';
+  }
+  hitRect.addEventListener('pointermove', e => showAt(e.clientX, svg.getBoundingClientRect()));
+  hitRect.addEventListener('pointerleave', hideTooltip);
+})();
+</script>
