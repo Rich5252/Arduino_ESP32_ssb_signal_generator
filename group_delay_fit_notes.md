@@ -928,3 +928,594 @@ look.
 step is a `w` chirp/TFA sweep with `a` ON to check the amplitude channel
 against the predicted net-correction table above, then real two-tone/mic
 IMD testing — same validation sequence gdeq went through.
+
+## 2026-09-03, later same day: `a` validated on real hardware — magnitude tracks prediction, but it reintroduces real group-delay dispersion
+
+Source: `ga_Trial1_TF.txt`, a real TFA sweep with both `g` and `a` on
+(amplitude+phase, same instrument/convention as `TF meas.txt`). First
+real-hardware two-tone/mic IMD feedback on `a` came in alongside it: a
+genuine positive effect — it balances the upper/lower sideband IMD levels
+and brings the LF-region higher-order IMDs down to match the HF-region
+ones. `eq` (`e`, the pre-Hilbert HPF+presence chain) still has the
+biggest overall positive effect on IMD, separately discussed below.
+
+**Magnitude side: tracks the predicted net-correction table well.**
+Referenced to its own 100–300Hz passband average, same method as the
+insertion-loss measurement:
+
+| Frequency | Predicted net (design table above) | Measured net (this sweep) |
+|---|---|---|
+| 500Hz | -0.27dB | -0.41dB |
+| 700Hz | -0.42dB | -0.54dB |
+| 1700Hz | -0.60dB | -0.54dB |
+| 1900Hz | -0.47dB | -0.85dB |
+| 3100Hz | -0.11dB | +0.12dB |
+| 4300Hz | -3.06dB | -2.43dB |
+| 8000Hz | -15.70dB | -16.03dB |
+
+Agreement is within a few tenths of a dB at every point except 1900Hz
+(0.38dB off) — well within normal real-hardware measurement variation,
+nothing here suggests the shelf isn't doing what it was designed to do.
+
+**Group-delay side: a real, quantified side effect, not just the
+theoretical caveat `envelope_ampeq.h` flagged.** Compared against the
+earlier `g`-only validation sweep (100–8000Hz, same 181-point
+Savitzky–Golay convention as every other group-delay figure in this
+document):
+
+| | `g` only (measured, earlier validation) | `g`+`a` (measured, this sweep) |
+|---|---|---|
+| p-p dispersion | 19.4µs | **81.7µs (~4×)** |
+| mean absolute group delay | 198.6µs | 197.2µs (essentially unchanged) |
+
+The shelf's own group delay, computed directly from its RBJ coefficients
+(fc=2500Hz, +6dB, S=1, no measurement involved): swings from about
+-37µs just below its 2500Hz corner to +20µs above it (p-p ≈65µs, i.e.
+almost the entire size of the measured increase) while averaging only
+≈0.4µs across the band (i.e. almost the entire reason the absolute mean
+barely moved). Adding this theoretical shelf-alone curve to the `g`-only
+measured curve (simple LTI superposition) reproduces the measured `g`+`a`
+curve's shape to within ~7µs RMS — not as tight as gdeq's own ~2µs
+RMS fit-to-measurement match (expected: this combines two separately-
+smoothed noisy real sweeps rather than smoothing one already-combined
+measurement), but more than enough to confirm the mechanism: **the shelf
+is not phase-transparent, and gdeq's fit has no way to know about it**
+(gdeq was fit purely against the analog filter's own phase response,
+before ampeq existed). Chart: `gdeq_ampeq_delay_chart_v4.html`.
+
+**Not a contradiction of the magnitude result or the user's IMD report**
+— both stand as measured. It's a second, independent effect worth
+tracking: right now the shelf's amplitude-symmetry benefit is winning on
+the bench, but if `a`'s gain is ever pushed higher (getting closer to the
+full ~22dB inverse this was deliberately capped short of), the shelf's
+own delay swing will grow too — it scales with how much correction the
+shelf is asked to make, the same way its magnitude effect does. Worth
+re-running the IMD delay-sweep (the one that found ~4 samples optimal for
+`g` alone) with `a` also on, since its own group-delay contribution could
+shift where that optimum sits.
+
+## 2026-09-03, later same day: is `eq`'s IMD benefit the HPF or the presence boost?
+
+User's real-hardware report: `eq` (`e`) still has the single biggest
+positive effect on IMD of everything tried so far — cleans up
+inter-modulation tones broadly, not just the sideband-symmetry effect
+`a` produces. Asked whether this is specifically the 300Hz highpass
+stage's influence.
+
+**Can't be isolated with the current code — `eq_enable` gates both
+stages as one unit.** `ssb_dsp.c`'s `ssb_dsp_process_sample()` runs
+`biquad_process(&h->eq_hpf, ...)` then `biquad_process(&h->eq_presence,
+...)` back to back, both inside the single `if (handle->eq_enable)`
+block — there's no way to toggle the 300Hz HPF and the 2200Hz/+4dB
+presence peak independently via serial command today.
+
+**Working hypothesis, not yet confirmed: more likely the HPF.** This
+project has already established (`null_bias_investigation.md`,
+2026-08-31) that `wrap_pi()`'s resolution of the two-tone envelope's
+phase behavior right at destructive-interference nulls carries a real,
+measurable bias — and that investigation's own reproduction workflow
+explicitly calls for `e` (and `c`) to be off before taking a clean
+`null_bias`/`null_bias2` reading, i.e. this project already treats `eq`
+as a confound for null-crossing phase behavior, not just a tone-coloring
+effect. A 300Hz 2nd-order highpass removes near-DC content (mic/ADC
+offset, sub-audio drift, mains hum) from the audio *before* the Hilbert
+transform — exactly the kind of content that would show up as an
+envelope-baseline/near-null error once split into envelope+phase, and
+that's a plausible mechanism for a broad, general IMD cleanup rather than
+just a narrowband tone-coloring effect. The 2200Hz/+4dB presence peak, by
+contrast, has no obvious general IMD mechanism at the two-tone
+frequencies in use (500–1900Hz) — it's there for perceived voice
+intelligibility, not distortion.
+
+This is a hypothesis worth testing directly, not a conclusion — the
+cleanest way is to split `eq_enable` into two independently-toggleable
+flags (HPF-only, presence-only) so both can be A/B'd on the bench the
+same way `g`/`a` are. Not yet done — parked here pending the user's
+go-ahead, see the accompanying conversation.
+
+## 2026-09-03, later same day: why `eq` can't just be added to the `w` chirp/TFA test loop the way `g`/`a` were
+
+User asked whether `eq` could be added into the `w` sine-chirp/TFA test
+loop the same way `g` and `a` were. Structurally it can't be done the
+same trivial way, for an architectural reason worth recording:
+
+`g` (`envelope_gdeq_process()`) and `a` (`envelope_ampeq_process()`) both
+operate *downstream*, on an already-extracted envelope AMPLITUDE value —
+that's exactly the domain `test_signals_generate_chirp()` synthesizes
+directly, so calling them in the `AUDIO_SRC_CHIRP` fast-path (which
+completely bypasses `ssb_dsp_process_sample()` — see
+`ssb_mic_test.ino`'s own comment on this) was a same-domain, one-line
+addition each time.
+
+`eq` (`ssb_dsp_set_eq_enabled()`, the HPF+presence chain) operates
+*upstream* — on the raw single-channel AUDIO sample, *before* the
+Hilbert transform that splits it into envelope and phase in the first
+place. It lives entirely inside `ssb_dsp_process_sample()`, which the
+chirp fast-path bypasses by design. There is no "envelope value" for
+`eq` to run on at the point the chirp injects its sweep — `eq`'s effect
+is on the audio signal that DETERMINES both the envelope and the phase
+channels together, not a post-processing step on either one alone.
+
+Characterizing `eq` with a TFA-style sweep the way `g`/`a` were
+characterized would need a genuinely different test mode: a swept sine
+fed in as the raw AUDIO sample (i.e. through `ssb_dsp_process_sample()`
+itself, `eq` on vs. off), with the resulting `envelope` AND `freq_dev_hz`
+outputs captured as the TFA's two channels — a legitimately new test
+signal generator (`test_signals.h` pattern), not a one-line addition to
+the existing envelope-domain chirp. This would actually be a more
+complete tool than the current chirp, since it would show `eq`'s
+combined effect on both the envelope and phase paths together (which is
+exactly the domain a real two-tone/mic signal lives in) rather than
+either path in isolation. Not yet built — parked here as a scoped,
+concrete next step pending the user's go-ahead, see the accompanying
+conversation.
+
+## 2026-09-03, later same day: what is `eq` actually doing to the 700/1900Hz two-tone signal?
+
+Follow-up to the HPF-vs-presence question above — computed the two
+stages' actual RBJ response (exact coefficients from `biquad_set_highpass`/
+`biquad_set_peaking` in `ssb_dsp.c`) at the default two-tone pair
+(`TWOTONE_F1_HZ`/`TWOTONE_F2_HZ`, 700/1900Hz, `config.h`) and at the
+65-tap Hilbert FIR's (`HILBERT_TAPS`, `generate_hilbert_coeffs()`) own
+frequency response, to see what's mechanistically available to explain
+the reported IMD benefit.
+
+**Ruled out: tone-level balancing.** At 700Hz/1900Hz the 300Hz HPF
+removes essentially nothing (-0.14dB / -0.00dB) — it's not shaping the
+wanted tones at all. The 2200Hz presence peak, if anything, works
+*against* balance: +0.40dB at 700Hz vs. **+3.60dB at 1900Hz** — a real
+asymmetric boost of the higher tone, the opposite of what a "levels the
+tones" explanation would need.
+
+**Found: the HPF imposes a real, frequency-dependent phase-delay
+difference between the two tones, even where it barely touches their
+amplitude.** Phase-delay (each pure tone's own time-shift through the
+filter, `-phase(f)/(2πf)` — not the same "group delay" this document uses
+elsewhere for envelope dispersion, so naming it distinctly here to avoid
+confusion) at 700Hz is **-144µs**, at 1900Hz only **-18µs** — a
+**~126µs differential shift between f1 and f2**, imposed on the raw
+audio sample *before* it ever reaches the Hilbert transform. That's the
+same order of magnitude as the delay `g` itself was built to compensate
+for downstream, just happening upstream instead. Shifting the relative
+timing between the two input tones changes the exact shape of the
+resulting envelope/phase trajectory the whole downstream chain
+(quantization, PWM, the analog reconstruction filter) has to reproduce —
+a concrete, testable candidate mechanism, and one that applies even to
+the firmware's own purely-synthetic `'t'`/`'T'` two-tone generator
+(`test_signals.cpp` — no real audio front end involved there at all).
+
+**Still relevant if the two-tone signal is ever fed through the real mic
+front end instead of the synthetic generator:** the Hilbert FIR's own
+frequency response, computed directly from its 65 taps, is flat to
+better than 0.1dB from ~500Hz up to Nyquist, but is NOT flat below that —
+already -0.72dB at 300Hz, -2.68dB at 200Hz, -7.65dB at 100Hz, and
+mathematically forced to exactly zero at DC (the antisymmetric
+windowed-sinc construction always nulls there). Any real-world content
+down there — mic/ADC DC offset, mains hum, thermal drift — would get an
+inaccurate quadrature component once Hilbert-transformed, and since
+envelope and phase are both derived from that same analytic signal, the
+error leaks into both channels at once — a broadband effect, not tied to
+one IMD product, matching a "cleans up IMDs generally" description. This
+mechanism has nothing to act on for the *synthetic* two-tone signal
+specifically (it's two clean sinusoids, no sub-300Hz content to strip),
+so it only applies if the two-tone test in question actually runs through
+the ADC/mic path.
+
+**Which mechanism is live depends on which test path was used** — parked
+both here since it isn't yet known which (or both) explain the reported
+result; see the accompanying conversation. Splitting `eq_enable` into two
+independently-toggleable flags (proposed above) remains the clean way to
+settle this on the bench rather than reasoning about it further from
+coefficients alone.
+
+## 2026-09-03, later same day: confirmed synthetic-only — and a stronger candidate mechanism found
+
+User confirmed all `eq` A/B testing to date uses only the firmware's
+synthetic `'t'` two-tone generator, never the mic/ADC path. **This
+cleanly rules out the Hilbert-FIR-low-frequency-conditioning mechanism
+above** — a mathematically pure two-tone sum has no DC offset, hum, or
+drift for the HPF to strip, so there's nothing for that mechanism to act
+on here. That leaves the differential phase-delay finding, plus a third,
+considerably stronger candidate found while re-checking the combined
+(HPF+presence, cascaded, matching the actual code order) response rather
+than each stage in isolation:
+
+**The presence peak's asymmetric boost keeps the two-tone envelope from
+ever reaching a true zero null.** For two tones of amplitude A1, A2, the
+envelope's minimum is exactly `|A1-A2|` and its maximum is `A1+A2` —
+textbook two-tone algebra. With `eq` off, `TWOTONE_AMPLITUDE` (0.45,
+`config.h`) is applied equally to both tones, so A1=A2 and the envelope
+hits a **literal, exact zero** at every destructive-interference null —
+the single hardest condition this whole project has spent significant
+effort characterizing (the predistort LUT's steepest, most sparsely-
+characterized region sits at 36–55% duty specifically because of this;
+`null_bias_investigation.md`'s whole subject is a discrete artifact at
+exactly this condition; the `'x'`/`'z'` envelope-floor feature exists
+specifically to avoid driving the envelope this low).
+
+With `eq` on, the combined HPF+presence response (computed at the exact
+coefficients, cascaded in the real code order) is +0.26dB/-176µs
+phase-delay at 700Hz and **+3.60dB**/-30µs phase-delay at 1900Hz — almost
+all of that dB difference comes from the presence peak (the HPF's own
+amplitude effect at both tones is under 0.15dB, negligible). That's a net
+**+3.34dB (~1.47×) amplitude mismatch between the two tones**. Redone
+through the actual `TWOTONE_AMPLITUDE=0.45` numbers: A1→0.4636,
+A2→0.6809 — envelope minimum rises from an exact 0 to **0.217**, i.e.
+**-14.4dB relative to the new peak (1.145)**. In other words: `eq`, as
+currently wired, is *inadvertently* doing something close to what the
+dedicated `'x'`/floor feature does deliberately — keeping the envelope
+out of its worst, most-nonlinear region — except it does it as an
+unplanned side effect of the presence peak's asymmetric gain, tied to the
+specific two-tone pair in use, rather than as a controlled, symmetric,
+tunable floor.
+
+**This also reframes the earlier HPF-vs-presence guess — the opposite
+way round.** Correcting the working hypothesis from two entries above (that
+guessed the HPF was more likely responsible, reasoning from the
+null-crossing bias investigation's own test protocol): with the synthetic
+generator confirmed as the only signal path in use, the presence peak
+looks like the more likely dominant contributor via this null-floor
+mechanism, not the HPF. The HPF's own contribution is real but smaller —
+the ~126µs (HPF-alone) to ~146µs (combined) differential phase-delay
+between the two tones remains a genuine, separate effect, just evidently
+a second-order one next to a >14dB null-floor change.
+
+**Falsifiable prediction for the split-toggle test (still the right next
+step):** presence-only should reproduce most of `eq`'s current IMD
+benefit; HPF-only should show much less. If that holds, it also predicts
+that dialing in the existing `'x'` envelope-floor control (with `eq` off
+entirely) might reproduce a similar benefit in a cleaner, independently-
+tunable way — worth trying directly on the bench, no code changes needed
+for that particular check.
+
+## 2026-09-03, later same day: `'x'` makes IMDs worse — resolved, and confirms amplitude (not tone timing) is the mechanism
+
+User tried the `'x'` floor prediction above directly: **it makes IMDs
+worse in every case tried, not better.** Separately, and unprompted, the
+user reports scoping the envelope signal directly: `eq` off shows real
+zeros at the nulls with bad IMDs (particularly the low-order inter-IMD
+tones already flagged before, around 200/400Hz); `eq` on shows a visibly
+higher envelope floor and cleaner IMDs — an independent, direct
+hardware confirmation of the envelope-floor-height finding above, not
+just a math prediction anymore. Question asked: is the benefit from the
+tones' relative *phase* (the ~126–146µs timing-shift finding) or just
+their relative *amplitude*?
+
+**Answer: amplitude — and the reasoning explains why `'x'` backfires.**
+Modeled the analytic signal directly (`A1*e^{jw1t} + A2*e^{jw2t}`,
+exact for a sum of two positive-frequency tones) and computed the
+per-sample instantaneous frequency (`freq_dev`) through one full
+700/1900Hz beat cycle at 16kHz, for both conditions:
+
+- **`eq` off (equal amplitude, A1=A2=0.45):** the sample landing nearest
+  the null shows `freq_dev` **flip sign** right there — +1300Hz on the
+  samples either side, -6700Hz on the one nearest the null. That's not
+  just a big number, it's a genuine derivative discontinuity: the
+  complex trajectory is passing essentially through the origin, and the
+  phase has nowhere to go but reverse direction abruptly. (The exact
+  peak value is sample-grid-dependent — how close a given sample lands
+  to the true continuous-time null, which is a genuine, unbounded
+  singularity in continuous time — which is very likely why the earlier
+  delay-sweep found some delay values "null out higher freq better" than
+  others with real spread: the delay setting shifts exactly which sample
+  lands closest to the true null.)
+- **`eq` on (mismatched amplitude, A1=0.4636, A2=0.6809 from the
+  computed ampl. response above):** `freq_dev` through the same region
+  rises and falls smoothly — 1744→2435→4071→2953→1882→1587→1483Hz — no
+  sign flip, no discontinuity, bounded.
+
+The reason is geometric, not about timing: the envelope minimum is
+exactly `|A1-A2|`, which depends only on the two amplitudes — a pure
+relative-*phase*/timing shift between the tones (what the HPF alone
+contributes) only moves *when* the null occurs, never *whether* the
+complex trajectory actually reaches the origin. Only an amplitude
+mismatch keeps the trajectory bounded away from the origin, which is
+what keeps `freq_dev`'s derivative bounded and sign-consistent. So the
+answer to "phase or amplitude" is **amplitude** — the ~126–146µs timing
+shift from the HPF is real but doesn't touch null *depth*, only its
+timing, and null depth is what the phase-derivative singularity actually
+depends on.
+
+**This also fully explains why `'x'` fails.** `envelope_floor_apply()`
+runs on the envelope value only, after it's already been computed — it
+never touches `freq_dev_hz` (confirmed both by re-reading
+`envelope_floor.h`'s own doc comment and by the REVISION-1 postmortem
+in the "Envelope-null floor" section of `ssb_mic_test_commands.md`,
+which describes exactly why freezing `freq_dev_hz` too was tried and
+reverted). So with `'x'` engaged and `eq` off, the *actual* input tones
+are still exactly equal amplitude — the true analytic-signal trajectory
+still passes through the origin, `freq_dev` still takes that same
+violent, sign-flipping excursion right at the null — but now the
+envelope value being reconstructed at that exact instant has been
+artificially forced UP by the floor remap. That means the violent phase
+transient now rides on a higher-amplitude carrier instead of a
+naturally near-zero one — normally, a deep null's low RF amplitude
+somewhat masks how much that transient's spectral spread actually
+contributes to the output; `'x'` removes that masking without touching
+the transient itself, which is a plausible, mechanistically clean reason
+it measures worse rather than better. `eq`'s mismatch, by contrast, fixes
+the actual root cause upstream (the trajectory never approaches the
+origin in the first place), so there's no transient left to mask.
+
+**Net conclusion:** the improvement `eq` provides is real, amplitude-
+driven, and now confirmed on the bench (envelope floor height) as well
+as by the math. The HPF's own ~126–146µs tone-timing shift is a real,
+separate, and much smaller effect that doesn't touch null depth at all.
+The split-toggle test (HPF-only vs. presence-only) is still the cleanest
+way to confirm the relative sizes on the bench, but is no longer needed
+to answer the phase-vs-amplitude question itself — that one's settled.
+
+## 2026-09-03, later same day: this is a known, named problem in the EER/polar-transmitter literature — research summary
+
+User asked whether this null/phase-flip issue is something the field has
+already tackled, and specifically whether noise injection/dithering
+could help. Had this researched properly (web search, not recalled from
+memory) rather than guessed at. Findings, each with a real source:
+
+- **This is THE well-known Achilles-heel of Kahn-technique/EER/polar
+  transmitters**, not a quirk specific to this project's architecture.
+  Traces back to L. Kahn's original 1952 EER paper (*Proc. IRE*), is
+  covered in the standard survey series (Raab, Asbeck, Cripps, et al.,
+  "RF and Microwave Power Amplifier and Transmitter Technologies," Parts
+  1–5, *High Frequency Electronics*, 2003–2004), and is precisely
+  characterized in **J. Zhuang, K. Waheed, R. B. Staszewski, "A
+  Technique to Reduce Phase/Frequency Modulation Bandwidth in a Polar RF
+  Transmitter," IEEE Trans. Circuits and Systems I, vol. 57, no. 8, Sept.
+  2010, pp. 2196–2207** — which states the phase/magnitude split causes
+  bandwidth expansion of "~10× the original signal bandwidth, or
+  theoretically infinite... when the signal trajectory passes through or
+  near the constellation origin." That "theoretically infinite" framing
+  matches this session's own finding almost exactly (the discrete
+  `freq_dev` sign-flip at the null sample).
+- **The established fix matches what `eq` stumbled into, generalized
+  correctly**: Zhuang et al. propose "altering the signal trajectory
+  such that it avoids crossing (and proximity of) the constellation
+  origin," done in the Cartesian (I/Q) domain **before** the
+  envelope/phase split — at a small accepted EVM/ACLR cost. This
+  independently validates the direction found this session by
+  first-principles reasoning (the fix has to happen on the complex
+  signal upstream of the split, not as a post-hoc scalar remap of the
+  extracted envelope — exactly why `'x'` failed and `eq`'s upstream
+  tone-amplitude mismatch worked). Important nuance: naive radial
+  magnitude clamping (push `|z|` up, preserve its angle unchanged) does
+  **not** by itself fix anything — `angle(k·z) = angle(z)` for any real
+  `k>0`, so scaling magnitude alone leaves the angle/`freq_dev` trajectory
+  completely untouched. Whatever "alter the trajectory" means in
+  practice, it has to change the angle sequence too, not just rescale
+  radius — `'x'` is a clean real-world demonstration of exactly this
+  distinction going wrong.
+- **Commercial precedent for envelope floor limiting**: US Patent
+  7,412,213, "Envelope Limiting for Polar Modulators" (Sequoia
+  Communications, filed 2006) describes low-side envelope floor limiting
+  specifically to prevent envelope collapse at nulls. Flagging a caveat
+  though, not a contradiction: this project's own `'x'` is exactly this
+  idea (envelope floor limiting) and it measured worse, not better —
+  strongly suggesting that if the patented technique works, it isn't
+  doing a naive post-hoc scalar remap of an already-extracted envelope
+  value the way `envelope_floor_apply()` does; it's likely applied
+  somewhere that also reshapes the phase trajectory. Patent claims not
+  independently verified in this pass.
+- **Phase-path bandwidth/slew-rate limiting is the other standard,
+  complementary technique class** (general EER practice — the phase
+  modulator's own finite bandwidth naturally does some of this in analog
+  Kahn implementations). This project already has a directly applicable
+  tool for it: the `freq_dev` slew-rate limiter (see that section of
+  `ssb_mic_test_commands.md`) — not yet specifically tested against this
+  null-crossing spike. Cheapest next experiment, no new code needed.
+- **Dithering/noise injection: NOT FOUND as an established or precedented
+  technique for this specific problem.** Targeted search (EER/polar +
+  dithering, phase-discriminator zero-crossing dithering, CORDIC
+  near-origin literature) turned up nothing proposing noise injection to
+  avoid this exact near-origin angle singularity. CORDIC literature
+  treats near-origin error as an accuracy/analysis topic, not something
+  dithered away. This doesn't mean it wouldn't work — the general
+  principle (statistically avoiding a rare deterministic worst-case
+  coincidence, at the cost of a small broadband noise floor, same logic
+  as ADC dither) is sound elsewhere in DSP — but it should be treated as
+  an untested idea worth a real bench measurement, not an established
+  fix being reused.
+- **Correction to an assumption made earlier this session**: had
+  speculated the exact-zero null might be mainly an artifact of the
+  deliberately worst-case, equal-amplitude two-tone IMD test rather than
+  a real operational concern. The Zhuang et al. paper demonstrates the
+  same bandwidth-expansion problem using a real WCDMA signal, not a
+  synthetic two-tone — no support found for the "mostly a torture-test
+  artifact" framing, so retracting it. Treat this as a genuine concern
+  worth solving properly, not just a two-tone benchmark curiosity.
+
+**Concrete next steps, roughly in cost order:** (1) test the existing
+`freq_dev` slew-rate limiter specifically against the null-crossing
+spike — already built, zero new code; (2) design a deliberate version of
+what `eq` does by accident — a small, controlled adjustment to the
+complex analytic signal (after the Hilbert transform, before
+magnitude/phase extraction) that keeps the trajectory off the origin
+independent of `presence_gain_db`/voice-EQ settings — not yet designed,
+needs real thought about what specifically to add/reshape given radial
+clamping alone is proven not to work; (3) if wanted, a real bench test of
+noise injection, going in with clear eyes that it's unprecedented for
+this exact problem, not a known fix being applied.
+
+## 2026-09-03, later same day: slew-rate limiter real-hardware result — and the code's own assumption behind `FREQ_DEV_SLEW_MAX_FINITE_HZ` was wrong
+
+Tested the "cheapest next experiment" from the list above. Real-hardware
+result: **tightening the slew limit below 8000Hz/sample makes 3rd-order
+IMD worse, even the smallest step down** — but loosening it ABOVE the
+firmware's current 8000Hz/sample ceiling, to 12000 and then 20000,
+gained 1-2dB in 3rd-order IMD with no other products getting worse (some
+improved too). This directly falsifies the assumption written into
+`ssb_dsp.c`'s own comment next to `FREQ_DEV_SLEW_MAX_FINITE_HZ`
+(currently 8000.0f): *"raw freq_dev itself never exceeds max_freq_dev_hz,
+~8000Hz, so a same-sign single-sample swing that large is already the
+largest possible."* That reasoning only covers a same-sign swing. It
+misses the actual worst case: a swing that crosses through/near zero at
+a null flips SIGN, and a sign-crossing swing between two large-magnitude
+opposite-sign values can be close to double a same-sign swing's size.
+
+Modeled this directly: simulated the analytic signal for the 700/1900Hz
+pair at 16kHz across many different sample-grid phase alignments (since
+which discrete sample lands nearest the true continuous-time null is
+alignment-dependent — the true continuous-time singularity is unbounded,
+but sampling quantizes how close any real sample can get to it, which is
+also very likely why the 2026-09-01 delay-sweep found some delay values
+"null out higher freq better" than others with real spread — the delay
+setting shifts exactly which sample lands closest):
+
+- **`eq` off (true null, equal amplitude):** worst-case single-sample
+  `|Δfreq_dev|` over many alignments ≈ **9640Hz** — comfortably explains
+  why 8000Hz/sample wasn't enough (still clipping the worst alignments
+  hard), why tightening further only clips progressively more of the
+  large-but-otherwise-legitimate excursions near a null (hence
+  monotonically worse), and why loosening to 12000 then 20000
+  progressively reduced how hard that worst-case event gets clipped.
+- **`eq` on (mismatched amplitude, no true null):** worst-case
+  single-sample `|Δfreq_dev|` over the same alignments ≈ only **1650Hz**
+  — again confirms `eq` and a sufficiently loose slew limiter are
+  addressing the *same* underlying problem from two different ends: `eq`
+  prevents the trajectory from ever approaching the danger zone; a loose
+  enough slew limiter just stops harshly clipping the rare event when the
+  trajectory does approach it (with `eq` off).
+
+**Practical firmware gap:** `FREQ_DEV_SLEW_MAX_FINITE_HZ = 8000.0f` is
+also the ceiling the interactive `'}'` key steps up to before snapping to
+fully unlimited — so the empirically useful 12000–20000+ range the user
+found **cannot currently be reached from the serial interface at all**,
+only by setting `freq_dev_slew_limit_hz` some other way (the setter
+itself, `ssb_dsp_set_freq_dev_slew_limit_hz()`, has no upper clamp, only
+the lower one at `FREQ_DEV_SLEW_MIN_HZ` — so this was already reachable
+without a recompile, just not via `'{'`/`'}'`). Worth raising
+`FREQ_DEV_SLEW_MAX_FINITE_HZ` well past 20000 (with real margin over the
+~9640Hz worst case found above — the 700/1900Hz pair specifically; a
+different two-tone spacing or sample rate would shift that number) so
+`'}'` can explore this range interactively, and correcting the stale
+comment. Not yet done — see the accompanying conversation for the
+proposed value and whether to also touch `FREQ_DEV_SLEW_STEP_HZ`/count
+for reasonable button-press granularity over the wider range.
+
+**Not yet done:** a finer sweep between 8000 and 24000+ (only 8000, 12000,
+20000 tried so far) to find the true optimum rather than just confirming
+the direction of improvement; also worth trying fully unlimited directly
+for comparison, since the trend so far (8k worse → 12k better → 20k
+better still) is monotonically improving toward looser, and it isn't yet
+known whether that keeps improving all the way to off or peaks somewhere
+finite.
+
+---
+
+## 2026-09-04 — extending `ampeq`'s magnitude correction toward 8000Hz: a second shelf stage, and its group-delay price
+
+**Request:** "I'd like to extend the gain comp higher in freq. What can we
+do there without breaking the group delay. I want to see if this would
+improve the higher IMDs further." — a direct follow-on from the 2026-09-03
+`ga_Trial1_TF.txt` work, which left the shelf-1-only design still -15.70dB
+net at 8000Hz (measured -21.70dB loss, shelf-1 only clawing back +6.00dB
+at its plateau).
+
+**Design.** Added a second RBJ high-shelf stage (`ENV_AMPEQ_SHELF2_FREQ_HZ
+= 6000.0f`, `ENV_AMPEQ_SHELF2_GAIN_DB = 10.0f`) cascaded after the existing
+shelf (`envelope_ampeq.h`/`.cpp`, both under the one `'a'` enable flag —
+no new key). Three candidates were compared against the measured
+insertion-loss table before picking this one:
+
+| shelf2 (fc, gain) | NET@500 | NET@1900 | NET@3100 | NET@4300 | NET@8000 |
+|---|---|---|---|---|---|
+| 5000Hz / +8dB  | -0.27 | -0.42 | +0.30 | -1.02 | -7.70 |
+| 5500Hz / +9dB  | -0.27 | -0.45 | +0.09 | -1.89 | -6.70 |
+| **6000Hz / +10dB** | **-0.27** | **-0.46** | **-0.02** | **-2.52** | **-5.70** |
+
+All three leave 500-1900Hz essentially untouched (shelf2 contributes
+<0.02dB there in every case — its corner is high enough not to disturb the
+already-good midband). 6000Hz/+10dB was picked because it clears the
+3100Hz IMD3-upper offset almost exactly (-0.02dB, vs. the others'
+overshoot/undershoot) while recovering the most at 8000Hz of the three.
+Full net table with both shelves stacked:
+
+| Freq | Measured loss alone | shelf1+shelf2 correction | NET (was, shelf1-only) |
+|---|---|---|---|
+| 500Hz  | -0.28dB  | +0.01dB  | -0.27dB (-0.27dB) |
+| 700Hz  | -0.45dB  | +0.03dB  | -0.42dB (-0.42dB) |
+| 1700Hz | -1.55dB  | +0.96dB  | -0.60dB (-0.60dB) |
+| 1900Hz | -1.85dB  | +1.39dB  | -0.46dB (-0.47dB) |
+| 3100Hz | -4.52dB  | +4.50dB  | -0.02dB (-0.11dB) |
+| 4300Hz | -8.75dB  | +6.23dB  | -2.52dB (-3.06dB) |
+| 8000Hz | -21.70dB | +16.00dB | -5.70dB (-15.70dB) |
+
+Poles for the new stage at (6000Hz, +10dB): magnitude 0.654 — comfortably
+stable, well inside the unit circle despite the corner sitting closer to
+Nyquist (8000Hz at this Fs) than shelf1's.
+
+**Group-delay cost — computed the same way as every gdeq fit in this
+project (analytic RBJ shelf phase, `-dphase/dw`, converted to µs), over
+50-7999Hz:**
+
+| Stage | p-p | mean | worst points |
+|---|---|---|---|
+| shelf1 alone (2500Hz/+6dB) | 64.9µs | 0.03µs | -41.6µs @ 1333Hz, +23.3µs @ 3586Hz |
+| shelf2 alone (6000Hz/+10dB) | 125.4µs | 0.01µs | -39.1µs @ 5029Hz, +86.3µs @ 7037Hz |
+| shelf1+shelf2 combined | 148.6µs | 0.04µs | (delays sum directly — both LTI) |
+
+At the two-tone/IMD-offset frequencies specifically (combined shelf1+shelf2
+delay only, not counting the analog filter or gdeq): 500Hz -42.7µs, 700Hz
+-45.6µs, 1700Hz -49.5µs, 1900Hz -43.2µs, 3100Hz +0.2µs, 4300Hz -12.4µs,
+8000Hz +70.5µs — roughly a 120µs swing across exactly the band this
+project has spent the most effort flattening (envelope_gdeq.h).
+
+**Why this can't be designed away.** This is the second time this session
+a shelf's own delay contribution has come up (`a`'s original single-shelf
+already reintroduced 19.4→81.7µs p-p dispersion when validated against
+`ga_Trial1_TF.txt`, see the 2026-09-03 entry above), and it generalizes: a
+causal, minimum-phase magnitude filter's gain and phase responses are
+locked together by a Hilbert-transform-type relationship — it's the same
+reason gdeq's own all-pass sections had to be built as UNITY-magnitude by
+construction to get delay correction with zero gain side-effect. There is
+no shelf *shape* that recovers more high-frequency gain without incurring
+more nearby phase/delay distortion — bigger gain and/or a corner closer to
+Nyquist (there is no headroom to push the corner further out; 8000Hz IS
+Nyquist at this Fs, so this stage is already about as close to the correction
+target as a shelf's own corner can usefully sit) means more delay cost,
+full stop. So "extend the correction without breaking group delay" cannot
+mean "find a magically phase-transparent shelf" — it means accepting this
+stage's delay contribution and then **refitting `envelope_gdeq.h`'s
+all-pass coefficients against the new combined (analog + shelf1 + shelf2)
+phase response** — the identical numerically-fit-against-real-data method
+already used twice in this project for smaller reasons (the BC337→
+PNP_BC327_ATTN filter swap; then the LTspice→real-hardware data swap, see
+`envelope_gdeq.h`'s history). **Not yet done.** gdeq's current coefficients
+(a1=0.026173, a2=0.236810) were fit against the analog filter ALONE,
+before shelf1 even existed, and are already known (2026-09-03 g+a trial)
+to let shelf1's dispersion straight through uncorrected — adding shelf2 on
+top without refitting will make the delay side worse, not better, even if
+it helps IMDs.
+
+**Recommended next step (not yet run):** flash this two-stage design,
+re-run the `'w'` chirp/TFA workflow to measure the REAL combined
+magnitude+phase response (don't trust the analytic prediction alone —
+shelf1's magnitude prediction tracked real hardware to a few tenths of a
+dB, but gdeq's own history shows real measurements occasionally diverge
+from prediction in ways worth catching before committing further), THEN
+decide whether the resulting two-tone IMD change is worth doing the gdeq
+refit to recover flat delay. Only after that refit would this be a fair
+like-for-like test of "does more high-frequency amplitude correction
+improve the higher IMDs" — right now, testing shelf1+shelf2 on two-tone
+IMD without refitting gdeq would conflate two effects (more amplitude
+correction vs. more delay dispersion) and wouldn't cleanly answer the
+question asked.

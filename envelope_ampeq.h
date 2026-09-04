@@ -4,8 +4,8 @@
  * envelope_ampeq.h
  *
  * ---- Envelope-path magnitude (insertion-loss) equalizer ----
- * A single high-shelf biquad (ssb_shelf_biquad_t, see ssb_dsp.h - NOT the
- * unrelated, differently-shaped ssb_biquad_t already defined in
+ * TWO cascaded high-shelf biquads (ssb_shelf_biquad_t, see ssb_dsp.h - NOT
+ * the unrelated, differently-shaped ssb_biquad_t already defined in
  * ssb_adc_filter.h; the two collided under the same name the first time
  * this was added and had to be renamed to fix a link error) on the
  * envelope path, partially compensating the analog reconstruction
@@ -14,12 +14,14 @@
  * independent and complementary: gdeq flattens the filter's group DELAY
  * (unity-magnitude all-pass, by construction cannot touch amplitude),
  * this flattens (partially) its GAIN roll-off (a real gain-shaping
- * filter, not all-pass - it doesn't touch delay in any way this project
- * currently corrects for, though a genuine biquad does have its own
- * small delay/phase contribution near its corner; not separately
- * accounted for here since the shelf's plateau is well below where gdeq
- * itself is doing its own work - see the "Interaction with gdeq" note
- * below).
+ * filter, not all-pass - it DOES touch delay, more so now that a second,
+ * higher-gain stage has been added - see the "Interaction with gdeq" note
+ * below, and the 2026-09-04 entry in the #if block further down, for why
+ * that's now a first-order consideration rather than a footnote).
+ * Originally a single stage (2026-09-03); a second stage was added
+ * 2026-09-04 specifically to extend the correction further toward
+ * 8000Hz (Nyquist at this Fs) - both stages share the one 'a' enable
+ * flag/toggle, there is no separate on/off for each.
  *
  * ---- Why this exists ----
  * 2026-09-03: real-hardware amplitude+phase TF measurement
@@ -82,13 +84,19 @@
  * they're cascaded in doesn't change the combined response - applied
  * here right after envelope_gdeq_process() purely for code locality
  * (the two RSET-filter compensators living next to each other), not
- * because the order matters. A high-shelf biquad does have its own small
+ * because the order matters. A high-shelf biquad does have its own
  * group-delay contribution (unlike gdeq's all-pass sections, its
  * magnitude ISN'T flat, so its phase/delay isn't the free, independent
- * quantity ssb_allpass1_t's is) - not yet characterized or folded into
- * gdeq's own fit. If the combined on-bench group delay ends up
- * measurably different from the gdeq-alone prediction once this is
- * enabled, that's the first place to look.
+ * quantity ssb_allpass1_t's is) - NOT folded into gdeq's own fit.
+ * Quantified 2026-09-03 for the single-shelf design (real hardware,
+ * `ga_Trial1_TF.txt`): enabling 'a' alone reintroduced measured dispersion
+ * from 19.4us to 81.7us peak-to-peak even though mean delay barely moved,
+ * because gdeq's coefficients were fit against the analog filter ALONE.
+ * The 2026-09-04 second shelf stage makes this larger still (see that
+ * entry in the #if block below for the numbers) - gdeq is now overdue for
+ * a refit against the combined analog+shelf1+shelf2 phase response, the
+ * same numerically-fit-against-real-data method already used twice for
+ * smaller reasons (see envelope_gdeq.h's history). NOT YET DONE.
  *
  * ---- Status ----
  * NOT YET VALIDATED ON REAL HARDWARE. Off by default, same convention as
@@ -129,30 +137,110 @@
   // discussed with the user rather than chasing the full ~22dB there.
   #define ENV_AMPEQ_SHELF_FREQ_HZ   2500.0f
   #define ENV_AMPEQ_SHELF_GAIN_DB   6.0f
+
+  // ---- 2026-09-04: second shelf stage, extending correction toward
+  // 8000Hz (= Nyquist at this Fs - there is no "further" past this) ----
+  // Requested by the user specifically to see whether closing more of the
+  // still-large 8000Hz gap (-15.70dB net, above) improves the higher-order
+  // IMD products further. Cascaded AFTER the shelf above (order doesn't
+  // matter, both LTI - see "Interaction with gdeq" below for why it DOES
+  // matter for the delay side). Chosen the same way as the first shelf -
+  // by inspection against the measured loss table, not by optimization -
+  // biased toward leaving the already-good 500-1900Hz region alone (its
+  // own corner is high enough that it contributes <0.02dB there) while
+  // doing the heavy lifting from ~3100Hz up:
+  //   500Hz    +0.00dB   ->  net  -0.27dB  (unchanged from shelf-1-only)
+  //   700Hz    +0.00dB   ->  net  -0.42dB  (unchanged)
+  //   1700Hz   +0.01dB   ->  net  -0.60dB  (unchanged)
+  //   1900Hz   +0.01dB   ->  net  -0.46dB  (unchanged)
+  //   3100Hz   +0.08dB   ->  net  -0.02dB  (was -0.11dB)
+  //   4300Hz   +0.54dB   ->  net  -2.52dB  (was -3.06dB)
+  //   8000Hz  +10.00dB   ->  net  -5.70dB  (was -15.70dB - the main target)
+  // Three candidates were compared before picking this one (5000Hz/+8dB,
+  // 5500Hz/+9dB, 6000Hz/+10dB) - all left 500-1900Hz equally untouched;
+  // 6000Hz/+10dB was chosen because it clears the 3100Hz IMD3-upper offset
+  // to within 0.02dB (the other two either overshoot slightly positive or
+  // undershoot) while giving the largest 8000Hz recovery of the three.
+  // Poles at (fc,gain)=(6000Hz,+10dB): 0.654 magnitude - comfortably
+  // stable, nowhere near the unit circle despite sitting closer to
+  // Nyquist than shelf 1.
+  //
+  // GROUP-DELAY COST - read before enabling on the bench: this stage's
+  // own analytic group delay (computed the same way as gdeq's fits, RBJ
+  // shelf phase, -dphase/dw) is LARGER than shelf 1's, not smaller, even
+  // though it's "just" a second biquad - a direct consequence of its
+  // larger gain (+10dB vs +6dB) and closer-to-Nyquist corner, not an
+  // implementation shortcoming:
+  //   shelf 1 alone:        64.9us peak-to-peak, ~0.03us mean, over
+  //                         50-7999Hz (extremes: -41.6us @ 1333Hz,
+  //                         +23.3us @ 3586Hz)
+  //   shelf 2 alone:       125.4us peak-to-peak, ~0.01us mean, over the
+  //                         same band (extremes: -39.1us @ 5029Hz,
+  //                         +86.3us @ 7037Hz)
+  //   shelf 1 + shelf 2:   148.6us peak-to-peak, ~0.04us mean (delays
+  //                         add directly - both stages' phases sum)
+  // At the two-tone/IMD-offset frequencies specifically (combined
+  // shelf 1 + shelf 2 delay, relative to their own flat asymptote - NOT
+  // relative to the analog filter or gdeq):
+  //   500Hz -42.7us   700Hz -45.6us   1700Hz -49.5us   1900Hz -43.2us
+  //   3100Hz  +0.2us   4300Hz -12.4us   8000Hz +70.5us
+  // That is a ~120us swing across exactly the band this project has spent
+  // the most effort flattening (see envelope_gdeq.h) - this is NOT
+  // avoidable by choosing a differently-shaped shelf. A causal,
+  // minimum-phase magnitude filter's gain and phase responses are locked
+  // together (same Hilbert-transform relationship that makes gdeq's
+  // filters unity-magnitude BY CONSTRUCTION the only way to get delay
+  // correction with zero gain side-effect) - more high-frequency gain
+  // recovered here necessarily means more nearby phase/delay distortion,
+  // for ANY shelf design, not just this one. So "extend the correction
+  // without breaking group delay" cannot mean "find a shelf shape with no
+  // delay cost" - it means accepting this stage's delay contribution and
+  // then REFITTING envelope_gdeq.h's all-pass coefficients against the
+  // new combined (analog + shelf 1 + shelf 2) phase response, the same
+  // way gdeq has already been refit twice before for smaller reasons (the
+  // BC337->PNP_BC327_ATTN filter swap, then the LTspice->real-hardware
+  // data swap) - see that file's history and group_delay_fit_notes.md's
+  // matching 2026-09-04 entry. NOT YET DONE - gdeq's current coefficients
+  // (a1=0.026173, a2=0.236810) were fit against the analog filter ALONE,
+  // before shelf 1 existed, and are already known (2026-09-03 g+a
+  // real-hardware trial) to let shelf 1's own dispersion back in
+  // uncorrected; adding shelf 2 on top without refitting will make that
+  // worse, not better, on the group-delay side even though it may help
+  // IMDs. Recommended sequence: enable this stage, re-run the 'w'
+  // chirp/TFA workflow to measure the REAL combined magnitude+phase
+  // response (don't trust this analytic prediction alone - shelf 1's
+  // prediction was accurate to a few tenths of a dB/matched shape, but
+  // gdeq's own history shows real hardware occasionally surprises), THEN
+  // decide whether the resulting IMD change on two-tone is worth a gdeq
+  // refit to recover flat delay.
+  #define ENV_AMPEQ_SHELF2_FREQ_HZ  6000.0f
+  #define ENV_AMPEQ_SHELF2_GAIN_DB  10.0f
 #else
   #error "ENV_AMPEQ_SHELF_FREQ_HZ/GAIN_DB have only been chosen for ENV_FILTER_PNP_BC327_ATTN at SAMPLE_RATE_HZ=16000 - see envelope_ampeq.h / group_delay_fit_notes.md for the real-hardware TF data needed to pick new values"
 #endif
 
-// Zeroes the shelf biquad's state and (re)applies the coefficients above.
+// Zeroes BOTH shelf biquads' state and (re)applies the coefficients above.
 // Call once from setup() - always, regardless of the enabled default, so
 // enabling later via 'a' only ever needs envelope_ampeq_set_enabled(),
 // not a separate init path (same convention as envelope_gdeq_init()).
 void envelope_ampeq_init(void);
 
-// If enabled, runs `envelope` through the high-shelf biquad and returns
-// the result; otherwise returns it unchanged. Call unconditionally from
-// dsp_task, once per tick, for every audio source (same rationale as
+// If enabled, runs `envelope` through BOTH high-shelf biquads in cascade
+// (shelf 1 then shelf 2 - order doesn't affect the result, both LTI) and
+// returns the result; otherwise returns it unchanged. Call unconditionally
+// from dsp_task, once per tick, for every audio source (same rationale as
 // envelope_gdeq_process() - see that file - including ENVSTEP/AMTEST so
 // those isolation tests exercise the real combined response).
 float IRAM_ATTR envelope_ampeq_process(float envelope);
 
 bool envelope_ampeq_get_enabled(void);
 
-// Sets the enabled flag. On an off->on transition, also resets the
-// biquad's state (avoids feeding stale x1/x2/y1/y2 from however long
-// it's been since this was last on, or since boot, into the first
-// sample after re-enabling - same reasoning as
-// envelope_gdeq_set_enabled()'s reset). A no-op transition does NOT
-// reset state, for the same reason gdeq's doesn't (continuous operation
-// across preset switches that both have this on).
+// Sets the enabled flag for BOTH shelf stages (there is no independent
+// per-stage toggle). On an off->on transition, also resets both biquads'
+// state (avoids feeding stale x1/x2/y1/y2 from however long it's been
+// since this was last on, or since boot, into the first sample after
+// re-enabling - same reasoning as envelope_gdeq_set_enabled()'s reset). A
+// no-op transition does NOT reset state, for the same reason gdeq's
+// doesn't (continuous operation across preset switches that both have
+// this on).
 void envelope_ampeq_set_enabled(bool enable);

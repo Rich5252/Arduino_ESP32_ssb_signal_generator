@@ -268,16 +268,22 @@ void handle_serial_commands(void)
                                    "theoretical starting point ~+2.65 samples (see envelope_gdeq.h)" : "");
         } else if (c == 'a') {
             // Mirrors the 'g' handler above exactly - see envelope_ampeq.h.
-            // NOT YET VALIDATED on real hardware as of 2026-09-03; off by
-            // default. Re-run the 'w' chirp/TFA workflow (amplitude
-            // channel) to check the actual on-bench correction before
-            // trusting this on two-tone/mic IMD testing.
+            // Single-shelf design NOT YET VALIDATED on real hardware as of
+            // 2026-09-03 (magnitude side confirmed close to prediction on
+            // the g+a trial; group-delay side reintroduced real dispersion
+            // because gdeq hasn't been refit against it). A second shelf
+            // stage was added 2026-09-04, extending correction further
+            // toward 8000Hz at the cost of MORE group-delay dispersion,
+            // not yet measured on real hardware at all - see
+            // envelope_ampeq.h's 2026-09-04 entry before trusting IMD
+            // results with this on. Off by default.
             bool now_on = !envelope_ampeq_get_enabled();
             envelope_ampeq_set_enabled(now_on);   // internally resets state on an off->on transition
             serial_reply("-> envelope magnitude (insertion-loss) equalizer %s%s\r\n", now_on ? "ON" : "off",
-                          now_on ? " - modest high-shelf correction, NOT yet validated on real "
-                                   "hardware - re-run 'w' chirp/TFA (amplitude channel) to check "
-                                   "the actual on-bench correction (see envelope_ampeq.h)" : "");
+                          now_on ? " - two-stage high-shelf correction (now extended toward 8000Hz), "
+                                   "NOT yet validated on real hardware in this form - re-run 'w' "
+                                   "chirp/TFA (amplitude AND phase channels) to check the actual "
+                                   "on-bench correction and delay cost (see envelope_ampeq.h)" : "");
         } else if (c == 'D') {
             bool now_on = !envelope_predistort_get_enabled();
             envelope_predistort_set_enabled(now_on);
@@ -633,7 +639,7 @@ void handle_serial_commands(void)
 
             // Same reset-on-enable reasoning as the 'g'/'a' handlers -
             // shared via envelope_ampeq_set_enabled() itself, so an
-            // off->on transition on preset load resets the shelf's state
+            // off->on transition on preset load resets both shelves' state
             // cleanly too, not just when toggled live.
             envelope_ampeq_set_enabled(p.env_ampeq_enable);
 
