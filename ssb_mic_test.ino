@@ -821,10 +821,17 @@ void setup()
                   (envelope_output_get_pwm_offset() + envelope_output_get_pwm_scale() > 1.0f
                        ? 1.0f : envelope_output_get_pwm_offset() + envelope_output_get_pwm_scale()) * 100.0f,
                   envelope_output_get_pwm_offset(), envelope_output_get_pwm_scale(), ENV_PWM_STEP * 100.0f);
-    Serial.printf("Send 'g' to toggle the envelope group-delay equalizer (currently %s) - "
-                  "fitted against the original Sallen-Key filter's real LTspice response, "
-                  "not yet validated on hardware; re-tune '['/']' from scratch after enabling.\r\n",
-                  envelope_gdeq_get_enabled() ? "ON" : "off");
+    Serial.printf("Send 'g' to toggle the envelope group-delay equalizer (currently %s, %s coefficients) - "
+                  "real-hardware validated for group delay; re-tune '['/']' from scratch after enabling.\r\n",
+                  envelope_gdeq_get_enabled() ? "ON" : "off",
+                  envelope_gdeq_get_use_aa_candidate() ? "a+A candidate" : "default");
+#if ENV_GDEQ_HAS_AA_CANDIDATE
+    Serial.printf("Send 'G' to switch gdeq coefficients (currently %s) between the default pair and the "
+                  "'a'+'A'-specific candidate - 2026-09-05: candidate gives better close-in two-tone IMD "
+                  "but a much larger far-out intermodulation forest (see envelope_gdeq.h), a mixed result, "
+                  "not currently recommended for routine use. Re-tune '['/']' after switching.\r\n",
+                  envelope_gdeq_get_use_aa_candidate() ? "a+A candidate" : "default");
+#endif
     Serial.printf("Send 'D' to toggle envelope pre-distortion (currently %s) - measured-curve lookup "
                   "table that REPLACES the 'u'/'j'/'i'/'k' linear offset/scale mapping while on, "
                   "not yet validated beyond the measurement itself.\r\n",

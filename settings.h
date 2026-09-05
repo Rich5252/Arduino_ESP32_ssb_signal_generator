@@ -152,6 +152,21 @@ typedef struct
     // a gdeq refit - see group_delay_fit_notes.md's 2026-09-04 entries).
     bool env_ampeq_shelf2_enable;  // 'A' - envelope_ampeq.h, off by default
 
+    // Added 2026-09-05 when the 'a'+'A'-specific gdeq candidate
+    // (envelope_gdeq.h) became a live runtime toggle instead of a
+    // compile-time-only flag - real-hardware testing that same day found
+    // it a genuinely mixed result (better close-in two-tone IMD, worse
+    // far-out intermodulation forest - see envelope_gdeq.h's 2026-09-05
+    // header entry and group_delay_fit_notes.md), so it stays off by
+    // default here too, same convention as every trailing field above.
+    // Appended at the END - existing presets' positional initializers
+    // zero-fill this to false (default gdeq coefficients). Only takes
+    // effect on ENV_FILTER_PNP_BC327_ATTN @ SAMPLE_RATE_HZ=16000
+    // (envelope_gdeq_set_use_aa_candidate() ignores it otherwise, so a
+    // preset pasted from a different filter/Fs build won't silently apply
+    // a coefficient pair that was never fit for the active build).
+    bool env_gdeq_use_aa_candidate;  // 'G' - envelope_gdeq.h, off by default
+
 } PersistentSettings;
 
 

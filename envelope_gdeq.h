@@ -237,18 +237,61 @@
  * entry for the full trade-off table and `gdeq_refit_a_A_candidate_v7.html`
  * for the chart.
  *
- * Selected via `ENV_GDEQ_USE_AA_CANDIDATE` in the `#if` block below - 0
- * (default) keeps the coefficients above active; flip to 1 only when
- * bench-testing with `'a'` AND `'A'` both on. **NOT YET VALIDATED ON REAL
- * HARDWARE for the a+A case specifically** - this is a candidate derived
- * from a reconstructed curve, not a fresh direct `'g'` OFF + `'a'`+`'A'`
- * ON sweep (the self-consistency check is strong, but every other fit in
- * this file was confirmed against a fresh direct measurement before being
- * trusted - recommended here too before drawing firm conclusions). Mean
- * added delay for the candidate: ~124.4us (1.990 samples @ 16000Hz) -
- * close to the default's 125.4us/2.006 samples, so switching between the
- * two should need only a small `'['`/`']'` nudge, not a from-scratch
- * relative-delay search.
+ * ---- 2026-09-05: VALIDATED on real hardware (group delay), then found to
+ * be a genuinely mixed result once the full spectrum was checked - NOW
+ * RUNTIME-SELECTABLE via `'G'`, not just a compile-time flag ----
+ * `gaA_Trial3_Optimised_gd_TF.txt` (corrected re-run, flag confirmed
+ * active) measured 87.7us p-p / 195.7us mean, matching the 72.6us/197.1us
+ * prediction above closely (RMS 2.7us) - real, substantial confirmation
+ * of the group-delay claim. BUT a same-session two-tone spectrum
+ * comparison (`2gaA_spectra.txt` vs `3gaA_spectra.txt`, both at their own
+ * correctly-tuned `relative_delay`) then found a genuinely two-sided
+ * result: classic close-in two-tone IMD (3rd-11th order) is better with
+ * this candidate at every order checked, but a much larger forest of
+ * additional intermodulation lines appears roughly 4-16kHz from carrier,
+ * running 11-19dB HIGHER than the default coefficients produce in the same
+ * region - not an unrelated spur (falls on the GCD(700,1900)=100Hz grid,
+ * genuine intermodulation of the same two tones), and not a delay-
+ * misalignment artifact (both configs were at their own bench-optimal
+ * relative delay). A subsequent design-space search (same grid+polish
+ * method as every fit in this file, several smoothness-aware objectives,
+ * 2/3/4-section cascades) found NO better coefficient set exists in this
+ * filter architecture - the candidate below is already at the Pareto-
+ * optimal point for both p-p dispersion and local delay-curve smoothness
+ * simultaneously, so whatever's driving the far-out spur growth is outside
+ * plain group-delay theory (see group_delay_fit_notes.md's matching
+ * 2026-09-05 entries for the full derivation, the spectra chart, and the
+ * coefficient-search results). **Net: NOT currently recommended for
+ * adoption** - real group-delay and close-in-IMD wins, but a real far-out
+ * spectral cost too, and redesigning the filter itself doesn't fix it.
+ *
+ * Given that ambiguity - and this project's own repeated finding that no
+ * single scalar metric here (p-p dispersion, or classic low-order IMD) has
+ * reliably predicted overall real-world quality - this now answers its own
+ * "should this become runtime-selectable" question from the entry above:
+ * yes. `'G'` (envelope_gdeq_set_use_aa_candidate(), serial_commands.cpp)
+ * switches between the two coefficient sets live, without a reflash, on
+ * ENV_FILTER_PNP_BC327_ATTN @ 16000Hz only (`ENV_GDEQ_HAS_AA_CANDIDATE`
+ * below) - the only filter/Fs this candidate has ever been fit for.
+ * Switching calls `ssb_allpass1_init()` on both sections with the new
+ * coefficient (documented as cheap/task-context-safe, and it zeroes state
+ * the same way enabling `'g'` from off does - no stale x1/y1 glitch on the
+ * next sample). Persisted via a new trailing `PersistentSettings` field
+ * (`env_gdeq_use_aa_candidate`, off/false by default, same convention as
+ * `env_ampeq_shelf2_enable`). **Re-tune `'['`/`']'` after switching** -
+ * bench-confirmed 2026-09-05: 2 samples (default) vs. 2.83 samples
+ * (candidate) for minimum close-in IMD, NOT the ~124.4us/125.4us
+ * theoretical-mean-delay figures below, which turned out to under-predict
+ * the real shift by about 1 sample (see group_delay_fit_notes.md's
+ * `relative_delay` retuning entries for why - the relevant reading is
+ * local group delay AT the actual tone frequencies, not the mean over the
+ * whole 100-8000Hz band, which happened to look almost identical between
+ * the two sets while the local values at 500-2200Hz differ by 52-64us).
+ *
+ * Mean added delay for the candidate: ~124.4us (1.990 samples @ 16000Hz) -
+ * close to the default's 125.4us/2.006 samples in theory, but see the
+ * paragraph above for why the REAL retuned optimum differs by more than
+ * that difference alone would suggest.
  *
  * IMPORTANT SIDE EFFECT (both filters): an all-pass filter can only ADD
  * delay, never subtract it - flattening this curve pushes the envelope
@@ -294,54 +337,20 @@
 // AD9851 bit-order mistakes. Add a new #elif (and a matching fit, see
 // group_delay_fit_notes.md) rather than guessing if SAMPLE_RATE_HZ or the
 // analog filter ever changes again.
+// ENV_GDEQ_HAS_AA_CANDIDATE defaults to 0 - only the PNP_BC327_ATTN@16000Hz
+// branch below (the only filter/Fs this candidate has ever been fit for)
+// #defines it to 1. Checked by 'G' (serial_commands.cpp) to decide whether
+// the runtime toggle does anything on this build, rather than silently
+// switching to a coefficient pair that was never fit for the active
+// filter/Fs - same "don't silently run with the wrong pair" discipline as
+// the #error guards below.
+#define ENV_GDEQ_HAS_AA_CANDIDATE 0
+
 #if SAMPLE_RATE_HZ == 16000
   #if ENV_FILTER_VARIANT == ENV_FILTER_BC337
     #define ENV_GDEQ_A1  -0.023900f
     #define ENV_GDEQ_A2   0.447131f
   #elif ENV_FILTER_VARIANT == ENV_FILTER_PNP_BC327_ATTN
-    // ---- 2026-09-04: a SECOND fit exists now, specific to the 'a'+'A'
-    // ampeq case (both shelf1 AND shelf2 on) - see group_delay_fit_notes.md's
-    // matching entry for the full derivation, the reconstructed-curve
-    // method (no new hardware sweep was needed - the bare analog+shelf1+
-    // shelf2 phase was recovered from the existing ga_Trial2_TF.txt
-    // measurement by subtracting the CURRENT coefficients' exactly-known
-    // analytic phase, validated by self-consistency), and IMPORTANTLY the
-    // trade-off table showing the improvement is NOT uniform (fixes
-    // 8000Hz a lot, ADDS 24-66us of delay at 500-3100Hz - the two-tone's
-    // own fundamentals - relative to the values below). That candidate
-    // (a1=a2=-0.139115) is NOT the active default - it would make things
-    // WORSE for the 'g'-alone and 'g'+'a'-only cases the values below were
-    // actually fit for (this filter type only supports ONE fixed pair at
-    // compile time; see the open architectural question in
-    // group_delay_fit_notes.md about whether that should ever become
-    // runtime-selectable). Flip ENV_GDEQ_USE_AA_CANDIDATE to 1 below ONLY
-    // when specifically bench-testing with 'a' AND 'A' both on - flip it
-    // back to 0 (or just leave it, since testing sessions have been ending
-    // with a revert-and-record-more-data pattern all through this project)
-    // before trusting 'g'/'g'+'a' results again. NEITHER value below has
-    // been re-measured on real hardware for the a+A case specifically -
-    // this is a candidate to bench-test, not a confirmed result.
-    #define ENV_GDEQ_USE_AA_CANDIDATE 1
-
-    #if ENV_GDEQ_USE_AA_CANDIDATE
-      // Grid search + global (differential-evolution) search + Nelder-Mead
-      // refinement, same discipline as every fit in this file, against the
-      // reconstructed analog+shelf1+shelf2 bare curve (88.4us p-p, 71.1us
-      // mean over 100-8000Hz). 2/3/4-section searches all converged to
-      // essentially the same ~71-73us p-p floor (a real ceiling for this
-      // filter type on this curve shape - see group_delay_fit_notes.md for
-      // why: two interior extrema plus a steep near-Nyquist edge from
-      // shelf2's own delay signature), so 2 sections (same architecture as
-      // below) was kept rather than adding more for a diminishing-returns
-      // ~1-2us gain. Result: 157.5us -> 72.6us p-p (~2.2x) relative to
-      // what applying the OTHER (default) coefficients to this same bare
-      // curve would give - NOT a ~4x flattening like the original
-      // analog-alone fit below achieved, and NOT uniform - see the header
-      // comment above and group_delay_fit_notes.md's trade-off table
-      // before drawing IMD conclusions from just this p-p number.
-      #define ENV_GDEQ_A1  -0.139115f
-      #define ENV_GDEQ_A2  -0.139115f
-    #else
     // Refitted 2026-09-03 against REAL HARDWARE TFA data
     // (Group_delay_off__on_F_Phase.txt, Hi-Z-buffered measurement rig),
     // fit band widened to 100-8000Hz (was 100-4300Hz) - see the header
@@ -354,8 +363,13 @@
     // known (2026-09-03 g+a trial, then again 2026-09-04 with shelf2 too)
     // to NOT flatten well once ampeq's shelf(s) are on - these values were
     // fit against the bare analog filter ALONE, before either shelf
-    // existed - see the ENV_GDEQ_USE_AA_CANDIDATE block above for the
-    // shelf1+shelf2-specific alternative.
+    // existed - see ENV_GDEQ_A1_AA_CANDIDATE/ENV_GDEQ_A2_AA_CANDIDATE
+    // below for the shelf1+shelf2-specific alternative, and this file's
+    // "2026-09-05" header entry for why that alternative is now
+    // RUNTIME-selectable (`'G'`) rather than a separate compile-time
+    // build. THIS pair (below) is what's active at boot and whenever
+    // envelope_gdeq_set_use_aa_candidate(false) is in effect - i.e. the
+    // default, recommended state.
     #define ENV_GDEQ_A1   0.026173f
     #define ENV_GDEQ_A2   0.236810f
     // For reference/history (NOT active) - 2026-09-01 LTspice-only fit,
@@ -363,7 +377,29 @@
     // if evaluated past 4300Hz, which is exactly why this needed a real
     // re-fit rather than just widening the old coefficients' claimed
     // range - see header comment.
-    #endif
+
+    // ---- 'a'+'A'-specific candidate (2026-09-04 fit, 2026-09-05 mixed
+    // real-hardware result - see header comment above in full) ----
+    // Grid search + global (differential-evolution) search + Nelder-Mead
+    // refinement, same discipline as every fit in this file, against the
+    // reconstructed analog+shelf1+shelf2 bare curve (88.4us p-p, 71.1us
+    // mean over 100-8000Hz). 2/3/4-section searches all converged to
+    // essentially the same ~71-73us p-p floor (a real ceiling for this
+    // filter type on this curve shape - see group_delay_fit_notes.md for
+    // why: two interior extrema plus a steep near-Nyquist edge from
+    // shelf2's own delay signature), so 2 sections (same architecture as
+    // above) was kept rather than adding more for a diminishing-returns
+    // ~1-2us gain. Result: 157.5us -> 72.6us p-p (~2.2x) relative to what
+    // the default pair above gives on this same bare curve - NOT a ~4x
+    // flattening like the analog-alone fit above achieved, and NOT
+    // uniform - see the header comment and group_delay_fit_notes.md's
+    // trade-off table. Available at runtime via `'G'`
+    // (envelope_gdeq_set_use_aa_candidate()) ONLY for this filter/Fs -
+    // this is the only combination it's ever been fit for.
+    #define ENV_GDEQ_A1_AA_CANDIDATE  -0.139115f
+    #define ENV_GDEQ_A2_AA_CANDIDATE  -0.139115f
+    #undef  ENV_GDEQ_HAS_AA_CANDIDATE
+    #define ENV_GDEQ_HAS_AA_CANDIDATE 1
   #else
     #error "ENV_GDEQ_A1/A2 have only been fitted for ENV_FILTER_BC337 or ENV_FILTER_PNP_BC327_ATTN at SAMPLE_RATE_HZ=16000 - see group_delay_fit_notes.md for the fitting method to add another"
   #endif
@@ -376,6 +412,18 @@
   #endif
 #else
 #error "ENV_GDEQ_A1/A2 have only been fitted for SAMPLE_RATE_HZ = 10000 or 16000 - see group_delay_fit_notes.md for the fitting method to add another"
+#endif
+
+// Fallback definition so envelope_gdeq.cpp compiles unconditionally (it
+// references ENV_GDEQ_A1_AA_CANDIDATE/A2 behind a runtime, not #if, check -
+// see envelope_gdeq_set_use_aa_candidate()) on filter/Fs combinations where
+// ENV_GDEQ_HAS_AA_CANDIDATE is 0. Never actually selected at runtime on
+// those builds - envelope_gdeq_set_use_aa_candidate() refuses to turn the
+// candidate on unless ENV_GDEQ_HAS_AA_CANDIDATE is 1 - so the specific
+// value here doesn't matter; same as the default pair keeps this a no-op.
+#ifndef ENV_GDEQ_A1_AA_CANDIDATE
+  #define ENV_GDEQ_A1_AA_CANDIDATE ENV_GDEQ_A1
+  #define ENV_GDEQ_A2_AA_CANDIDATE ENV_GDEQ_A2
 #endif
 
 // Zeroes both all-pass sections' state and initializes their coefficients
@@ -404,3 +452,30 @@ bool envelope_gdeq_get_enabled(void);
 // is shared by both the 'g' serial handler and the preset loader, so the
 // off->on reset logic only has to be correct in one place.
 void envelope_gdeq_set_enabled(bool enable);
+
+// Added 2026-09-05 - runtime toggle between the two fitted coefficient
+// pairs (default ENV_GDEQ_A1/A2 vs. the 'a'+'A'-specific
+// ENV_GDEQ_A1_AA_CANDIDATE/A2, see the header comment's 2026-09-05 entry
+// for the full real-hardware result: better close-in IMD, worse far-out
+// spectral splatter - a genuinely mixed result, NOT currently recommended
+// for routine use, which is exactly why this is a live 'G' toggle rather
+// than a silent default change). Returns which pair is currently selected
+// (false = default, true = candidate) - always false on a filter/Fs build
+// where ENV_GDEQ_HAS_AA_CANDIDATE is 0.
+bool envelope_gdeq_get_use_aa_candidate(void);
+
+// Selects which coefficient pair is active and re-initializes BOTH
+// sections with it via ssb_allpass1_init() (documented as cheap/safe from
+// task context, and it zeroes state as a side effect - same no-stale-x1/y1
+// reasoning as envelope_gdeq_set_enabled()'s off->on reset, so switching
+// live never glitches the next sample with a mismatched coefficient/state
+// pair). Requesting true (candidate) on a build where
+// ENV_GDEQ_HAS_AA_CANDIDATE is 0 is a no-op - stays on the default pair,
+// since that build never fitted a candidate for its filter/Fs combination.
+// After switching, re-tune '['/']' - the bench-confirmed optimum differs
+// by about 1 sample (2 vs. 2.83 @ 16000Hz for the g+a+A config), NOT the
+// smaller shift the two pairs' theoretical mean delays alone would suggest
+// (see envelope_gdeq.h's header comment and group_delay_fit_notes.md for
+// why - it's a local-group-delay-at-the-tone-frequencies effect, not a
+// mean-delay one).
+void envelope_gdeq_set_use_aa_candidate(bool use_candidate);
