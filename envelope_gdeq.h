@@ -321,7 +321,7 @@
     // before trusting 'g'/'g'+'a' results again. NEITHER value below has
     // been re-measured on real hardware for the a+A case specifically -
     // this is a candidate to bench-test, not a confirmed result.
-    #define ENV_GDEQ_USE_AA_CANDIDATE 0
+    #define ENV_GDEQ_USE_AA_CANDIDATE 1
 
     #if ENV_GDEQ_USE_AA_CANDIDATE
       // Grid search + global (differential-evolution) search + Nelder-Mead

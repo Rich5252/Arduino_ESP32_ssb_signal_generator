@@ -226,6 +226,26 @@ void handle_serial_commands(void)
                           "re-tune relative delay ('['/']') for this band before capturing\r\n",
                           band_name, test_signals_get_twotone_f1_hz(), test_signals_get_twotone_f2_hz(),
                           was_twotone ? "" : ", two-tone mode enabled");
+        } else if (c == 'R') {
+            // Steps the two-tone pair's amplitude ratio
+            // (TONE_RATIO_PRESETS, test_signals.cpp, +/-3dB in 1dB steps
+            // as of 2026-09-04) - added to test directly whether AMPLITUDE
+            // MISMATCH between the two tones, on its own, reproduces
+            // 'eq's IMD benefit with 'eq' OFF (no HPF, no presence peak) -
+            // see test_signals.h's doc comment and
+            // ssb_mic_test_commands.md's dated entry this follows up on.
+            // Independent of 'e'/'eq'/'a'/'A'/'g' - combine or compare
+            // freely. Switches into two-tone mode too if not already
+            // there, same convention as 'T'.
+            bool was_twotone_r = (src == AUDIO_SRC_TWOTONE);
+            const char *ratio_name = test_signals_next_tone_ratio();
+            if (!was_twotone_r) {
+                dsp_state_set_audio_source(AUDIO_SRC_TWOTONE);
+            }
+            serial_reply("-> two-tone amplitude ratio: tone2 %s relative to tone1 "
+                          "(linear ratio %.4f)%s\r\n",
+                          ratio_name, test_signals_get_tone2_gain(),
+                          was_twotone_r ? "" : ", two-tone mode enabled");
 #if AD9851_ATTACHED
         } else if (c == ']') {
             relative_delay_increase();

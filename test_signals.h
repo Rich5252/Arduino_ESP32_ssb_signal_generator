@@ -40,6 +40,30 @@ float test_signals_get_twotone_f2_hz(void);
 // group-delay-equalizer refit discussion this was added for).
 const char* test_signals_next_twotone_band(void);
 
+// Runtime-adjustable amplitude ratio between the two tones - tone2 (the
+// upper of the pair) scaled relative to tone1. Added 2026-09-04 to test
+// directly whether it's specifically the AMPLITUDE MISMATCH between the
+// two tones - not 'eq's HPF/presence side effects, not tone timing - that
+// keeps the envelope from reaching a true zero at a destructive-
+// interference null and thereby avoids freq_dev's sign-flip discontinuity
+// there (see ssb_mic_test_commands.md's "Is 'eq's IMD benefit the
+// highpass or the presence boost?" section, 2026-09-03 "resolved:
+// amplitude" entry, which this follows up on). Independent of 'e'/eq and
+// of 'a'/'A'/'g' - combine or compare freely. Starts at equal amplitude
+// (today's unchanged default) so 'R' must be pressed at least once to
+// introduce any mismatch.
+//
+// 2026-09-04, later same day: confirmed on the bench and range narrowed
+// to a symmetric +/-3dB (was 0 to -20dB, tone2-down-only) - see
+// TONE_RATIO_PRESETS in test_signals.cpp for the exact 1dB-step cycle in
+// both directions. Both directions are covered because 'eq's own presence
+// peak turned out to BOOST tone2 (not attenuate it) - the combined
+// tone1+tone2 constructive-interference peak is held constant across
+// every ratio (see test_signals.cpp), so boosting tone2 carries no more
+// clipping risk than attenuating it did.
+float test_signals_get_tone2_gain(void);
+const char* test_signals_next_tone_ratio(void);
+
 // Envelope step test ('p') - slow square wave direct to the envelope
 // output, carrier held fixed, bypassing ssb_dsp_process_sample()
 // entirely. master_gain_linear is dsp_state_get_master_gain_linear() -

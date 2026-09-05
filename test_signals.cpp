@@ -65,11 +65,67 @@ const char* test_signals_next_twotone_band(void)
     return TWOTONE_BAND_PRESETS[s_band_index].name;
 }
 
+// ---- 2026-09-04: runtime-adjustable tone2/tone1 amplitude ratio ('R') ----
+// See test_signals.h for why this exists. 2026-09-04, later same day:
+// range narrowed to a symmetric +/-3dB (was 0 to -20dB, tone2-down-only) -
+// real-hardware testing with the original range already confirmed the
+// amplitude-mismatch hypothesis, and separately clarified that 'eq's own
+// presence peak BOOSTS tone2 (the upper tone) rather than attenuating it
+// - the down-only version could only test the opposite direction from
+// what 'eq' actually does. Now spans both directions. To keep every step
+// directly comparable in overall drive level, and to make a boost
+// direction safe, tone1+tone2's combined constructive-interference peak
+// is held CONSTANT at today's existing 2*TWOTONE_AMPLITUDE (0.9) for
+// EVERY ratio - only the SPLIT between the two tones changes (e.g. equal
+// splits 0.45/0.45; +3dB splits ~0.373/0.527, tone2 louder; -3dB splits
+// ~0.527/0.373, tone2 quieter) - rather than a fixed tone1 plus a
+// multiplier on tone2, which is what let the old down-only version cycle
+// safely but would have pushed the peak past 1.0 in the boost direction.
+typedef struct { const char *name; float ratio_db; } tone_ratio_t;
+static const tone_ratio_t TONE_RATIO_PRESETS[] = {
+    { "-3dB (tone2 quieter)",                             -3.0f },
+    { "-2dB",                                              -2.0f },
+    { "-1dB",                                              -1.0f },
+    { "equal (0dB, today's default)",                       0.0f },
+    { "+1dB",                                               1.0f },
+    { "+2dB",                                               2.0f },
+    { "+3dB (tone2 louder - matches eq's own direction)",   3.0f },
+};
+#define TONE_RATIO_COUNT (sizeof(TONE_RATIO_PRESETS) / sizeof(TONE_RATIO_PRESETS[0]))
+#define TONE_RATIO_EQUAL_INDEX 3   // must stay pointed at the 0dB entry above
+
+static int s_tone_ratio_index = TONE_RATIO_EQUAL_INDEX;
+// Both initialized directly to TWOTONE_AMPLITUDE (rather than derived from
+// the table via a startup call) so boot behavior is bit-for-bit identical
+// to before 'R' existed until 'R' is actually pressed - this exactly
+// equals what the 0dB preset's own formula produces anyway
+// (peak_budget/(1+1) = 2*TWOTONE_AMPLITUDE/2 = TWOTONE_AMPLITUDE), so
+// there's no discontinuity the first time 'R' IS pressed either.
+static volatile float s_tone1_amplitude = TWOTONE_AMPLITUDE;
+static volatile float s_tone2_amplitude = TWOTONE_AMPLITUDE;
+
+// Ratio (tone2/tone1, linear) currently in effect - derived from the two
+// amplitudes actually in use rather than cached separately, so it can
+// never drift out of sync with what generate_twotone_sample() is doing.
+float test_signals_get_tone2_gain(void) { return s_tone2_amplitude / s_tone1_amplitude; }
+
+const char* test_signals_next_tone_ratio(void)
+{
+    s_tone_ratio_index = (s_tone_ratio_index + 1) % TONE_RATIO_COUNT;
+    float ratio_db = TONE_RATIO_PRESETS[s_tone_ratio_index].ratio_db;
+    float r = powf(10.0f, ratio_db / 20.0f);            // tone2/tone1, linear
+    const float peak_budget = 2.0f * TWOTONE_AMPLITUDE;  // constant across every ratio
+    float a1 = peak_budget / (1.0f + r);
+    s_tone1_amplitude = a1;
+    s_tone2_amplitude = r * a1;
+    return TONE_RATIO_PRESETS[s_tone_ratio_index].name;
+}
+
 float IRAM_ATTR generate_twotone_sample(void)
 {
     const float two_pi = 2.0f * (float)M_PI;
-    float sample = TWOTONE_AMPLITUDE * sinf(s_tone1_phase) +
-                   TWOTONE_AMPLITUDE * sinf(s_tone2_phase);
+    float sample = s_tone1_amplitude * sinf(s_tone1_phase) +
+                   s_tone2_amplitude * sinf(s_tone2_phase);
     s_tone1_phase += two_pi * s_tone1_hz / (float)SAMPLE_RATE_HZ;
     s_tone2_phase += two_pi * s_tone2_hz / (float)SAMPLE_RATE_HZ;
     if (s_tone1_phase > two_pi) s_tone1_phase -= two_pi;
