@@ -312,61 +312,138 @@ static void IRAM_ATTR dsp_task(void* arg)
         // clamp aimed at squelching mic-path noise at silence, not
         // something a swept-tone TF measurement exercises or benefits
         // from measuring through.
+        //
+        // 2026-09-06, IMPORTANT CORRECTION: gdeq/ampeq below are now
+        // gated to `is_full_tick` (SAMPLE_RATE_HZ), NOT called on every
+        // fast tick the way the rest of this block still is. Found via
+        // real-bench report: "I enabled the x4 interp in code... to get
+        // higher Fs for w test but dont have the a+A in w test circuit?"
+        // Root cause: envelope_gdeq_process()/envelope_ampeq_process()'s
+        // coefficients (ssb_allpass1_t's `a`, the ampeq shelf biquads) are
+        // fit assuming they run at SAMPLE_RATE_HZ - an IIR filter's real-
+        // Hz response depends on normalized frequency (real Hz / the
+        // ACTUAL rate it's clocked at), not just its coefficient. Calling
+        // them every fast tick (ENVELOPE_INTERP_FACTOR x SAMPLE_RATE_HZ,
+        // as this block did before this fix) silently runs them at
+        // ENVELOPE_INTERP_FACTOR times their design rate. Quantified
+        // (Fs=16000 vs Fs=64000, ENVELOPE_INTERP_FACTOR=4, the a+A
+        // candidate's own coefficients): predicted 100-8000Hz p-p
+        // dispersion collapses from ~72.6us (intended) to ~4.1us at 4x
+        // the rate - gdeq would look like it does almost nothing on a
+        // sweep; the default coefficients go from ~69.3us to ~1.2us,
+        // even more collapsed. Same mechanism shifts the ampeq shelf
+        // biquads' real corner frequency by that same factor, pushing
+        // their boost mostly outside a 100-8000Hz sweep window. This
+        // matches the reported symptom exactly, and explains it without
+        // needing a+A to have been literally removed from the circuit -
+        // its EFFECT just gets rate-warped down toward invisible.
+        // Meanwhile the NORMAL production pipeline's own gdeq/ampeq calls
+        // (envelope_gdeq_process()/envelope_ampeq_process() below, near
+        // envelope_interp_on_full_tick()) were never affected by this -
+        // they already only run on is_full_tick, i.e. genuinely at
+        // SAMPLE_RATE_HZ regardless of ENVELOPE_INTERP_FACTOR's value,
+        // because that gate decimates by exactly that same factor. Only
+        // this early-intercept chirp path lacked the equivalent
+        // decimation. Fix: gdeq/ampeq (and the DC mapping after them,
+        // which is memoryless/rate-independent but kept alongside them
+        // for the same call-once-per-full-tick reason) now run only on
+        // is_full_tick, handing off to envelope_interp_on_full_tick()/
+        // envelope_interp_on_interp_tick() - the SAME PWM-smoothing
+        // machinery the normal pipeline already uses below - instead of
+        // a direct envelope_output_write_pwm() call every fast tick. This
+        // also means 'I' now controls the 'w' test's PWM smoothness the
+        // same way it does for real playback, decoupled from gdeq/ampeq's
+        // own fixed SAMPLE_RATE_HZ processing rate - the two concerns
+        // this bug had conflated. The raw chirp waveform generation
+        // (test_signals_generate_chirp() just below) is UNCHANGED - it
+        // still runs every fast tick, so sweeping up to CHIRP_F1_HZ
+        // (20kHz) is unaffected; only what gdeq/ampeq actually see is now
+        // decimated to match their design rate. NOT yet bench-validated -
+        // same not-yet-confirmed status as envelope_interp.h's own
+        // interpolation feature.
         if (dsp_state_get_audio_source() == AUDIO_SRC_CHIRP) {
+            // 2026-09-06 fix (see below): captured HERE, at the true top of
+            // this tick, before test_signals_generate_chirp() or any of the
+            // gdeq/ampeq/DC-mapping work below - envelope_interp.h's own
+            // v4.1 note is explicit that a timestamp taken any later (e.g.
+            // after this tick's own processing has already spent tens of
+            // microseconds) makes compute_ramp_value()'s ramp timing wrong,
+            // not just imprecise. Cheap (one register read) even on interp
+            // ticks where it goes unused.
+            int64_t chirp_tick_start_us = esp_timer_get_time();
             float chirp_envelope;
             bool ref_high;
             test_signals_generate_chirp(dsp_state_get_master_gain_linear(), &chirp_envelope, &ref_high);
 
-            // Envelope-path group-delay equalizer - see envelope_gdeq.h.
-            // Same call, same 'g' toggle, same live on/off behavior as the
-            // normal full-tick pipeline's own envelope_gdeq_process() call
-            // below (envelope_gdeq_process() internally no-ops when
-            // disabled, so this is safe to call unconditionally here too -
-            // no separate gating needed). Run BEFORE the predistort/
-            // offset-scale mapping, matching that pipeline's own ordering,
-            // so 'g' reshapes the swept envelope itself rather than
-            // whatever the DC mapping already did to it.
-            chirp_envelope = envelope_gdeq_process(chirp_envelope);
+            if (is_full_tick) {
+                // Envelope-path group-delay equalizer - see envelope_gdeq.h.
+                // Same call, same 'g' toggle, same live on/off behavior as
+                // the normal full-tick pipeline's own envelope_gdeq_process()
+                // call below (envelope_gdeq_process() internally no-ops when
+                // disabled, so this is safe to call unconditionally here too
+                // - no separate gating needed). Run BEFORE the predistort/
+                // offset-scale mapping, matching that pipeline's own
+                // ordering, so 'g' reshapes the swept envelope itself rather
+                // than whatever the DC mapping already did to it. Gated to
+                // is_full_tick - see this block's own top comment (2026-09-06
+                // correction) for why.
+                chirp_envelope = envelope_gdeq_process(chirp_envelope);
 
-            // Envelope-path magnitude equalizer - see envelope_ampeq.h.
-            // Same reasoning/wiring as gdeq just above, toggle 'a' (shelf 1)
-            // / 'A' (shelf 2, added 2026-09-04, independent flag) - this
-            // is what lets the chirp/TFA workflow measure either shelf's
-            // actual on-bench correction directly via the sweep's
-            // AMPLITUDE channel, the same way gdeq's phase channel
-            // already validated its own refit.
-            chirp_envelope = envelope_ampeq_process(chirp_envelope);
+                // Envelope-path magnitude equalizer - see envelope_ampeq.h.
+                // Same reasoning/wiring as gdeq just above, toggle 'a'
+                // (shelf 1) / 'A' (shelf 2, added 2026-09-04, independent
+                // flag) - this is what lets the chirp/TFA workflow measure
+                // either shelf's actual on-bench correction directly via the
+                // sweep's AMPLITUDE channel, the same way gdeq's phase
+                // channel already validated its own refit.
+                chirp_envelope = envelope_ampeq_process(chirp_envelope);
 
-            // Apply the SAME offset/scale (or predistort) DC mapping every
-            // other source gets from the normal full-tick pipeline below -
-            // deliberately NOT skipped here, unlike envelope_floor (see
-            // this block's own top comment for why that one stays
-            // skipped). Master gain ('+'/'-', already passed into
-            // test_signals_generate_chirp() above) only scales the SWING
-            // around AM_TEST_DEPTH's fixed mean (same convention as
-            // AMTEST) - it moves how HARD the filter is driven, not WHERE
-            // on the duty range it's centered, so it can't reveal a
-            // duty-range-dependent (DC-operating-point-dependent)
-            // nonlinearity in the analog filter/BS170 gate stage. 'u'/'j'
-            // (offset) and 'i'/'k' (scale) directly move that operating
-            // point - exactly the knob needed to test the TF across
-            // different parts of the duty range - so wiring them in here
-            // is what actually answers that question, not more gain.
-            if (envelope_predistort_get_enabled()) {
-                chirp_envelope = envelope_predistort_process(chirp_envelope);
+                // Apply the SAME offset/scale (or predistort) DC mapping
+                // every other source gets from the normal full-tick pipeline
+                // below - deliberately NOT skipped here, unlike
+                // envelope_floor (see this block's own top comment for why
+                // that one stays skipped). Master gain ('+'/'-', already
+                // passed into test_signals_generate_chirp() above) only
+                // scales the SWING around AM_TEST_DEPTH's fixed mean (same
+                // convention as AMTEST) - it moves how HARD the filter is
+                // driven, not WHERE on the duty range it's centered, so it
+                // can't reveal a duty-range-dependent (DC-operating-point-
+                // dependent) nonlinearity in the analog filter/BS170 gate
+                // stage. 'u'/'j' (offset) and 'i'/'k' (scale) directly move
+                // that operating point - exactly the knob needed to test the
+                // TF across different parts of the duty range - so wiring
+                // them in here is what actually answers that question, not
+                // more gain.
+                if (envelope_predistort_get_enabled()) {
+                    chirp_envelope = envelope_predistort_process(chirp_envelope);
+                } else {
+                    chirp_envelope = chirp_envelope * envelope_output_get_pwm_scale() + envelope_output_get_pwm_offset();
+                }
+                // Final safety clamp - same bounds/reasoning as the normal
+                // pipeline's own clamp right before its
+                // envelope_interp_on_full_tick() call: an offset/scale
+                // combination (or, at high master gain, AMTEST's own "swing
+                // can push peaks past 1.0" case, still possible pre-mapping
+                // above) can push this outside [0,1] - flatten it here
+                // rather than wrapping the raw LEDC duty register.
+                if (chirp_envelope < 0.0f) chirp_envelope = 0.0f;
+                if (chirp_envelope > 1.0f) chirp_envelope = 1.0f;
+                // Hand off to envelope_interp - same call the normal
+                // pipeline uses below - instead of a direct
+                // envelope_output_write_pwm(). Writes PWM for this full
+                // tick, and (if 'I' is on) arms the ramp
+                // envelope_interp_on_interp_tick() advances on the fast
+                // ticks in between; if 'I' is off, on_interp_tick() does
+                // nothing at all on those ticks (envelope_interp.cpp) and
+                // the LEDC hardware simply holds this tick's duty value -
+                // the same already-understood baseline ZOH behavior the
+                // normal pipeline has always had. chirp_tick_start_us was
+                // captured at the TOP of this tick, above - see that
+                // comment for why it must not be taken here instead.
+                envelope_interp_on_full_tick(chirp_envelope, chirp_tick_start_us);
             } else {
-                chirp_envelope = chirp_envelope * envelope_output_get_pwm_scale() + envelope_output_get_pwm_offset();
+                envelope_interp_on_interp_tick();
             }
-            // Final safety clamp - same bounds/reasoning as the normal
-            // pipeline's own clamp right before its envelope_output_write_
-            // pwm() call: an offset/scale combination (or, at high master
-            // gain, AMTEST's own "swing can push peaks past 1.0" case,
-            // still possible pre-mapping above) can push this outside
-            // [0,1] - flatten it here rather than wrapping the raw LEDC
-            // duty register.
-            if (chirp_envelope < 0.0f) chirp_envelope = 0.0f;
-            if (chirp_envelope > 1.0f) chirp_envelope = 1.0f;
-            envelope_output_write_pwm(chirp_envelope);
 #if !CMD_DEBUG_PIN_ENABLED
             if (ref_high) {
                 GPIO_FAST_SET(CHIRP_REF_GPIO);
@@ -790,13 +867,26 @@ void setup()
              MCP4725_I2C_ADDR,
              PWM_COMPARISON_ENABLED ? "on" : "off");
     Serial.println("Send 't' for two-tone test signal, 's' for single-tone test signal, 'm' for live mic input, 'p' for envelope step test, 'y' for FM isolation test, 'h' for AM isolation test, 'f' to cycle the ADC LPF off/Butterworth/Chebyshev, 'r' to reset diagnostics, 'v' to mute periodic diagnostics, 'n' to cycle the null_bias diagnostic's envelope threshold (see '[dsp] null_bias' line).");
-    Serial.printf("Send 'w' for the sine-chirp test mode (%.0fHz-%.0fHz log sweep over %.1fs, %.0fms mute/"
+#if CHIRP_BIDIRECTIONAL
+    float chirp_banner_total_sec = 2.0f * CHIRP_SWEEP_SEC;
+    const char *chirp_banner_shape = "up+down";
+#else
+    float chirp_banner_total_sec = CHIRP_SWEEP_SEC;
+    const char *chirp_banner_shape = "up only";
+#endif
+#if CHIRP_SWEEP_LOG
+    const char *chirp_banner_law = "log";
+#else
+    const char *chirp_banner_law = "linear";
+#endif
+    Serial.printf("Send 'w' for the sine-chirp test mode (%.0fHz-%.0fHz %s sweep, %.1fs [%s], %.0fms mute/"
                   "sync marker at each restart, square-wave reference on pin%d) - characterizes the "
                   "envelope/PWM (RSET) analog filter's transfer function against an external ADC-based "
                   "measurement rig. 'u'/'j'/'i'/'k'/'D' still move the sweep's DC operating point on the "
                   "duty range (use these to test the filter across the range, NOT master gain, which "
                   "only scales swing depth around a fixed mean).\r\n",
-                  CHIRP_F0_HZ, CHIRP_F1_HZ, CHIRP_SWEEP_SEC, CHIRP_MUTE_SEC * 1000.0f, CHIRP_REF_GPIO);
+                  CHIRP_F0_HZ, CHIRP_F1_HZ, chirp_banner_law, chirp_banner_total_sec, chirp_banner_shape,
+                  CHIRP_MUTE_SEC * 1000.0f, CHIRP_REF_GPIO);
     Serial.printf("Send 'T' to step the two-tone pair through a spread of bands (currently f1=%.0fHz f2=%.0fHz) - "
                   "for mapping envelope/phase delay mismatch vs. frequency without a recompile per band.\r\n",
                   test_signals_get_twotone_f1_hz(), test_signals_get_twotone_f2_hz());

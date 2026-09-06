@@ -243,6 +243,17 @@ void IRAM_ATTR test_signals_generate_chirp(float master_gain_linear, float *out_
     const float fs_fast = (float)SAMPLE_RATE_HZ * (float)ENVELOPE_INTERP_FACTOR;
     const float two_pi = 2.0f * (float)M_PI;
 
+    // 2026-09-05: CHIRP_BIDIRECTIONAL adds a down-leg (CHIRP_F1_HZ ->
+    // CHIRP_F0_HZ) after the original up-leg, before muting/restarting -
+    // see config.h's CHIRP_BIDIRECTIONAL comment. cycle_sweep_sec is the
+    // total sweep duration per repeat (both legs when bidirectional), used
+    // below for the elapsed-time wraparound.
+#if CHIRP_BIDIRECTIONAL
+    const float cycle_sweep_sec = 2.0f * CHIRP_SWEEP_SEC;
+#else
+    const float cycle_sweep_sec = CHIRP_SWEEP_SEC;
+#endif
+
     if (s_chirp_elapsed_s < CHIRP_MUTE_SEC) {
         // Brief silence at the start of every cycle - a clean, easy-to-
         // trigger-on marker for the external measurement rig to detect
@@ -260,16 +271,35 @@ void IRAM_ATTR test_signals_generate_chirp(float master_gain_linear, float *out_
         // function measurement wants.
     } else {
         float t_sweep = s_chirp_elapsed_s - CHIRP_MUTE_SEC;   // 0 at sweep start
-        if (t_sweep > CHIRP_SWEEP_SEC) t_sweep = CHIRP_SWEEP_SEC;   // clamp the last fractional tick before wrap
+        if (t_sweep > cycle_sweep_sec) t_sweep = cycle_sweep_sec;   // clamp the last fractional tick before wrap
 
-        // Logarithmic (exponential) sweep: f(t) = f0 * (f1/f0)^(t/T) -
-        // instantaneous frequency, integrated into a phase accumulator
+        // Sweep law (log or linear - CHIRP_SWEEP_LOG, config.h):
+        // log:    f(t) = f0 * (f1/f0)^(t/T)  - equal time per octave
+        // linear: f(t) = f0 + (f1-f0)*(t/T)  - equal time per Hz
+        // Bidirectional: the up-leg (t_sweep < CHIRP_SWEEP_SEC) uses this
+        // directly; the down-leg mirrors t_sweep back into the same [0,T]
+        // shape (t_frac below), so frequency retraces the identical curve
+        // back down to CHIRP_F0_HZ instead of jumping there discontinuously
+        // - continuous instantaneous frequency across the whole up+down
+        // cycle, no rate-of-change discontinuity except at the deliberate
+        // mute boundary. Same mirroring applies to either sweep law.
+        float t_frac_sec = t_sweep;
+#if CHIRP_BIDIRECTIONAL
+        if (t_sweep > CHIRP_SWEEP_SEC) {
+            t_frac_sec = cycle_sweep_sec - t_sweep;   // down-leg: mirror back to [0, CHIRP_SWEEP_SEC]
+        }
+#endif
+        // Instantaneous frequency, integrated into a phase accumulator
         // per-sample rather than using the sweep's closed-form phase
         // integral, since the per-sample instantaneous-frequency approach
-        // is simpler to get right and cheap enough at this rate (one powf
-        // per fast tick, ~64k/sec - negligible next to the DSP budget the
-        // full 16kHz pipeline already spends per tick).
-        float f_inst = CHIRP_F0_HZ * powf(CHIRP_F1_HZ / CHIRP_F0_HZ, t_sweep / CHIRP_SWEEP_SEC);
+        // is simpler to get right and cheap enough at this rate (one powf/
+        // multiply per fast tick, ~64k/sec - negligible next to the DSP
+        // budget the full 16kHz pipeline already spends per tick).
+#if CHIRP_SWEEP_LOG
+        float f_inst = CHIRP_F0_HZ * powf(CHIRP_F1_HZ / CHIRP_F0_HZ, t_frac_sec / CHIRP_SWEEP_SEC);
+#else
+        float f_inst = CHIRP_F0_HZ + (CHIRP_F1_HZ - CHIRP_F0_HZ) * (t_frac_sec / CHIRP_SWEEP_SEC);
+#endif
 
         s_chirp_phase += two_pi * f_inst / fs_fast;
         if (s_chirp_phase > two_pi) s_chirp_phase -= two_pi;
@@ -284,7 +314,7 @@ void IRAM_ATTR test_signals_generate_chirp(float master_gain_linear, float *out_
     }
 
     s_chirp_elapsed_s += 1.0f / fs_fast;
-    if (s_chirp_elapsed_s >= CHIRP_MUTE_SEC + CHIRP_SWEEP_SEC) {
+    if (s_chirp_elapsed_s >= CHIRP_MUTE_SEC + cycle_sweep_sec) {
         s_chirp_elapsed_s = 0.0f;
         s_chirp_phase = 0.0f;   // resync phase too, so every repeat sweep is identical (see above)
     }

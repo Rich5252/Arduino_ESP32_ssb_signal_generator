@@ -189,22 +189,43 @@ void handle_serial_commands(void)
             // the 'g' group-delay-equalizer A/B workflow (toggle 'g', then
             // re-run 'w' to compare compensated vs raw TF) NEEDS a fresh,
             // synced restart every time, even while already mid-sweep -
-            // otherwise you're stuck waiting up to the full CHIRP_SWEEP_SEC
-            // (5s) for the next natural mute/sync marker after toggling
-            // 'g', rather than getting an immediate clean trigger point for
+            // otherwise you're stuck waiting up to the full sweep cycle
+            // (CHIRP_SWEEP_SEC, or 2x that with CHIRP_BIDIRECTIONAL) for
+            // the next natural mute/sync marker after toggling 'g', rather
+            // than getting an immediate clean trigger point for
             // the TF rig. Re-sending 'w' while already sweeping is now a
             // real, useful "restart now" action, not a redundant re-select.
             // NOTE: CMD_DEBUG_PIN_ENABLED (config.h) must be 0 for the
             // chirp's square-wave reference on pin39 to be glitch-free -
             // it shares that physical pin with TIMING_DEBUG_GPIO_CMD.
+            //
+            // 2026-09-05: total cycle time is now CHIRP_MUTE_SEC +
+            // CHIRP_SWEEP_SEC (up leg only) or CHIRP_MUTE_SEC +
+            // 2*CHIRP_SWEEP_SEC (up+down, CHIRP_BIDIRECTIONAL - see
+            // config.h) - the status line below reports total sweep time,
+            // not just one leg, so it matches how long a full 'w' capture
+            // actually takes on the bench.
             test_signals_chirp_reset();
             dsp_state_set_audio_source(AUDIO_SRC_CHIRP);
-            serial_reply("-> sine chirp test (%.0fHz-%.0fHz, %.1fs sweep, %.0fms mute/sync, ref pin%d, "
+#if CHIRP_BIDIRECTIONAL
+            float chirp_total_sweep_sec = 2.0f * CHIRP_SWEEP_SEC;
+            const char *chirp_shape = "up+down";
+#else
+            float chirp_total_sweep_sec = CHIRP_SWEEP_SEC;
+            const char *chirp_shape = "up only";
+#endif
+#if CHIRP_SWEEP_LOG
+            const char *chirp_law = "log";
+#else
+            const char *chirp_law = "linear";
+#endif
+            serial_reply("-> sine chirp test (%.0fHz-%.0fHz %s sweep, %.1fs [%s], %.0fms mute/sync, ref pin%d, "
                           "%dx fast-tick); DC mapping ('u'/'j'/'i'/'k'/'D') still applies, gdeq ('g') "
                           "currently %s (%s coefficients), ampeq shelf 1 ('a') currently %s, ampeq shelf 2 "
                           "('A') currently %s - toggle 'g'/'a'/'A'/'G' + re-run 'w' to A/B compensated vs "
                           "raw TF (phase channel for 'g'/'G', amplitude channel for 'a'/'A')\r\n",
-                          CHIRP_F0_HZ, CHIRP_F1_HZ, CHIRP_SWEEP_SEC, CHIRP_MUTE_SEC * 1000.0f,
+                          CHIRP_F0_HZ, CHIRP_F1_HZ, chirp_law, chirp_total_sweep_sec, chirp_shape,
+                          CHIRP_MUTE_SEC * 1000.0f,
                           CHIRP_REF_GPIO, ENVELOPE_INTERP_FACTOR,
                           envelope_gdeq_get_enabled() ? "ON" : "OFF",
                           envelope_gdeq_get_use_aa_candidate() ? "a+A candidate" : "default",

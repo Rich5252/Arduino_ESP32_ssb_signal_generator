@@ -258,9 +258,55 @@
 // infrastructure is needed. CHIRP_F1_HZ=20kHz matches the user's stated
 // measurement range ("I can measure to about 20kHz").
 #define CHIRP_F0_HZ      20.0f
-#define CHIRP_F1_HZ   20000.0f
-#define CHIRP_SWEEP_SEC   5.0f
-#define CHIRP_MUTE_SEC    0.03f
+#define CHIRP_F1_HZ   8000.0f
+// 2026-09-05: slowed from 5.0s - the gdeq mid-band (2.8-4.5kHz) redesign
+// work needs cleaner phase data than the original fits used (see
+// group_delay_fit_notes.md's matching entry: a coefficient search against
+// noisy reconstructed data gave an unstable answer). A slower sweep means
+// more fast-ticks (more sine cycles) elapse per Hz of frequency change
+// everywhere in the band, giving the external rig's own
+// measurement/averaging more settled data per point - directly reduces
+// the kind of point-to-point phase jitter that made the mid-band redesign
+// search sensitive to the smoothing window used. Tune to taste against
+// the rig's own integration time; nothing else depends on this value.
+#define CHIRP_SWEEP_SEC  30.0f
+// 2026-09-05: sweep now goes UP then back DOWN (CHIRP_BIDIRECTIONAL,
+// below) each cycle, so CHIRP_SWEEP_SEC is the duration of ONE leg (up OR
+// down), not the full up+down cycle - a full cycle is
+// CHIRP_MUTE_SEC + 2*CHIRP_SWEEP_SEC.
+#define CHIRP_MUTE_SEC    0.01f
+// 2026-09-05: sweep up (CHIRP_F0_HZ->CHIRP_F1_HZ) then back down
+// (CHIRP_F1_HZ->CHIRP_F0_HZ) before muting/restarting, instead of the old
+// one-directional sweep that jumped straight from CHIRP_F1_HZ back to
+// CHIRP_F0_HZ at the top of every repeat. NOTE: that old jump happened
+// right as the envelope was about to go silent for CHIRP_MUTE_SEC anyway
+// (mute forces the envelope to 0 unconditionally, regardless of sweep
+// direction), so it was never an audible/analog discontinuity in the
+// actual RSET output - the real benefit here is TWO independent phase
+// readings of the same frequency per cycle (once on the way up, once on
+// the way down), which is a direct, free check for any timing/sync lag in
+// the measurement chain itself (up-leg and down-leg readings should
+// agree; a consistent gap between them points at the rig, not the
+// filter). Set to 0 to restore the old one-directional sweep (e.g. if a
+// downstream analysis script assumes a single up-only pass and hasn't
+// been updated to split the two legs).
+#define CHIRP_BIDIRECTIONAL 1
+// 2026-09-05: sweep law - 1 = logarithmic (original, f(t)=f0*(f1/f0)^(t/T),
+// equal TIME PER OCTAVE), 0 = linear (f(t)=f0+(f1-f0)*(t/T), equal time
+// per Hz). CAUTION before flipping this to 0 with the CHIRP_F0_HZ/
+// CHIRP_F1_HZ values above unchanged: a log sweep from 20Hz-20000Hz
+// already spends ~87% of its dwell time below 8000Hz (since most of the
+// 20-20000Hz range's ~10 octaves fall below 8kHz) - exactly the audio
+// band this project cares about. A LINEAR sweep over the same 20-20000Hz
+// endpoints would spend only ~40% of its time below 8000Hz (8000-20 is
+// under 40% of the full 20-20000 span) - i.e. switching to linear WITHOUT
+// also narrowing CHIRP_F1_HZ would give WORSE resolution in the band that
+// matters, not better, despite "linear = more even" intuition. If linear
+// is wanted specifically to get more even dwell time across a target band
+// (e.g. to resolve the gdeq mid-band 2.8-4.5kHz zone better relative to
+// the rest of 100-8000Hz), lower CHIRP_F1_HZ to match that band (e.g.
+// 8000Hz) at the same time - don't just flip this flag alone.
+#define CHIRP_SWEEP_LOG 0
 #define CHIRP_REF_GPIO  TIMING_DEBUG_GPIO_ADC   // pin39 (was pin13, moved 2026-09-02 - see
                                     // TIMING_DEBUG_GPIO_ADC's own comment above) - square-wave
                                     // reference channel for the
@@ -341,7 +387,7 @@
                                  // timing residual - see relative_delay.h's fractional delay
                                  // line, added specifically to test that instead. Must stay ODD
                                  // if changed again.
-#define MAX_FREQ_DEV_HZ    20000.0f  // Originally raised from 2800.0f for a diagnostic A/B test -
+#define MAX_FREQ_DEV_HZ    8000.0f  // Originally raised from 2800.0f for a diagnostic A/B test -
                                      // real hardware showed a consistent ~+100Hz offset on BOTH
                                      // tones of a 700/1900Hz two-tone test (landed at 800/1999Hz)
                                      // while a single 1000Hz tone was exactly on frequency;

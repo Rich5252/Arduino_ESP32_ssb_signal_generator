@@ -363,7 +363,7 @@
 // isn't just "copy Hans's 28x") - not currently exposed as a runtime-
 // tunable the way the slew limiter is; revisit as a live '<'/'>'-style
 // step if/once a fixed 4x is confirmed worthwhile on real hardware.
-#define ENVELOPE_INTERP_FACTOR 1
+#define ENVELOPE_INTERP_FACTOR 4
 
 // v4.3: which curve compute_ramp_value() evaluates over the [s_p1,s_p2]
 // segment - see the "v4.3" header note above for the full rationale.
