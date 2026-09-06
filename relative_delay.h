@@ -52,6 +52,19 @@
                                      // testing found a sweet spot near -0.25 samples, to resolve
                                      // it more precisely than that coarser step could
 
+// Added 2026-09-06 after the candidate-B bench test found BOTH the default
+// and candidate-B gdeq configs need a delay "compromise" chosen from
+// within a sub-0.1-sample window (2.00-2.10 samples @ 16000Hz) where
+// different two-tone IMD orders trade off against each other - too fine a
+// distinction to make with only the 0.05-sample '['/']' step (2 presses
+// covers that entire window with no intermediate points). Same
+// coarse/fine pairing convention as MASTER_GAIN_STEP_DB/_FINE_STEP_DB
+// ('+'/'-' vs '.'/','), just under different keys since '.'/',' and
+// '{'/'}' (the natural shifted '['/']' pair) are both already taken -
+// ';'/''' sit in the same keyboard neighborhood as '['/']' on a US QWERTY
+// layout, which is why they were picked over an unrelated pair.
+#define DELAY_FINE_STEP_SAMPLES 0.01f  // 1/5th of DELAY_STEP_SAMPLES - 0.625us at 16kHz
+
 // Both rings are always written/read together, BEFORE either output is
 // driven - the current relative-delay value decides whether the
 // freq_dev or the envelope side actually gets held back; the other one
@@ -71,6 +84,14 @@ void relative_delay_increase(void);
 // '[' - decrease relative delay by one DELAY_STEP_SAMPLES, clamped to
 // -(PHASE_DELAY_MAX_SAMPLES-2).
 void relative_delay_decrease(void);
+
+// ''' - increase relative delay by one DELAY_FINE_STEP_SAMPLES (2026-09-06),
+// same clamp as relative_delay_increase().
+void relative_delay_increase_fine(void);
+
+// ';' - decrease relative delay by one DELAY_FINE_STEP_SAMPLES (2026-09-06),
+// same clamp as relative_delay_decrease().
+void relative_delay_decrease_fine(void);
 
 // Sets relative delay directly (used by preset loading) - clamped the
 // same way the '['/']' handlers are.

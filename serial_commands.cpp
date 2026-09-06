@@ -283,6 +283,29 @@ void handle_serial_commands(void)
                           d, d * 1000000.0f / SAMPLE_RATE_HZ,
                           d > 0.0f ? "phase held back" :
                           d < 0.0f ? "envelope held back" : "aligned");
+        } else if (c == '\'') {
+            // Added 2026-09-06 - fine-step counterpart to ']', same
+            // coarse/fine pairing convention as '+'/'.' for master gain.
+            // See relative_delay.h's DELAY_FINE_STEP_SAMPLES comment for
+            // why this was needed: the candidate-B bench test found both
+            // the default and candidate-B gdeq configs need their delay
+            // chosen from within a sub-0.1-sample window where different
+            // IMD orders trade off, finer than the plain ']' step can
+            // resolve.
+            relative_delay_increase_fine();
+            float d = relative_delay_get_samples();
+            serial_reply("-> relative delay %+.3f samples (~%+.2fus) - %s\r\n",
+                          d, d * 1000000.0f / SAMPLE_RATE_HZ,
+                          d > 0.0f ? "phase held back" :
+                          d < 0.0f ? "envelope held back" : "aligned");
+        } else if (c == ';') {
+            // Fine-step counterpart to '[' - see the ''' handler above.
+            relative_delay_decrease_fine();
+            float d = relative_delay_get_samples();
+            serial_reply("-> relative delay %+.3f samples (~%+.2fus) - %s\r\n",
+                          d, d * 1000000.0f / SAMPLE_RATE_HZ,
+                          d > 0.0f ? "phase held back" :
+                          d < 0.0f ? "envelope held back" : "aligned");
 #endif
         } else if (c == 'u') {
             envelope_output_raise_pwm_offset();

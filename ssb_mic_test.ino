@@ -899,11 +899,12 @@ void setup()
                   MASTER_GAIN_FINE_STEP_DB);
 #if AD9851_ATTACHED
     Serial.printf("Send 'o' to toggle AD9851 RF output on/off (currently %s), "
-                  "'['/']' for relative phase/envelope delay (currently %+.2f samples, ~%+.0fus, "
-                  "%.2f/step - positive delays phase, negative delays envelope).\r\n",
+                  "'['/']' for relative phase/envelope delay (currently %+.3f samples, ~%+.2fus, "
+                  "%.2f/step), or the finer semicolon/apostrophe pair (%.2f/step) - positive delays "
+                  "phase, negative delays envelope.\r\n",
                   carrier_output_get_rf_enabled() ? "ON" : "off",
                   relative_delay_get_samples(), relative_delay_get_samples() * 1000000.0f / SAMPLE_RATE_HZ,
-                  DELAY_STEP_SAMPLES);
+                  DELAY_STEP_SAMPLES, DELAY_FINE_STEP_SAMPLES);
 #endif
     Serial.printf("Send 'u'/'j' for PWM duty range offset, 'i'/'k' for span "
                   "(currently %.0f%%-%.0f%%, offset=%.2f scale=%.2f, %.0f%%/step).\r\n",

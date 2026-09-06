@@ -60,6 +60,18 @@ void relative_delay_decrease(void)
         s_relative_delay_samples -= DELAY_STEP_SAMPLES;
 }
 
+void relative_delay_increase_fine(void)
+{
+    if (s_relative_delay_samples < (float)(PHASE_DELAY_MAX_SAMPLES - 2))
+        s_relative_delay_samples += DELAY_FINE_STEP_SAMPLES;
+}
+
+void relative_delay_decrease_fine(void)
+{
+    if (s_relative_delay_samples > -(float)(PHASE_DELAY_MAX_SAMPLES - 2))
+        s_relative_delay_samples -= DELAY_FINE_STEP_SAMPLES;
+}
+
 void relative_delay_set_samples(float samples)
 {
     if (samples > (float)(PHASE_DELAY_MAX_SAMPLES - 2))  samples = (float)(PHASE_DELAY_MAX_SAMPLES - 2);
