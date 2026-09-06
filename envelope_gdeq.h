@@ -321,11 +321,76 @@
  * top-priority open item regardless of what it turns out to show. Toggle
  * via 'g', off by default so existing tuning isn't disturbed until
  * deliberately opted into.
+ *
+ * ---- 2026-09-06: a THIRD coefficient set ("candidate B"), and 'G' becomes
+ * a 3-way CYCLE instead of a 2-way toggle ---- The mid-band local-slope-
+ * vs-p-p Pareto refit (group_delay_fit_notes.md, redone against the real,
+ * cross-validated HiRes chirp data instead of the noisy reconstruction the
+ * 2026-09-05 version of this search used) found something sharper than
+ * that entry's own "already Pareto-optimal" conclusion: the a+A candidate
+ * above (a1=a2=-0.139115), while nearly optimal for FULL-BAND p-p, makes
+ * the LOCAL group-delay slope through 2800-4500Hz genuinely WORSE than
+ * running with gdeq off entirely (49.6us/kHz vs. bare's own 36.8us/kHz) -
+ * a real regression, not just a smaller-than-hoped improvement, and a
+ * sharper, now real-data-backed version of the mechanism implicated in
+ * that far-out two-tone spur forest. "Candidate B" (a1=a2=+0.09) trades
+ * back some of the a+A candidate's p-p advantage (105.2us -> 136.0us,
+ * still meaningfully better than the default pair's 156.5us) for a real
+ * 43% reduction in that local mid-band slope (49.6 -> 28.1us/kHz, close to
+ * the default pair's own best-achievable 26.1us/kHz). Same symmetric
+ * single-parameter (a1=a2) design as the existing candidate, fitted for
+ * the same ENV_FILTER_PNP_BC327_ATTN @ SAMPLE_RATE_HZ=16000 combination
+ * against the same real bare (analog+shelf1+shelf2) curve. See
+ * `ENV_GDEQ_A1_CANDIDATE_B`/`ENV_GDEQ_A2_CANDIDATE_B` below and
+ * `env_gdeq_variant_t` for how it's selected.
+ *
+ * **THIS IS A MODEL PREDICTION, NOT YET A BENCH RESULT** - unlike every
+ * other coefficient set in this file, candidate B has not been measured on
+ * real hardware at all (no TFA sweep, no two-tone spur-forest check). It's
+ * offered for bench-testing, not as a recommendation - treat it with at
+ * least as much caution as the a+A candidate's own "mixed result, not
+ * currently recommended" status above, more so until it's actually been on
+ * the bench.
+ *
+ * With three sets now selectable, `s_env_gdeq_use_aa_candidate`'s plain
+ * bool storage stopped being able to express "which one" - replaced with
+ * an `env_gdeq_variant_t` enum (`ENV_GDEQ_VARIANT_DEFAULT` = 0,
+ * `ENV_GDEQ_VARIANT_AA_CANDIDATE` = 1, `ENV_GDEQ_VARIANT_CANDIDATE_B` = 2),
+ * same style as `envelope_interp_curve_t`'s own enum (deliberately
+ * DEFAULT = 0, so a preset/struct field that zero-fills - see settings.h -
+ * lands on today's actual default, not a stale mid-project one). `'G'`
+ * (serial_commands.cpp) now CYCLES default -> a+A candidate -> candidate B
+ * -> default -> ..., same modulo-cycle convention 'C' (envelope_interp.h)
+ * and 'f' (adc_capture.h) already use, automatically skipping any variant
+ * this build never fitted (`envelope_gdeq_variant_available()`) rather
+ * than landing on a coefficient pair that was never fit for the active
+ * filter/Fs - same "never silently run with an unfit pair" discipline the
+ * old `ENV_GDEQ_HAS_AA_CANDIDATE` guard enforced, generalized to
+ * `ENV_GDEQ_HAS_CANDIDATE_B` for the new set. `envelope_gdeq_get_use_aa_
+ * candidate()`/`envelope_gdeq_set_use_aa_candidate()` are gone - every
+ * call site (serial_commands.cpp, ssb_mic_test.ino, settings.h's
+ * `PersistentSettings`) now reads/writes the enum instead.
  */
 
 #include <stdbool.h>
 #include "config.h"
 #include "ssb_dsp.h"
+
+// Which fitted gdeq coefficient set is active - see the header comment's
+// 2026-09-06 entry above for why this replaced a plain bool. Deliberately
+// an ordinary enum (not enum class) so it behaves like every other project
+// enum here (audio_source_t, envelope_interp_curve_t, adc_lpf_mode_t) -
+// usable directly as a PersistentSettings field, printable via a
+// name-lookup table, and safe to `% ENV_GDEQ_VARIANT_COUNT` for the 'G'
+// cycle. ENV_GDEQ_VARIANT_DEFAULT is deliberately value 0 - see
+// envelope_interp_curve_t's own comment in envelope_interp.h for why that
+// matters for struct zero-fill.
+typedef enum {
+    ENV_GDEQ_VARIANT_DEFAULT = 0,
+    ENV_GDEQ_VARIANT_AA_CANDIDATE = 1,
+    ENV_GDEQ_VARIANT_CANDIDATE_B = 2,
+    ENV_GDEQ_VARIANT_COUNT = 3
+} env_gdeq_variant_t;
 
 // Selected at compile time by SAMPLE_RATE_HZ AND ENV_FILTER_VARIANT
 // (config.h) - see the fitting results in the header comment above for why
@@ -345,6 +410,12 @@
 // filter/Fs - same "don't silently run with the wrong pair" discipline as
 // the #error guards below.
 #define ENV_GDEQ_HAS_AA_CANDIDATE 0
+// Same convention, for the 2026-09-06 "candidate B" set - see this file's
+// header comment and ENV_GDEQ_A1_CANDIDATE_B/ENV_GDEQ_A2_CANDIDATE_B below.
+// Kept as its own independent flag (not folded into ENV_GDEQ_HAS_AA_
+// CANDIDATE) so a future filter/Fs fit could have one set without the
+// other without misrepresenting which sets it actually has.
+#define ENV_GDEQ_HAS_CANDIDATE_B 0
 
 #if SAMPLE_RATE_HZ == 16000
   #if ENV_FILTER_VARIANT == ENV_FILTER_BC337
@@ -368,8 +439,8 @@
     // "2026-09-05" header entry for why that alternative is now
     // RUNTIME-selectable (`'G'`) rather than a separate compile-time
     // build. THIS pair (below) is what's active at boot and whenever
-    // envelope_gdeq_set_use_aa_candidate(false) is in effect - i.e. the
-    // default, recommended state.
+    // envelope_gdeq_set_variant(ENV_GDEQ_VARIANT_DEFAULT) is in effect -
+    // i.e. the default, recommended state.
     #define ENV_GDEQ_A1   0.026173f
     #define ENV_GDEQ_A2   0.236810f
     // For reference/history (NOT active) - 2026-09-01 LTspice-only fit,
@@ -394,12 +465,38 @@
     // flattening like the analog-alone fit above achieved, and NOT
     // uniform - see the header comment and group_delay_fit_notes.md's
     // trade-off table. Available at runtime via `'G'`
-    // (envelope_gdeq_set_use_aa_candidate()) ONLY for this filter/Fs -
-    // this is the only combination it's ever been fit for.
+    // (envelope_gdeq_set_variant(ENV_GDEQ_VARIANT_AA_CANDIDATE)) ONLY for
+    // this filter/Fs - this is the only combination it's ever been fit for.
     #define ENV_GDEQ_A1_AA_CANDIDATE  -0.139115f
     #define ENV_GDEQ_A2_AA_CANDIDATE  -0.139115f
     #undef  ENV_GDEQ_HAS_AA_CANDIDATE
     #define ENV_GDEQ_HAS_AA_CANDIDATE 1
+
+    // ---- "Candidate B" (2026-09-06 mid-band Pareto refit - see this
+    // file's header comment above in full) ---- Grid search
+    // ((a1,a2) in [-0.30,0.30]^2, 0.01 step) + Nelder-Mead polish, same
+    // discipline as every fit in this file, against the REAL measured
+    // bare (analog+shelf1+shelf2) curve from HiRes_aA_TF.txt - a genuine
+    // upgrade over the reconstructed curve the a+A candidate above was fit
+    // against. Objective: minimize the worst-case (max abs) local group-
+    // delay slope in 2800-4500Hz subject to a full-band (387-7547Hz) p-p
+    // budget, then take the point on the resulting Pareto envelope nearest
+    // a1=a2=+0.09. Result: full-band p-p 136.0us (vs. the a+A candidate's
+    // 105.2us and the default pair's 156.5us), local 2800-4500Hz max slope
+    // 28.1us/kHz (vs. the a+A candidate's 49.6us/kHz - WORSE than bare's
+    // own 36.8us/kHz - and the default pair's 26.1us/kHz). See
+    // group_delay_fit_notes.md's 2026-09-06 entry for the full derivation,
+    // the two-stage-differentiation methodology fix behind the local-slope
+    // metric, and the additive-model validation against real measured
+    // aAG3/aAg2 hardware data. Available at runtime via `'G'`
+    // (envelope_gdeq_set_variant()) ONLY for this filter/Fs - same
+    // restriction as the a+A candidate above, for the same reason (never
+    // fit anywhere else). NOT YET VALIDATED ON REAL HARDWARE AT ALL - see
+    // header comment.
+    #define ENV_GDEQ_A1_CANDIDATE_B  0.09f
+    #define ENV_GDEQ_A2_CANDIDATE_B  0.09f
+    #undef  ENV_GDEQ_HAS_CANDIDATE_B
+    #define ENV_GDEQ_HAS_CANDIDATE_B 1
   #else
     #error "ENV_GDEQ_A1/A2 have only been fitted for ENV_FILTER_BC337 or ENV_FILTER_PNP_BC327_ATTN at SAMPLE_RATE_HZ=16000 - see group_delay_fit_notes.md for the fitting method to add another"
   #endif
@@ -416,14 +513,24 @@
 
 // Fallback definition so envelope_gdeq.cpp compiles unconditionally (it
 // references ENV_GDEQ_A1_AA_CANDIDATE/A2 behind a runtime, not #if, check -
-// see envelope_gdeq_set_use_aa_candidate()) on filter/Fs combinations where
+// see envelope_gdeq_set_variant()) on filter/Fs combinations where
 // ENV_GDEQ_HAS_AA_CANDIDATE is 0. Never actually selected at runtime on
-// those builds - envelope_gdeq_set_use_aa_candidate() refuses to turn the
-// candidate on unless ENV_GDEQ_HAS_AA_CANDIDATE is 1 - so the specific
+// those builds - envelope_gdeq_set_variant() refuses to select the
+// candidate unless ENV_GDEQ_HAS_AA_CANDIDATE is 1 - so the specific
 // value here doesn't matter; same as the default pair keeps this a no-op.
 #ifndef ENV_GDEQ_A1_AA_CANDIDATE
   #define ENV_GDEQ_A1_AA_CANDIDATE ENV_GDEQ_A1
   #define ENV_GDEQ_A2_AA_CANDIDATE ENV_GDEQ_A2
+#endif
+
+// Same reasoning as the ENV_GDEQ_A1_AA_CANDIDATE fallback immediately
+// above, for the 2026-09-06 candidate B set - never actually selected at
+// runtime where ENV_GDEQ_HAS_CANDIDATE_B is 0
+// (envelope_gdeq_variant_available() gates it), so the fallback value
+// doesn't matter beyond letting this file compile unconditionally.
+#ifndef ENV_GDEQ_A1_CANDIDATE_B
+  #define ENV_GDEQ_A1_CANDIDATE_B ENV_GDEQ_A1
+  #define ENV_GDEQ_A2_CANDIDATE_B ENV_GDEQ_A2
 #endif
 
 // Zeroes both all-pass sections' state and initializes their coefficients
@@ -453,29 +560,45 @@ bool envelope_gdeq_get_enabled(void);
 // off->on reset logic only has to be correct in one place.
 void envelope_gdeq_set_enabled(bool enable);
 
-// Added 2026-09-05 - runtime toggle between the two fitted coefficient
-// pairs (default ENV_GDEQ_A1/A2 vs. the 'a'+'A'-specific
-// ENV_GDEQ_A1_AA_CANDIDATE/A2, see the header comment's 2026-09-05 entry
-// for the full real-hardware result: better close-in IMD, worse far-out
-// spectral splatter - a genuinely mixed result, NOT currently recommended
-// for routine use, which is exactly why this is a live 'G' toggle rather
-// than a silent default change). Returns which pair is currently selected
-// (false = default, true = candidate) - always false on a filter/Fs build
-// where ENV_GDEQ_HAS_AA_CANDIDATE is 0.
-bool envelope_gdeq_get_use_aa_candidate(void);
+// Added 2026-09-05 as a runtime toggle between two fitted coefficient
+// pairs; extended 2026-09-06 to a 3-way cycle (default / a+A candidate /
+// candidate B, `env_gdeq_variant_t` above) once a third set existed - see
+// this file's header comment for the full history and real-hardware
+// results of each. Returns which set is currently selected - always
+// ENV_GDEQ_VARIANT_DEFAULT on a filter/Fs build where the requested
+// variant was never fitted (see envelope_gdeq_variant_available() below).
+env_gdeq_variant_t envelope_gdeq_get_variant(void);
+
+// True if `variant` was actually fitted for the active filter/Fs
+// (ENV_FILTER_VARIANT + SAMPLE_RATE_HZ, config.h) - ENV_GDEQ_VARIANT_DEFAULT
+// is always true; ENV_GDEQ_VARIANT_AA_CANDIDATE/_CANDIDATE_B follow
+// ENV_GDEQ_HAS_AA_CANDIDATE/ENV_GDEQ_HAS_CANDIDATE_B above. Used by the
+// 'G' serial handler to skip over unfitted variants when cycling, rather
+// than landing on a coefficient pair that was never fit for this build -
+// same "never silently run with an unfit pair" discipline
+// envelope_gdeq_set_variant() itself also enforces.
+bool envelope_gdeq_variant_available(env_gdeq_variant_t variant);
+
+// Short, human-readable name for `variant`, for serial replies/banners -
+// includes each set's own coefficients and, for candidate B, a reminder
+// that it's a model prediction, not yet bench-validated (see the header
+// comment's 2026-09-06 entry).
+const char *envelope_gdeq_variant_name(env_gdeq_variant_t variant);
 
 // Selects which coefficient pair is active and re-initializes BOTH
 // sections with it via ssb_allpass1_init() (documented as cheap/safe from
 // task context, and it zeroes state as a side effect - same no-stale-x1/y1
 // reasoning as envelope_gdeq_set_enabled()'s off->on reset, so switching
 // live never glitches the next sample with a mismatched coefficient/state
-// pair). Requesting true (candidate) on a build where
-// ENV_GDEQ_HAS_AA_CANDIDATE is 0 is a no-op - stays on the default pair,
-// since that build never fitted a candidate for its filter/Fs combination.
-// After switching, re-tune '['/']' - the bench-confirmed optimum differs
-// by about 1 sample (2 vs. 2.83 @ 16000Hz for the g+a+A config), NOT the
-// smaller shift the two pairs' theoretical mean delays alone would suggest
-// (see envelope_gdeq.h's header comment and group_delay_fit_notes.md for
-// why - it's a local-group-delay-at-the-tone-frequencies effect, not a
-// mean-delay one).
-void envelope_gdeq_set_use_aa_candidate(bool use_candidate);
+// pair). Requesting a variant that envelope_gdeq_variant_available() says
+// isn't fitted for this build falls back to ENV_GDEQ_VARIANT_DEFAULT
+// instead - same "don't silently run with an unfit pair" discipline as
+// before, generalized from the old two-state toggle. After switching,
+// re-tune '['/']' - the bench-confirmed optimum for the a+A candidate
+// differs by about 1 sample from the default pair's (2 vs. 2.83 @ 16000Hz
+// for the g+a+A config), NOT the smaller shift the pairs' theoretical mean
+// delays alone would suggest (see envelope_gdeq.h's header comment and
+// group_delay_fit_notes.md for why - it's a local-group-delay-at-the-tone-
+// frequencies effect, not a mean-delay one); candidate B hasn't been
+// bench-tuned at all yet, so '['/']' will need finding from scratch there.
+void envelope_gdeq_set_variant(env_gdeq_variant_t variant);

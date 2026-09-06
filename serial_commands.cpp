@@ -228,7 +228,7 @@ void handle_serial_commands(void)
                           CHIRP_MUTE_SEC * 1000.0f,
                           CHIRP_REF_GPIO, ENVELOPE_INTERP_FACTOR,
                           envelope_gdeq_get_enabled() ? "ON" : "OFF",
-                          envelope_gdeq_get_use_aa_candidate() ? "a+A candidate" : "default",
+                          envelope_gdeq_variant_name(envelope_gdeq_get_variant()),
                           envelope_ampeq_get_enabled() ? "ON" : "OFF",
                           envelope_ampeq_shelf2_get_enabled() ? "ON" : "OFF");
         } else if (c == 'T') {
@@ -347,33 +347,60 @@ void handle_serial_commands(void)
                                    "unrefit-gdeq state (see envelope_ampeq.h / group_delay_fit_notes.md) "
                                    "- re-run 'w' chirp/TFA to check the current combined response" : "");
         } else if (c == 'G') {
-            // Runtime toggle between the two fitted gdeq coefficient pairs -
-            // added 2026-09-05 after the a+A candidate's real-hardware
-            // result turned out to be a genuinely mixed one (better
-            // close-in two-tone IMD, worse far-out intermodulation forest -
-            // see envelope_gdeq.h's 2026-09-05 header entry and
-            // group_delay_fit_notes.md for the full derivation), which
-            // makes a live A/B toggle far more useful than the old
-            // compile-time-only ENV_GDEQ_USE_AA_CANDIDATE flag this
-            // replaces. Only meaningful on ENV_FILTER_PNP_BC327_ATTN @
-            // SAMPLE_RATE_HZ=16000 (ENV_GDEQ_HAS_AA_CANDIDATE) - the only
-            // filter/Fs this candidate has ever been fit for.
-#if ENV_GDEQ_HAS_AA_CANDIDATE
-            bool now_candidate = !envelope_gdeq_get_use_aa_candidate();
-            envelope_gdeq_set_use_aa_candidate(now_candidate);   // re-inits both sections' coefficients + state
-            serial_reply("-> gdeq coefficients: %s%s\r\n",
-                          now_candidate ? "a+A CANDIDATE (a1=a2=-0.139115)" : "DEFAULT (a1=0.026173, a2=0.236810)",
-                          now_candidate ? " - 2026-09-05: better close-in two-tone IMD (3rd-11th order), "
-                                          "but a much larger far-out intermodulation forest 4-16kHz from "
-                                          "carrier, +11 to +19dB vs. default - a genuinely mixed result, "
-                                          "not currently recommended for routine use (see envelope_gdeq.h). "
-                                          "Re-tune '['/']' - bench optimum 2.83 samples here vs. 2 samples "
-                                          "for the default pair (g+a+A config)." : " - re-tune '['/']' back "
-                                          "toward the default's own bench optimum (2 samples, g+a+A config).");
-#else
-            serial_reply("-> 'G' has no effect on this build - the a+A candidate was only ever fit for "
-                          "ENV_FILTER_PNP_BC327_ATTN @ SAMPLE_RATE_HZ=16000 (see envelope_gdeq.h)\r\n");
-#endif
+            // Runtime CYCLE between the fitted gdeq coefficient sets -
+            // added 2026-09-05 as a plain two-way toggle after the a+A
+            // candidate's real-hardware result turned out to be a
+            // genuinely mixed one (better close-in two-tone IMD, worse
+            // far-out intermodulation forest - see envelope_gdeq.h's
+            // 2026-09-05 header entry and group_delay_fit_notes.md for the
+            // full derivation); extended 2026-09-06 to a 3-way cycle (same
+            // modulo-cycle convention 'C'/'f' already use) when the
+            // mid-band local-slope-vs-p-p Pareto refit proposed a third
+            // set, "candidate B" - see envelope_gdeq.h's matching header
+            // entry. Skips over any variant this build never fitted
+            // (envelope_gdeq_variant_available()) rather than landing on a
+            // coefficient pair that was never fit for the active
+            // filter/Fs - generalizes the old ENV_GDEQ_HAS_AA_CANDIDATE-
+            // only compile-time guard this replaces, so no #if is needed
+            // here any more.
+            env_gdeq_variant_t cur_variant = envelope_gdeq_get_variant();
+            env_gdeq_variant_t next_variant = cur_variant;
+            for (int tries = 0; tries < ENV_GDEQ_VARIANT_COUNT; tries++) {
+                next_variant = (env_gdeq_variant_t)((next_variant + 1) % ENV_GDEQ_VARIANT_COUNT);
+                if (envelope_gdeq_variant_available(next_variant)) {
+                    break;
+                }
+            }
+            if (next_variant == cur_variant) {
+                // Only ENV_GDEQ_VARIANT_DEFAULT is fitted on this build -
+                // the loop above wrapped all the way back around without
+                // finding anything else available.
+                serial_reply("-> 'G' has no effect on this build - no gdeq candidate sets are fitted "
+                              "for the active filter/Fs beyond the default pair (see envelope_gdeq.h)\r\n");
+            } else {
+                envelope_gdeq_set_variant(next_variant);   // re-inits both sections' coefficients + state
+                const char *caveat;
+                if (next_variant == ENV_GDEQ_VARIANT_AA_CANDIDATE) {
+                    caveat = " - 2026-09-05: better close-in two-tone IMD (3rd-11th order), but a much "
+                             "larger far-out intermodulation forest 4-16kHz from carrier, +11 to +19dB "
+                             "vs. default - a genuinely mixed result, not currently recommended for "
+                             "routine use (see envelope_gdeq.h). Re-tune '['/']' - bench optimum 2.83 "
+                             "samples here vs. 2 samples for the default pair (g+a+A config).";
+                } else if (next_variant == ENV_GDEQ_VARIANT_CANDIDATE_B) {
+                    caveat = " - 2026-09-06: MODEL PREDICTION ONLY, NOT YET BENCH-VALIDATED. Proposed to "
+                             "fix the a+A candidate's 2800-4500Hz local group-delay slope, which the "
+                             "mid-band Pareto refit found is actually WORSE than gdeq off entirely "
+                             "(49.6 vs. bare's 36.8us/kHz) - candidate B predicts 28.1us/kHz there "
+                             "(full-band p-p 136.0us, vs. the a+A candidate's 105.2us) - see "
+                             "group_delay_fit_notes.md's 2026-09-06 entry. Needs a real TFA sweep and "
+                             "two-tone spur-forest A/B before being trusted. Re-tune '['/']' from "
+                             "scratch - no bench optimum found yet for this set.";
+                } else {
+                    caveat = " - re-tune '['/']' back toward the default's own bench optimum "
+                             "(2 samples, g+a+A config).";
+                }
+                serial_reply("-> gdeq coefficients: %s%s\r\n", envelope_gdeq_variant_name(next_variant), caveat);
+            }
         } else if (c == 'D') {
             bool now_on = !envelope_predistort_get_enabled();
             envelope_predistort_set_enabled(now_on);
@@ -629,13 +656,21 @@ void handle_serial_commands(void)
             // active; current project recommendation is "false" (shelf 1
             // only) until gdeq is refit.
             //
-            // env_gdeq_use_aa_candidate ('G', envelope_gdeq.h) is the
-            // newest trailing field, added 2026-09-05 when the a+A
-            // candidate gdeq fit became a live runtime toggle. 2026-09-05
-            // real-hardware result: better close-in two-tone IMD, but a
-            // much larger far-out intermodulation forest - a mixed result,
-            // NOT currently recommended, so pasting "true" here is a
-            // deliberate bench-testing choice, not this project's default.
+            // env_gdeq_variant ('G', envelope_gdeq.h) is the newest
+            // trailing field - added 2026-09-05 as a bool (env_gdeq_use_
+            // aa_candidate) when the a+A candidate gdeq fit became a live
+            // runtime toggle, migrated 2026-09-06 to this 3-state enum
+            // when "candidate B" made a second alternative set exist.
+            // Prints as the enum constant name (ENV_GDEQ_VARIANT_DEFAULT/
+            // _AA_CANDIDATE/_CANDIDATE_B), same convention as adc_lpf_mode/
+            // envelope_interp_curve above, so the pasted line compiles
+            // directly. 2026-09-05 real-hardware result for the a+A
+            // candidate: better close-in two-tone IMD, but a much larger
+            // far-out intermodulation forest - a mixed result, NOT
+            // currently recommended. Candidate B (2026-09-06) is a MODEL
+            // PREDICTION ONLY, not yet bench-validated at all. Pasting
+            // either non-default constant here is a deliberate
+            // bench-testing choice, not this project's default.
 #if AD9851_ATTACHED
             float rel_delay = relative_delay_get_samples();
             bool rf_enabled = carrier_output_get_rf_enabled();
@@ -670,6 +705,13 @@ void handle_serial_commands(void)
                 "ENVELOPE_INTERP_CURVE_CATMULL_ROM", "ENVELOPE_INTERP_CURVE_LINEAR",
                 "ENVELOPE_INTERP_CURVE_HOLD"
             };
+            // env_gdeq_variant prints as the enum constant name, same
+            // convention as adc_lpf_mode/envelope_interp_curve above - see
+            // this function's header comment's env_gdeq_variant note.
+            static const char *k_gdeq_variant_enum_name[ENV_GDEQ_VARIANT_COUNT] = {
+                "ENV_GDEQ_VARIANT_DEFAULT", "ENV_GDEQ_VARIANT_AA_CANDIDATE",
+                "ENV_GDEQ_VARIANT_CANDIDATE_B"
+            };
             serial_reply("-> settings line (paste into settingsPresets[] in settings.h, then rename \"Live\"):\r\n");
             serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s, %s, %s, %s, %s },\r\n",
                           audio_source_enum_name(dsp_state_get_audio_source()),
@@ -689,7 +731,7 @@ void handle_serial_commands(void)
                           k_interp_curve_enum_name[envelope_interp_get_curve()],
                           envelope_ampeq_get_enabled() ? "true" : "false",
                           envelope_ampeq_shelf2_get_enabled() ? "true" : "false",
-                          envelope_gdeq_get_use_aa_candidate() ? "true" : "false");
+                          k_gdeq_variant_enum_name[envelope_gdeq_get_variant()]);
         } else if (c >= '0' && c <= '9') {
             int preset = c - '0';
             const PersistentSettings& p = settingsPresets[preset];
@@ -757,12 +799,13 @@ void handle_serial_commands(void)
             envelope_ampeq_shelf2_set_enabled(p.env_ampeq_shelf2_enable);
 
             // Same reset-on-change reasoning as the 'G' handler - shared
-            // via envelope_gdeq_set_use_aa_candidate() itself, so a preset
-            // switching which coefficient pair is active also gets a clean
-            // filter-state reset, not just when toggled live. A no-op on
-            // any build where ENV_GDEQ_HAS_AA_CANDIDATE is 0 (see
-            // envelope_gdeq.h) - safe to call unconditionally either way.
-            envelope_gdeq_set_use_aa_candidate(p.env_gdeq_use_aa_candidate);
+            // via envelope_gdeq_set_variant() itself, so a preset
+            // switching which coefficient set is active also gets a clean
+            // filter-state reset, not just when toggled live. Falls back
+            // to ENV_GDEQ_VARIANT_DEFAULT on any build where the preset's
+            // requested variant wasn't fitted (see envelope_gdeq.h) - safe
+            // to call unconditionally either way.
+            envelope_gdeq_set_variant(p.env_gdeq_variant);
 
             serial_reply("-> preset %d: %s\r\n", preset, p.name);
         }

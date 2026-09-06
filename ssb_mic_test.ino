@@ -914,13 +914,16 @@ void setup()
     Serial.printf("Send 'g' to toggle the envelope group-delay equalizer (currently %s, %s coefficients) - "
                   "real-hardware validated for group delay; re-tune '['/']' from scratch after enabling.\r\n",
                   envelope_gdeq_get_enabled() ? "ON" : "off",
-                  envelope_gdeq_get_use_aa_candidate() ? "a+A candidate" : "default");
-#if ENV_GDEQ_HAS_AA_CANDIDATE
-    Serial.printf("Send 'G' to switch gdeq coefficients (currently %s) between the default pair and the "
-                  "'a'+'A'-specific candidate - 2026-09-05: candidate gives better close-in two-tone IMD "
-                  "but a much larger far-out intermodulation forest (see envelope_gdeq.h), a mixed result, "
-                  "not currently recommended for routine use. Re-tune '['/']' after switching.\r\n",
-                  envelope_gdeq_get_use_aa_candidate() ? "a+A candidate" : "default");
+                  envelope_gdeq_variant_name(envelope_gdeq_get_variant()));
+#if ENV_GDEQ_HAS_AA_CANDIDATE || ENV_GDEQ_HAS_CANDIDATE_B
+    Serial.printf("Send 'G' to cycle gdeq coefficients (currently %s) through default -> a+A candidate -> "
+                  "candidate B -> ... - 2026-09-05: the a+A candidate gives better close-in two-tone IMD "
+                  "but a much larger far-out intermodulation forest, a mixed result, not currently "
+                  "recommended for routine use; 2026-09-06: candidate B targets that far-out forest's "
+                  "likely cause (a worse-than-bare 2800-4500Hz local group-delay slope) but is a MODEL "
+                  "PREDICTION ONLY, not yet bench-validated (see envelope_gdeq.h / "
+                  "group_delay_fit_notes.md). Re-tune '['/']' after switching.\r\n",
+                  envelope_gdeq_variant_name(envelope_gdeq_get_variant()));
 #endif
     Serial.printf("Send 'D' to toggle envelope pre-distortion (currently %s) - measured-curve lookup "
                   "table that REPLACES the 'u'/'j'/'i'/'k' linear offset/scale mapping while on, "

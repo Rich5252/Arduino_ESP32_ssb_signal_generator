@@ -5,6 +5,7 @@
 #include "adc_capture.h"   // adc_lpf_mode_t
 #include "ssb_dsp.h"        // SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ
 #include "envelope_interp.h"  // envelope_interp_curve_t
+#include "envelope_gdeq.h"    // env_gdeq_variant_t
 
 
 // Runtime switch between test signals and live mic input, toggled from
@@ -157,15 +158,34 @@ typedef struct
     // compile-time-only flag - real-hardware testing that same day found
     // it a genuinely mixed result (better close-in two-tone IMD, worse
     // far-out intermodulation forest - see envelope_gdeq.h's 2026-09-05
-    // header entry and group_delay_fit_notes.md), so it stays off by
+    // header entry and group_delay_fit_notes.md), so it stayed off by
     // default here too, same convention as every trailing field above.
-    // Appended at the END - existing presets' positional initializers
-    // zero-fill this to false (default gdeq coefficients). Only takes
-    // effect on ENV_FILTER_PNP_BC327_ATTN @ SAMPLE_RATE_HZ=16000
-    // (envelope_gdeq_set_use_aa_candidate() ignores it otherwise, so a
-    // preset pasted from a different filter/Fs build won't silently apply
-    // a coefficient pair that was never fit for the active build).
-    bool env_gdeq_use_aa_candidate;  // 'G' - envelope_gdeq.h, off by default
+    //
+    // 2026-09-06: migrated from that plain bool (toggle between the
+    // default pair and the a+A candidate only) to this 3-state enum - the
+    // same kind of migration adc_lpf_mode went through above when the
+    // Chebyshev filter option was added. None of the 10 presets below ever
+    // set this field explicitly (all relied on zero-fill), and
+    // ENV_GDEQ_VARIANT_DEFAULT is deliberately value 0 (envelope_gdeq.h),
+    // so this was a purely mechanical false->ENV_GDEQ_VARIANT_DEFAULT
+    // migration with zero behavior change to any preset below. Needed to
+    // support "candidate B" (a1=a2=+0.09) - a third selectable set
+    // proposed by the mid-band local-slope-vs-p-p Pareto refit
+    // (group_delay_fit_notes.md's 2026-09-06 entry) after that search
+    // found the a+A candidate actually makes local 2800-4500Hz group-delay
+    // slope WORSE than gdeq off entirely. 'G' now CYCLES default -> a+A
+    // candidate -> candidate B -> default -> ... (same modulo-cycle
+    // convention as 'C'/'f'), skipping any set this build never fitted.
+    // Only takes effect on ENV_FILTER_PNP_BC327_ATTN @ SAMPLE_RATE_HZ=16000
+    // (envelope_gdeq_set_variant() falls back to ENV_GDEQ_VARIANT_DEFAULT
+    // otherwise, so a preset pasted from a different filter/Fs build won't
+    // silently apply a coefficient pair that was never fit for the active
+    // build). Candidate B is a MODEL PREDICTION ONLY as of 2026-09-06 - not
+    // yet bench-validated - so pasting ENV_GDEQ_VARIANT_CANDIDATE_B here is
+    // a deliberate bench-testing choice, not any kind of default.
+    env_gdeq_variant_t env_gdeq_variant;  // 'G' - envelope_gdeq.h, default by default
+
+
 
 } PersistentSettings;
 
@@ -228,12 +248,12 @@ AUDIO_SRC_TWOTONE, 0.00f, 0.20f, 0.90f, false, ADC_LPF_MODE_OFF, false, false, -
 SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM },
 
 // Preset 2 - Single-tone test
- { "Shelf2 Baseline pre grp adj#3", AUDIO_SRC_TWOTONE, 2.00f, 0.20f, 0.90f, true, ADC_LPF_MODE_OFF, false, false, -1.4f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, true, true },
+ { "Shelf2 Baseline pre grp adj#3", AUDIO_SRC_TWOTONE, 2.00f, 0.20f, 0.90f, true, ADC_LPF_MODE_OFF, false, false, -1.4f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, true, true, ENV_GDEQ_VARIANT_DEFAULT },
 
-// Preset 3 - Envelope / PWM test
-    { "BesselNoGD", AUDIO_SRC_TWOTONE, -0.96f, 0.00f, 0.90f, false, ADC_LPF_MODE_OFF, false, false, 2.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM },  // was -0.60f @ 10000Hz; adc_lpf_bypass=true
-
-    // relative_delay_samples
+ // Preset 3 - Envelope / PWM test
+ { "Shelf2 Baseline pre grp adj#4", AUDIO_SRC_TWOTONE, 2.00f, 0.20f, 0.90f, true, ADC_LPF_MODE_OFF, false, false, -1.4f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, true, true,  ENV_GDEQ_VARIANT_CANDIDATE_B },
+    
+ // relative_delay_samples
    // env_pwm_offset
    // env_pwm_scale
     // env_gdeq_enable
