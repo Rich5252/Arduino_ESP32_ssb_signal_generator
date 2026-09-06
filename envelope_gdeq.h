@@ -352,6 +352,25 @@
  * currently recommended" status above, more so until it's actually been on
  * the bench.
  *
+ * ---- UPDATE, 2026-09-06 (same day, later still): bench-tested ----
+ * `HiRes_aAG4_TF.txt` (real TFA sweep) confirms the group-delay prediction
+ * above on real hardware - measured full-band p-p and the 2800-4500Hz local
+ * slope both track the model closely, and the local slope measurement
+ * actually BEATS its own prediction (22.6 vs. predicted 28.1us/kHz).
+ * However, the real two-tone IMD improvement this candidate delivers is
+ * small and delay-tuning-dependent: both this set and the default pair need
+ * their `'['`/`']'` relative delay chosen from within a narrow 2.00-2.10
+ * sample "compromise window" (different IMD orders trade off against each
+ * other inside it, rather than one clean unambiguous optimum existing) -
+ * this is what motivated adding the finer `';'`/`'''` delay step (see
+ * relative_delay.h, `DELAY_FINE_STEP_SAMPLES`). Net: the paragraph above
+ * ("not yet bench-validated") is superseded for the group-delay claim
+ * specifically - candidate B's flattening is real - but the *IMD* result is
+ * still NOT a clean win, echoing the a+A candidate's own mixed result above.
+ * See group_delay_fit_notes.md's 2026-09-06 entries for the full cross-check
+ * (correlation/RMS against measured vs. predicted) and the delay-sweep
+ * detail behind the "small and delay-dependent" characterization.
+ *
  * With three sets now selectable, `s_env_gdeq_use_aa_candidate`'s plain
  * bool storage stopped being able to express "which one" - replaced with
  * an `env_gdeq_variant_t` enum (`ENV_GDEQ_VARIANT_DEFAULT` = 0,
@@ -491,8 +510,11 @@ typedef enum {
     // aAG3/aAg2 hardware data. Available at runtime via `'G'`
     // (envelope_gdeq_set_variant()) ONLY for this filter/Fs - same
     // restriction as the a+A candidate above, for the same reason (never
-    // fit anywhere else). NOT YET VALIDATED ON REAL HARDWARE AT ALL - see
-    // header comment.
+    // fit anywhere else). Group delay bench-VALIDATED 2026-09-06 (same day,
+    // later still, HiRes_aAG4_TF.txt) - real IMD result is small and
+    // delay-tuning-dependent, though - see the header comment's "UPDATE,
+    // 2026-09-06" entry above, which supersedes the "NOT YET VALIDATED ON
+    // REAL HARDWARE AT ALL" this comment used to end with.
     #define ENV_GDEQ_A1_CANDIDATE_B  0.09f
     #define ENV_GDEQ_A2_CANDIDATE_B  0.09f
     #undef  ENV_GDEQ_HAS_CANDIDATE_B

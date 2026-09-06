@@ -410,14 +410,25 @@ void handle_serial_commands(void)
                              "routine use (see envelope_gdeq.h). Re-tune '['/']' - bench optimum 2.83 "
                              "samples here vs. 2 samples for the default pair (g+a+A config).";
                 } else if (next_variant == ENV_GDEQ_VARIANT_CANDIDATE_B) {
-                    caveat = " - 2026-09-06: MODEL PREDICTION ONLY, NOT YET BENCH-VALIDATED. Proposed to "
-                             "fix the a+A candidate's 2800-4500Hz local group-delay slope, which the "
-                             "mid-band Pareto refit found is actually WORSE than gdeq off entirely "
-                             "(49.6 vs. bare's 36.8us/kHz) - candidate B predicts 28.1us/kHz there "
-                             "(full-band p-p 136.0us, vs. the a+A candidate's 105.2us) - see "
-                             "group_delay_fit_notes.md's 2026-09-06 entry. Needs a real TFA sweep and "
-                             "two-tone spur-forest A/B before being trusted. Re-tune '['/']' from "
-                             "scratch - no bench optimum found yet for this set.";
+                    // Shortened + updated 2026-09-06 (same day, later still) -
+                    // the original wording here (still "MODEL PREDICTION
+                    // ONLY, NOT YET BENCH-VALIDATED... no bench optimum found
+                    // yet") went stale within hours once the real
+                    // HiRes_aAG4_TF.txt bench test came back, AND at 537
+                    // bytes it combined with the ~46-byte variant name to
+                    // overflow serial_reply()'s 512-byte buffer (607 bytes
+                    // needed) - the "[serial_reply] WARNING: reply
+                    // truncated" the user saw on real hardware. Replaced
+                    // with the actual bench result instead, kept well under
+                    // budget (see group_delay_fit_notes.md's matching entry
+                    // for the full derivation - cross-checks, correlation/
+                    // RMS numbers, etc).
+                    caveat = " - 2026-09-06 bench test (HiRes_aAG4_TF.txt): group delay CONFIRMED on "
+                             "real hardware (beats its own prediction in the 2800-4500Hz band), but "
+                             "two-tone IMD gain is small and delay-tuning-dependent - both this and "
+                             "the default pair need '['/']'/';'/apostrophe tuned within a 2.00-2.10 "
+                             "sample compromise window (IMD orders trade off inside it). See "
+                             "group_delay_fit_notes.md.";
                 } else {
                     caveat = " - re-tune '['/']' back toward the default's own bench optimum "
                              "(2 samples, g+a+A config).";

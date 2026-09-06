@@ -93,7 +93,21 @@ const char *envelope_gdeq_variant_name(env_gdeq_variant_t variant)
         case ENV_GDEQ_VARIANT_AA_CANDIDATE:
             return "a+A candidate (a1=a2=-0.139115)";
         case ENV_GDEQ_VARIANT_CANDIDATE_B:
-            return "candidate B (a1=a2=+0.09, NOT bench-validated)";
+            // Shortened 2026-09-06 (same day, later) - the original name
+            // baked in "NOT bench-validated", which (a) went stale within
+            // hours once the HiRes_aAG4_TF.txt bench test came back, and
+            // (b) combined with the 'G' handler's full caveat string to
+            // overflow serial_reply()'s 512-byte buffer (607 bytes total,
+            // silently... well, now visibly, since 2026-09-02, truncated
+            // with a "[serial_reply] WARNING" - real hardware confirmed).
+            // Status/caveat text now lives ONLY in the 'G' handler's
+            // caveat string below (serial_commands.cpp) and the header
+            // comment above, so it only has to be updated in one place as
+            // the bench-test status evolves, instead of also being
+            // baked into this name (which is also used by the much
+            // shorter 'w'/boot-banner replies, where a long status clause
+            // isn't wanted anyway).
+            return "candidate B (a1=a2=+0.09)";
         case ENV_GDEQ_VARIANT_DEFAULT:
         default:
             return "default (a1=0.026173, a2=0.236810)";

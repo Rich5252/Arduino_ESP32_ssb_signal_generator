@@ -917,13 +917,22 @@ void setup()
                   envelope_gdeq_get_enabled() ? "ON" : "off",
                   envelope_gdeq_variant_name(envelope_gdeq_get_variant()));
 #if ENV_GDEQ_HAS_AA_CANDIDATE || ENV_GDEQ_HAS_CANDIDATE_B
+    // Updated 2026-09-06 (same day, later still) - this used to say candidate
+    // B was "a MODEL PREDICTION ONLY, not yet bench-validated", which went
+    // stale within hours once the real HiRes_aAG4_TF.txt bench test came
+    // back (group delay confirmed; IMD gain small/delay-dependent - see
+    // envelope_gdeq.h's matching header entry and group_delay_fit_notes.md).
+    // Also trimmed overall - this Serial.printf() doesn't go through
+    // serial_reply()'s length guard, but the 'G' handler's own reply
+    // (serial_commands.cpp) DID overflow that guard's 512-byte buffer with
+    // wording this long, so shortening both together rather than risking
+    // the same mistake here.
     Serial.printf("Send 'G' to cycle gdeq coefficients (currently %s) through default -> a+A candidate -> "
-                  "candidate B -> ... - 2026-09-05: the a+A candidate gives better close-in two-tone IMD "
-                  "but a much larger far-out intermodulation forest, a mixed result, not currently "
-                  "recommended for routine use; 2026-09-06: candidate B targets that far-out forest's "
-                  "likely cause (a worse-than-bare 2800-4500Hz local group-delay slope) but is a MODEL "
-                  "PREDICTION ONLY, not yet bench-validated (see envelope_gdeq.h / "
-                  "group_delay_fit_notes.md). Re-tune '['/']' after switching.\r\n",
+                  "candidate B -> ... - a+A: better close-in two-tone IMD but a much larger far-out "
+                  "intermodulation forest, not currently recommended; candidate B: group delay CONFIRMED "
+                  "on real hardware, but real IMD gain is small and delay-tuning-dependent (see "
+                  "envelope_gdeq.h / group_delay_fit_notes.md). Re-tune '['/']'/';'/apostrophe after "
+                  "switching.\r\n",
                   envelope_gdeq_variant_name(envelope_gdeq_get_variant()));
 #endif
     Serial.printf("Send 'D' to toggle envelope pre-distortion (currently %s) - measured-curve lookup "
