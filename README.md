@@ -6,6 +6,8 @@ The DDS will be used to both phase and amplitude modulate (see Analog Devices Ap
 
 The ESP32's on board ADC will be used to capture the microphone input.
 
+Because I hope to adapt this to reuse my TXlink TX project (ie add SSB to TXlink) I've chosen to use the Arduino IDE.
+
 The project will fully document progress with the wins and failures explained along the way.
 
-I make no apology for getting the help of Claud AI on this work.
+I make no apology for getting the help of Claude AI on this work.
