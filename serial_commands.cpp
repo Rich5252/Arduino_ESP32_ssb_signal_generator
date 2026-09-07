@@ -579,6 +579,13 @@ void handle_serial_commands(void)
             serial_reply("-> null_bias threshold=%.2f (see '[dsp] null_bias' diagnostic line)\r\n", thr);
         } else if (c == 'v') {
             diagnostics_toggle_muted();
+        } else if (c == 'V') {
+            // On-demand snapshot - see diagnostics_print_now()'s own
+            // comment for why this exists (the periodic 1Hz block is
+            // awkward to catch on purpose, and prints nothing at all
+            // while muted by design). Deliberately does NOT require
+            // unmuting first.
+            diagnostics_print_now();
         } else if (c == 'r') {
             // Resets every diagnostic counter/watermark for a clean
             // measurement window, without needing a full reflash. Useful

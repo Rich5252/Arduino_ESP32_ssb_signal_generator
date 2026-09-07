@@ -116,3 +116,13 @@ void diagnostics_toggle_muted(void);
 // flag - exactly the two timed blocks the original loop() had inline,
 // just moved here so loop() doesn't need its own timing-gate statics.
 void diagnostics_service(void);
+
+// Prints one status line + one [timing]/[adc]/[dsp] block immediately,
+// ignoring both the mute flag and the 45ms/1000ms throttle intervals -
+// 'V' (see serial_commands.cpp) wires this to a keystroke. For grabbing
+// an exact reading on demand (e.g. right after toggling something, or
+// right after un-muting from a deliberately-silent measurement window)
+// instead of waiting for/scrolling through the periodic stream. Doesn't
+// reset any counters and doesn't disturb diagnostics_service()'s own
+// independent timing - purely an extra read.
+void diagnostics_print_now(void);

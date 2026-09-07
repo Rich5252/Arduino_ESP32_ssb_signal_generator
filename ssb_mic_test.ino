@@ -866,7 +866,7 @@ void setup()
              AD9851_ATTACHED ? "attached" : "not attached (stubbed)",
              MCP4725_I2C_ADDR,
              PWM_COMPARISON_ENABLED ? "on" : "off");
-    Serial.println("Send 't' for two-tone test signal, 's' for single-tone test signal, 'm' for live mic input, 'p' for envelope step test, 'y' for FM isolation test, 'h' for AM isolation test, 'f' to cycle the ADC LPF off/Butterworth/Chebyshev, 'r' to reset diagnostics, 'v' to mute periodic diagnostics, 'n' to cycle the null_bias diagnostic's envelope threshold (see '[dsp] null_bias' line).");
+    Serial.println("Send 't' for two-tone test signal, 's' for single-tone test signal, 'm' for live mic input, 'p' for envelope step test, 'y' for FM isolation test, 'h' for AM isolation test, 'f' to cycle the ADC LPF off/Butterworth/Chebyshev, 'r' to reset diagnostics, 'v' to mute periodic diagnostics, 'V' to print one on-demand [timing]/[adc]/[dsp] snapshot right now (works even while muted, doesn't reset counters), 'n' to cycle the null_bias diagnostic's envelope threshold (see '[dsp] null_bias' line).");
 #if CHIRP_BIDIRECTIONAL
     float chirp_banner_total_sec = 2.0f * CHIRP_SWEEP_SEC;
     const char *chirp_banner_shape = "up+down";

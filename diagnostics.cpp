@@ -677,3 +677,25 @@ void diagnostics_service(void)
         if (diagblock_us > s_dbg_max_diag_block_us) s_dbg_max_diag_block_us = diagblock_us;
     }
 }
+
+// 2026-09-07: on-demand snapshot, added because the periodic block above
+// is genuinely awkward to catch on purpose - it only fires once a
+// second, and while `'v'` is muted it doesn't print at all (by design -
+// see diagnostics_toggle_muted()'s own comment). That made a clean A/B
+// (e.g. "mute, wait 10s so nothing prints, then read what accumulated
+// during the silence") unnecessarily fiddly: un-muting resumes the
+// ongoing 1Hz stream rather than giving one clean read exactly when
+// asked for. This bypasses BOTH gates - prints once, immediately, on
+// request, whether muted or not, without touching last_print_ms/
+// last_timing_print_ms (so it doesn't perturb the periodic block's own
+// independent schedule either). Deliberately does NOT reset any
+// counters - it's a read, not a `'r'`. Still goes through print_status_
+// line()/print_timing_and_adc_block()'s own diag_room_for() guards
+// internally, so it can't block waiting on the TX buffer any more than
+// the periodic path could.
+void diagnostics_print_now(void)
+{
+    Serial.printf("-> on-demand diagnostic snapshot (ignores mute/throttle, doesn't reset counters):\r\n");
+    print_status_line();
+    print_timing_and_adc_block(millis());
+}
