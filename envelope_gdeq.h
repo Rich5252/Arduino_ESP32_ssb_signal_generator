@@ -322,6 +322,19 @@
  * via 'g', off by default so existing tuning isn't disturbed until
  * deliberately opted into.
  *
+ * ---- UPDATE, 2026-09-07: the asymmetry above is NOT currently
+ * reproducible ---- Re-ran AMTEST ('h'): "AM test now seems well behaved
+ * and symmetric IMDs go up and down with modulation level in a sensible
+ * looking way, only getting large (-40) towards 100% modulation" (user) -
+ * the textbook-expected pattern for a clean AM path, not the asymmetric
+ * fc+/-2400Hz signature this paragraph describes. This paragraph is kept
+ * as-is (not edited/deleted) per this project's own convention, but the
+ * "current top-priority open item" characterization is superseded - see
+ * group_delay_fit_notes.md's 2026-09-07 entry for the full writeup,
+ * including why this narrows (does not close) the still-open "what's
+ * really limiting real IMD beyond group delay" question from the
+ * 2026-09-05/09-06 entries above.
+ *
  * ---- 2026-09-06: a THIRD coefficient set ("candidate B"), and 'G' becomes
  * a 3-way CYCLE instead of a 2-way toggle ---- The mid-band local-slope-
  * vs-p-p Pareto refit (group_delay_fit_notes.md, redone against the real,
