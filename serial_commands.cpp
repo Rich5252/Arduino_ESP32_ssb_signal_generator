@@ -138,6 +138,75 @@ static const char *audio_source_enum_name(audio_source_t src)
 // override's on/off state, not the stepping value itself.
 static uint32_t s_duty_override_value = 0;
 
+// Added 2026-09-07 alongside 'E' - see duty_override_write_and_reply()'s
+// own comment for the full rationale. false (default) = original 'd'
+// behavior unchanged (s_duty_override_value IS the raw duty count,
+// bypassing envelope_predistort/pwm_offset/pwm_scale entirely - this is
+// what built envelope_predistort's LUT in the first place, REVISION 4/5,
+// envelope_predistort.h, and stays available for re-characterizing that
+// raw curve). true = s_duty_override_value is instead treated as a
+// commanded envelope index, run through the SAME mapping dsp_task's
+// normal per-tick path uses, so 'D' (predistort) actually has something
+// to act on during a duty-style up/down sweep.
+static bool s_duty_override_use_envelope_mapping = false;
+
+// Shared by 'd' (on-enable) and '>'/'<'/'N'/'B' - computes and writes the
+// actual RSET duty for the current s_duty_override_value/
+// s_duty_override_use_envelope_mapping state, then reports it. Pulled out
+// into one function (2026-09-07) so all five call sites stay in sync
+// automatically rather than needing five copies of the same raw-vs-
+// envelope-mapping branch kept manually consistent.
+//
+// Why this exists: 'd' direct duty override was built (see its own
+// comment below) specifically to bypass the envelope pipeline - including
+// 'D' predistort - so the raw, uncorrected duty->RF-output curve could be
+// characterized on its own terms. That's the right tool for BUILDING the
+// predistort LUT, but it means toggling 'D' while in plain 'd' override
+// mode can never show any difference - there's no mapping stage left for
+// it to correct. 'E' (see its own handler) flips s_duty_override_
+// use_envelope_mapping so the SAME up/down stepper - and any existing
+// automated test harness already driving those same keys - can instead
+// validate 'D' against real hardware: the stepped index becomes a
+// commanded envelope (0..1, same 0..max_duty granularity as before, so no
+// change needed to how the index itself gets driven), mapped through
+// envelope_predistort_process() if 'D' is on or the plain pwm_offset/
+// pwm_scale linear mapping if it's off - genuinely exercising the same
+// branch dsp_task's normal per-tick path takes - before being converted
+// to a duty count and written. Requested directly: "check the distortion
+// correction... put in loop (on/off) for the duty measurement ('d')" -
+// user already has an automated harness driving the existing up/down
+// stepper and plans to run it once with 'D' on and once off; this is what
+// makes that comparison show a real difference instead of a guaranteed
+// null result. See group_delay_fit_notes.md's matching entry.
+static void duty_override_write_and_reply(void)
+{
+    uint32_t max_duty = envelope_output_get_max_duty();
+    if (!s_duty_override_use_envelope_mapping) {
+        envelope_output_write_duty_raw(s_duty_override_value);
+        serial_reply("-> duty %lu/%lu (raw)\r\n",
+                      (unsigned long)s_duty_override_value, (unsigned long)max_duty);
+        return;
+    }
+    // Envelope-mapping mode - same normalization/mapping/clamp order as
+    // dsp_task's own per-tick path (ssb_mic_test.ino), just entered from a
+    // manually-stepped index instead of the live envelope pipeline.
+    float envelope_frac = (float)s_duty_override_value / (float)max_duty;
+    float mapped;
+    if (envelope_predistort_get_enabled()) {
+        mapped = envelope_predistort_process(envelope_frac);
+    } else {
+        mapped = envelope_frac * envelope_output_get_pwm_scale() + envelope_output_get_pwm_offset();
+    }
+    if (mapped < 0.0f) mapped = 0.0f;
+    if (mapped > 1.0f) mapped = 1.0f;
+    uint32_t duty = (uint32_t)(mapped * (float)max_duty);
+    envelope_output_write_duty_raw(duty);
+    serial_reply("-> env index %lu/%lu (frac=%.4f) -> duty %lu/%lu (%s)\r\n",
+                  (unsigned long)s_duty_override_value, (unsigned long)max_duty, envelope_frac,
+                  (unsigned long)duty, (unsigned long)max_duty,
+                  envelope_predistort_get_enabled() ? "predistort ON" : "linear mapping, 'D' off");
+}
+
 void handle_serial_commands(void)
 {
     // Runtime source switch: 't' -> two-tone, 's' -> single-tone, 'm' ->
@@ -558,39 +627,62 @@ void handle_serial_commands(void)
             // steady source separately (e.g. 's', single-tone, phase
             // rock-steady - the same choice REVISION 1/2's own
             // characterization used).
+            //
+            // 2026-09-07: this bypasses 'D' (predistort) by design (see
+            // above), which means it's the wrong tool for checking whether
+            // 'D' actually does anything - see 'E' below for the
+            // envelope-mapped alternative that shares this same stepper.
             bool now_on = !envelope_output_duty_override_get_enabled();
             envelope_output_duty_override_set_enabled(now_on);
-            uint32_t max_duty = envelope_output_get_max_duty();
             if (now_on) {
                 s_duty_override_value = 0;
-                envelope_output_write_duty_raw(s_duty_override_value);
-                serial_reply("-> duty override ON, duty=%lu/%lu ('>'/'<'=+-1, 'N'/'B'=+-16; "
+                serial_reply("-> duty override ON (%s mode - 'E' to switch), '>'/'<'=+-1, 'N'/'B'=+-16; "
                               "dsp_task's normal envelope pipeline is now locked out of the "
-                              "RSET output until 'd' again)\r\n",
-                              (unsigned long)s_duty_override_value, (unsigned long)max_duty);
+                              "RSET output until 'd' again\r\n",
+                              s_duty_override_use_envelope_mapping ? "envelope-mapped, see 'D'" : "raw duty");
+                duty_override_write_and_reply();
             } else {
                 serial_reply("-> duty override off (dsp_task's normal envelope pipeline back in control)\r\n");
+            }
+        } else if (c == 'E') {
+            // Added 2026-09-07 - see duty_override_write_and_reply()'s own
+            // comment for the full rationale. Toggles whether the
+            // '>'/'<'/'N'/'B' stepper below writes its index as a literal
+            // raw duty count (off, original/default behavior) or as a
+            // commanded envelope run through 'D' (predistort) or the
+            // linear pwm_offset/pwm_scale mapping (on) - the only
+            // difference is what happens to the SAME stepped index at
+            // write time, so an existing automated test harness driving
+            // '>'/'<'/'N'/'B' needs no changes beyond sending this once.
+            // Works whether 'd' override is on or off right now - if it's
+            // already on, the current index is immediately re-written
+            // under the new interpretation so the output updates without
+            // needing another step press; if it's off, this just selects
+            // which mode 'd' will start in next.
+            s_duty_override_use_envelope_mapping = !s_duty_override_use_envelope_mapping;
+            serial_reply("-> duty override stepper now writes its index as %s%s\r\n",
+                          s_duty_override_use_envelope_mapping
+                              ? "a commanded ENVELOPE (mapped via 'D'/predistort, or the linear "
+                                "pwm_offset/scale mapping while 'D' is off)"
+                              : "the literal RAW duty count (bypasses 'D' entirely, same as before)",
+                          envelope_output_duty_override_get_enabled() ? "" : " - takes effect once 'd' is on");
+            if (envelope_output_duty_override_get_enabled()) {
+                duty_override_write_and_reply();
             }
         } else if (c == '>' && envelope_output_duty_override_get_enabled()) {
             uint32_t max_duty = envelope_output_get_max_duty();
             if (s_duty_override_value < max_duty) s_duty_override_value++;
-            envelope_output_write_duty_raw(s_duty_override_value);
-            serial_reply("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
+            duty_override_write_and_reply();
         } else if (c == '<' && envelope_output_duty_override_get_enabled()) {
-            uint32_t max_duty = envelope_output_get_max_duty();
             if (s_duty_override_value > 0) s_duty_override_value--;
-            envelope_output_write_duty_raw(s_duty_override_value);
-            serial_reply("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
+            duty_override_write_and_reply();
         } else if (c == 'N' && envelope_output_duty_override_get_enabled()) {
             uint32_t max_duty = envelope_output_get_max_duty();
             s_duty_override_value = (s_duty_override_value + 16 > max_duty) ? max_duty : s_duty_override_value + 16;
-            envelope_output_write_duty_raw(s_duty_override_value);
-            serial_reply("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
+            duty_override_write_and_reply();
         } else if (c == 'B' && envelope_output_duty_override_get_enabled()) {
-            uint32_t max_duty = envelope_output_get_max_duty();
             s_duty_override_value = (s_duty_override_value < 16) ? 0 : s_duty_override_value - 16;
-            envelope_output_write_duty_raw(s_duty_override_value);
-            serial_reply("-> duty %lu/%lu\r\n", (unsigned long)s_duty_override_value, (unsigned long)max_duty);
+            duty_override_write_and_reply();
 #if AD9851_ATTACHED
         } else if (c == 'o') {
             bool now_on = !carrier_output_get_rf_enabled();
