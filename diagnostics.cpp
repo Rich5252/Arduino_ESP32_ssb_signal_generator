@@ -365,6 +365,37 @@ static void print_timing_and_adc_block(uint32_t now)
                       s_dbg_max_busy_us, s_dbg_max_adc_us, s_dbg_max_dsp_us, s_dbg_max_write_us,
                       k_sample_period_us, s_dbg_overrun_count);
     }
+
+#if AD9851_ATTACHED
+    // 2026-09-07: moved to run right after the main [timing] line (was
+    // last in this block, after wakeup-jitter/core1/dsp-breakdown). Every
+    // diag_room_for() check in this function fires back-to-back with no
+    // chance for the USB-CDC TX buffer to drain in between (all inside
+    // one synchronous call), so on a real board whose resting
+    // availableForWrite() is only ~150-200 bytes (see diag_room_for()'s
+    // own comment), each line's *own* guard passing doesn't mean the
+    // NEXT line's guard will - the buffer keeps draining across the same
+    // burst. This line needed the single largest reservation (150 bytes)
+    // of any check in the block, and used to be checked fifth/last, so it
+    // was structurally the most likely one to lose that race and get
+    // silently dropped every cycle (see [diag] skip_total= below to
+    // confirm lines are being skipped at all) - not a compile-time or
+    // hardware gap, just starved for buffer priority. Splits the
+    // [timing] line's write_us (dominated by the AD9851 SPI write) into
+    // CPU-side prep (FTW math + bit-reversal loop) vs. the
+    // spi_device_polling_transmit()/bit-bang-loop call itself - see
+    // ad9851_profile_t (AD9851.h) and the bus-acquire-once change in
+    // ad9851_init() this is meant to validate the effect of.
+    if (diag_room_for(150)) {
+        ad9851_profile_t ad_prof;
+        carrier_output_get_profile(&ad_prof);
+        Serial.printf("[timing]   ad9851 breakdown: prep_us=%u spi_us=%u (prep+spi=%u vs. write_us=%u "
+                      "above - gap is remaining driver/call overhead)\r\n",
+                      ad_prof.max_prep_us, ad_prof.max_spi_us,
+                      ad_prof.max_prep_us + ad_prof.max_spi_us, s_dbg_max_write_us);
+    }
+#endif
+
     if (diag_room_for(100)) {
         Serial.printf("[timing]   wakeup jitter: max_gap_us=%u (nominal=%u) late_ticks_total=%u\r\n",
                       s_dbg_max_tick_gap_us, k_sample_period_us, s_dbg_late_tick_count);
@@ -394,22 +425,6 @@ static void print_timing_and_adc_block(uint32_t now)
         Serial.printf("[timing]   dsp breakdown: audio_fx=%u fir=%u atan2=%u sqrt=%u\r\n",
                       prof.max_audio_fx_us, prof.max_fir_us, prof.max_atan2_us, prof.max_sqrt_us);
     }
-
-#if AD9851_ATTACHED
-    // Splits the [timing] line's write_us (dominated by the AD9851 SPI
-    // write) into CPU-side prep (FTW math + bit-reversal loop) vs. the
-    // spi_device_polling_transmit() call itself - see ad9851_profile_t
-    // (AD9851.h) and the bus-acquire-once change in ad9851_init() this
-    // is meant to validate the effect of.
-    if (diag_room_for(150)) {
-        ad9851_profile_t ad_prof;
-        carrier_output_get_profile(&ad_prof);
-        Serial.printf("[timing]   ad9851 breakdown: prep_us=%u spi_us=%u (prep+spi=%u vs. write_us=%u "
-                      "above - gap is remaining driver/call overhead)\r\n",
-                      ad_prof.max_prep_us, ad_prof.max_spi_us,
-                      ad_prof.max_prep_us + ad_prof.max_spi_us, s_dbg_max_write_us);
-    }
-#endif
 
     // Evidence for setting MAX_FREQ_DEV_HZ from real data instead of
     // guessing again - max_unclamped is the TRUE peak deviation the
