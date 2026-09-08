@@ -214,7 +214,23 @@
  * hard ceiling on any useful envelope update rate, and 4x (64kHz) is
  * already the highest multiple of SAMPLE_RATE_HZ that stays under it; 8x
  * (128kHz) would write the duty register faster than the PWM carrier
- * itself can act on it, for zero real benefit. Curve SHAPE, not update
+ * itself can act on it, for zero real benefit.
+ *
+ * UPDATE 2026-09-08: "fixed at 78125Hz" above is now stale -
+ * RSET_MOD_LEDC_FREQ_HZ was retuned to 64000Hz (see envelope_output.h's
+ * own dated comment) to test whether putting the PWM carrier and the
+ * envelope update rate on a commensurate footing removes the ~12.8us of
+ * unsynchronized jitter the v3 hardware-fade attempt found between them
+ * (both original problem and the retune's reasoning described in the
+ * "CORROBORATION" section above). Doesn't reopen the 8x-factor question
+ * this paragraph answers, though: 128kHz would still write faster than
+ * whatever the carrier is now, so the "raising it further is a dead end"
+ * conclusion stands regardless of this specific retune - only the
+ * SPECIFIC ceiling number (78125) changed, not the shape of the argument.
+ * Not yet bench-verified whether the retune actually fixes the jitter -
+ * see group_delay_fit_notes.md's matching entry.
+ *
+ * Curve SHAPE, not update
  * RATE, was the remaining lever: v4's ramp is a straight line between
  * consecutive full-tick samples, which has a kink at every tick boundary
  * - real spectral content a smooth signal shouldn't have. Catmull-Rom
@@ -363,7 +379,7 @@
 // isn't just "copy Hans's 28x") - not currently exposed as a runtime-
 // tunable the way the slew limiter is; revisit as a live '<'/'>'-style
 // step if/once a fixed 4x is confirmed worthwhile on real hardware.
-#define ENVELOPE_INTERP_FACTOR 1
+#define ENVELOPE_INTERP_FACTOR 4
 
 // v4.3: which curve compute_ramp_value() evaluates over the [s_p1,s_p2]
 // segment - see the "v4.3" header note above for the full rationale.

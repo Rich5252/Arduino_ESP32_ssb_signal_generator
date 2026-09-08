@@ -52,7 +52,25 @@
 #define RSET_MOD_LEDC_GPIO    2      // within the board's easy-access GPIO1-13 range; not otherwise used
 #define RSET_MOD_LEDC_TIMER   LEDC_TIMER_0
 #define RSET_MOD_LEDC_CH      LEDC_CHANNEL_0
-#define RSET_MOD_LEDC_FREQ_HZ 78125  // max achievable at 10-bit res on 80MHz APB clock (see earlier discussion)
+// 2026-09-08: retuned from 78125 (max achievable at 10-bit res on the
+// 80MHz APB clock, i.e. 80,000,000/1024 - the original reasoning, kept
+// here for the record) to 64000 - ENVELOPE_INTERP_FACTOR(4) x
+// SAMPLE_RATE_HZ(16000), i.e. the actual envelope update rate once 'I'
+// interpolation is on. 78125 has no integer relationship to 64000 (v3's
+// hardware-LEDC-fade attempt found ~12.8us of unsynchronized jitter
+// between the two as a result - see envelope_interp.h's v1-v4 history);
+// 64000 IS also an exact integer division of the same 80MHz clock
+// (80,000,000/1250), so this is step 1 of testing whether putting the
+// carrier and the update rate on a commensurate (ideally phase-lockable)
+// footing removes that jitter - deliberately isolated, no other change
+// yet (still the existing software-driven ledc_set_duty()/
+// ledc_update_duty() path from envelope_interp.h v4, not v3's hardware
+// fade engine - that's a separate, later step if this alone helps).
+// NOTE: if either ENVELOPE_INTERP_FACTOR or SAMPLE_RATE_HZ changes, this
+// needs revisiting by hand - deliberately not written as a formula here,
+// same convention as ENVELOPE_INTERP_FACTOR itself being a plain literal
+// rather than derived from anything.
+#define RSET_MOD_LEDC_FREQ_HZ 64000
 #define RSET_MOD_LEDC_RES     LEDC_TIMER_10_BIT
 
 // Target max DAC update rate. The envelope only carries content up to
