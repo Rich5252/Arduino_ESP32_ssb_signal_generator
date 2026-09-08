@@ -312,15 +312,23 @@ void envelope_output_sync_ledc_timer_now(void)
 // note on the stage/commit-from-ISR variant this reverted FROM - real
 // hardware came back worse, not better, with that split (see the header
 // comment and group_delay_fit_notes.md's matching entry for the two
-// suspected mechanisms). No duty-override early-return here unlike
-// envelope_output_write_pwm()/start_hw_fade() above - the 'd' direct-duty-
-// override feature (envelope_output_write_duty_raw()) is PWM/LEDC-specific
-// by construction (it writes a raw LEDC duty count, a concept that doesn't
-// exist on the SDM side), so there is nothing for this path to defer to
-// while that mode is active; it keeps writing normally.
+// suspected mechanisms).
+//
+// 2026-09-08, later still: gained the SAME duty-override early-return
+// envelope_output_write_pwm()/start_hw_fade() already had - see
+// envelope_output_write_duty_raw()'s own comment below for why. 'd' now
+// drives whichever comparison path is actually compiled in (PWM or SDM,
+// they're mutually exclusive - see the SDM_OUT_GPIO #error above), so this
+// path needs to defer to it too, exactly like PWM's write function does.
 void IRAM_ATTR envelope_output_write_sdm(float envelope)
 {
 #if SDM_COMPARISON_ENABLED
+    if (s_duty_override_enabled) {
+        // Direct override command ('d' + '>'/'<'/'N'/'B', now density-
+        // aware - see envelope_output_write_duty_raw()) owns the SDM
+        // channel right now.
+        return;
+    }
     if (s_sdm_chan == NULL) {
         // Either init_sdm() failed (see its own error log at boot) or
         // SDM_COMPARISON_ENABLED was flipped on without a successful
@@ -345,6 +353,21 @@ void IRAM_ATTR envelope_output_write_sdm(float envelope)
 #endif
 }
 
+// 2026-09-08: generalized from PWM-only to dual-purpose - see this
+// function's own comment in envelope_output.h for the full reasoning.
+// `duty` is really "the raw override INDEX," 0..envelope_output_get_max_
+// duty() - under PWM_COMPARISON_ENABLED it's a literal LEDC duty count as
+// it always was; under SDM_COMPARISON_ENABLED it's linearly remapped onto
+// signed density [-SDM_DENSITY_CLAMP,+SDM_DENSITY_CLAMP], index 0 ->
+// -SDM_DENSITY_CLAMP, index max -> +SDM_DENSITY_CLAMP - the exact same
+// affine mapping envelope_output_write_sdm() uses for envelope=0/1, so a
+// swept index means the same thing to both output paths. This is what
+// lets 'd'/'>'/'<'/'N'/'B'/'E' (serial_commands.cpp) - and any existing
+// automated sweep harness already driving those same keys - work
+// unchanged regardless of which comparison path is compiled in; only one
+// of PWM_COMPARISON_ENABLED/SDM_COMPARISON_ENABLED can be 1 at a time (see
+// envelope_output.h's build-time #error), so there's no runtime ambiguity
+// about which peripheral this actually writes to.
 void IRAM_ATTR envelope_output_write_duty_raw(uint32_t duty)
 {
 #if PWM_COMPARISON_ENABLED
@@ -354,14 +377,34 @@ void IRAM_ATTR envelope_output_write_duty_raw(uint32_t duty)
     }
     ledc_set_duty(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_CH, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_CH);
+#elif SDM_COMPARISON_ENABLED
+    if (s_sdm_chan == NULL) {
+        return;
+    }
+    uint32_t max_index = 2u * (uint32_t)SDM_DENSITY_CLAMP;
+    if (duty > max_index) {
+        duty = max_index;
+    }
+    int32_t density = (int32_t)duty - (int32_t)SDM_DENSITY_CLAMP;
+    sdm_channel_set_pulse_density(s_sdm_chan, (int8_t)density);
 #else
     (void)duty;
 #endif
 }
 
+// 2026-09-08: generalized alongside envelope_output_write_duty_raw() above -
+// see that function's comment. Returns the max valid override INDEX for
+// whichever comparison path is compiled in (LEDC duty count under PWM,
+// 2*SDM_DENSITY_CLAMP under SDM), 0 if neither is enabled.
 uint32_t envelope_output_get_max_duty(void)
 {
+#if PWM_COMPARISON_ENABLED
     return (1u << RSET_MOD_LEDC_RES) - 1u;
+#elif SDM_COMPARISON_ENABLED
+    return 2u * (uint32_t)SDM_DENSITY_CLAMP;
+#else
+    return 0;
+#endif
 }
 
 bool envelope_output_duty_override_get_enabled(void)

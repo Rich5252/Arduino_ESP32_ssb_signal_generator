@@ -178,13 +178,32 @@ static bool s_duty_override_use_envelope_mapping = false;
 // stepper and plans to run it once with 'D' on and once off; this is what
 // makes that comparison show a real difference instead of a guaranteed
 // null result. See group_delay_fit_notes.md's matching entry.
+//
+// 2026-09-08: reply text made peripheral-aware - envelope_output_write_
+// duty_raw()/get_max_duty() (envelope_output.h) now drive SDM's density
+// instead of LEDC's duty count when SDM_COMPARISON_ENABLED is the one
+// compiled in (the two are mutually exclusive), so a reply that always
+// said "duty" would be actively misleading while running an SDM
+// linearity sweep with this same stepper. `max_duty` is still the generic
+// "max override index" either way; the density shown alongside it is
+// recovered from the SAME index<->density affine mapping envelope_output.
+// cpp's own write_duty_raw()/write_sdm() use (index - max_duty/2, exact
+// since max_duty is always 2*SDM_DENSITY_CLAMP under SDM), purely so the
+// printed number matches what's actually landing on the pin - it doesn't
+// change what gets written, only what gets logged.
 static void duty_override_write_and_reply(void)
 {
     uint32_t max_duty = envelope_output_get_max_duty();
     if (!s_duty_override_use_envelope_mapping) {
         envelope_output_write_duty_raw(s_duty_override_value);
+#if SDM_COMPARISON_ENABLED
+        int32_t density = (int32_t)s_duty_override_value - (int32_t)(max_duty / 2u);
+        serial_reply("-> index %lu/%lu -> density %ld (raw)\r\n",
+                      (unsigned long)s_duty_override_value, (unsigned long)max_duty, (long)density);
+#else
         serial_reply("-> duty %lu/%lu (raw)\r\n",
                       (unsigned long)s_duty_override_value, (unsigned long)max_duty);
+#endif
         return;
     }
     // Envelope-mapping mode - same normalization/mapping/clamp order as
@@ -201,10 +220,18 @@ static void duty_override_write_and_reply(void)
     if (mapped > 1.0f) mapped = 1.0f;
     uint32_t duty = (uint32_t)(mapped * (float)max_duty);
     envelope_output_write_duty_raw(duty);
+#if SDM_COMPARISON_ENABLED
+    int32_t density = (int32_t)duty - (int32_t)(max_duty / 2u);
+    serial_reply("-> env index %lu/%lu (frac=%.4f) -> index %lu/%lu -> density %ld (%s)\r\n",
+                  (unsigned long)s_duty_override_value, (unsigned long)max_duty, envelope_frac,
+                  (unsigned long)duty, (unsigned long)max_duty, (long)density,
+                  envelope_predistort_get_enabled() ? "predistort ON" : "linear mapping, 'D' off");
+#else
     serial_reply("-> env index %lu/%lu (frac=%.4f) -> duty %lu/%lu (%s)\r\n",
                   (unsigned long)s_duty_override_value, (unsigned long)max_duty, envelope_frac,
                   (unsigned long)duty, (unsigned long)max_duty,
                   envelope_predistort_get_enabled() ? "predistort ON" : "linear mapping, 'D' off");
+#endif
 }
 
 void handle_serial_commands(void)
@@ -624,11 +651,11 @@ void handle_serial_commands(void)
             dsp_state_set_master_gain_db(new_gain);
             serial_reply("-> master gain %+.2f dB\r\n", new_gain);
         } else if (c == 'd') {
-            // Direct duty override - see envelope_output.h's header
-            // comment. Bypasses master gain/envelope/offset-scale/
-            // predistort entirely so the RSET/PWM/filter/AD9851 chain can
-            // be characterized against a KNOWN, exact commanded duty
-            // count instead of one inferred from a gate-voltage reading -
+            // Direct duty/density override - see envelope_output.h's
+            // header comment. Bypasses master gain/envelope/offset-scale/
+            // predistort entirely so the RSET/filter/AD9851 chain can
+            // be characterized against a KNOWN, exact commanded output
+            // level instead of one inferred from a gate-voltage reading -
             // see envelope_predistort.h's REVISION 3 notes for why this
             // was added. The carrier/phase path is untouched - select a
             // steady source separately (e.g. 's', single-tone, phase
@@ -639,14 +666,27 @@ void handle_serial_commands(void)
             // above), which means it's the wrong tool for checking whether
             // 'D' actually does anything - see 'E' below for the
             // envelope-mapped alternative that shares this same stepper.
+            //
+            // 2026-09-08: now drives whichever of PWM/SDM is actually
+            // compiled in (envelope_output_write_duty_raw()) - the message
+            // below says "duty" or "density" accordingly so this reads
+            // correctly whichever comparison path is active.
             bool now_on = !envelope_output_duty_override_get_enabled();
             envelope_output_duty_override_set_enabled(now_on);
             if (now_on) {
                 s_duty_override_value = 0;
-                serial_reply("-> duty override ON (%s mode - 'E' to switch), '>'/'<'=+-1, 'N'/'B'=+-16; "
+#if SDM_COMPARISON_ENABLED
+                const char *item_label = "density";
+                const char *raw_label = "raw density";
+#else
+                const char *item_label = "duty";
+                const char *raw_label = "raw duty";
+#endif
+                serial_reply("-> %s override ON (%s mode - 'E' to switch), '>'/'<'=+-1, 'N'/'B'=+-16; "
                               "dsp_task's normal envelope pipeline is now locked out of the "
                               "RSET output until 'd' again\r\n",
-                              s_duty_override_use_envelope_mapping ? "envelope-mapped, see 'D'" : "raw duty");
+                              item_label,
+                              s_duty_override_use_envelope_mapping ? "envelope-mapped, see 'D'" : raw_label);
                 duty_override_write_and_reply();
             } else {
                 serial_reply("-> duty override off (dsp_task's normal envelope pipeline back in control)\r\n");

@@ -263,9 +263,10 @@ void envelope_output_sync_ledc_timer_now(void);
 // FACTOR correction, etc.).
 void IRAM_ATTR envelope_output_write_sdm(float envelope);
 
-// ---- Direct duty override ('d' + '>'/'<'/'N'/'B', serial_commands.cpp) ----
-// For characterizing the RSET/PWM/filter/AD9851 chain directly against a
-// KNOWN, exact commanded duty count, bypassing master gain, envelope,
+// ---- Direct duty/density override ('d' + '>'/'<'/'N'/'B', serial_commands.
+// cpp) ----
+// For characterizing the RSET/filter/AD9851 chain directly against a
+// KNOWN, exact commanded output level, bypassing master gain, envelope,
 // offset/scale, AND the predistort LUT entirely - see
 // envelope_predistort.h's REVISION 3 notes for why this exists (the
 // gate-voltage-inference chain that REVISION 2/3 relied on to back out
@@ -275,29 +276,47 @@ void IRAM_ATTR envelope_output_write_sdm(float envelope);
 // keeps running normally; 's' (single-tone, phase held rock-steady) is
 // the natural choice while sweeping this.
 //
-// Writes an EXACT raw PWM duty count [0, (1<<RSET_MOD_LEDC_RES)-1]
-// straight to the RSET LEDC channel - no float conversion, no offset/
-// scale, nothing else in between. Called only from serial_commands.cpp
-// (loop()/Core 1, not dsp_task/Core 0 - same non-ISR context
-// envelope_output_write_pwm() itself is always called from, so this
-// needs no new ISR-safety consideration).
+// 2026-09-08: generalized from PWM-only to ALSO drive SDM, whichever of
+// the two is actually compiled in (PWM_COMPARISON_ENABLED/SDM_COMPARISON_
+// ENABLED are mutually exclusive - see the build-time #error above) - see
+// envelope_output_write_duty_raw()'s own comment in the .cpp for the exact
+// index<->duty/density mapping. This means the SAME 'd'/'>'/'<'/'N'/'B'/'E'
+// UI, and any existing automated sweep harness already driving those keys
+// for PWM's own duty linearity characterization, can be reused unchanged
+// to run the equivalent characterization against SDM instead, just by
+// swapping which comparison flag is set to 1 and reflashing - the whole
+// point being: SDM shares the exact same downstream RC filter/BS170 gate/
+// RSET modulation as PWM now (see SDM_OUT_GPIO's own comment), so any
+// nonlinearity found there is a direct, load-bearing comparison against
+// the already-measured PWM predistort LUT, not a fresh unknown.
+//
+// Writes an EXACT raw override index [0, envelope_output_get_max_duty()]
+// straight to whichever peripheral is active - no float conversion, no
+// offset/scale, nothing else in between. Called only from serial_commands.
+// cpp (loop()/Core 1, not dsp_task/Core 0 - same non-ISR context
+// envelope_output_write_pwm()/write_sdm() themselves are always called
+// from, so this needs no new ISR-safety consideration).
 void IRAM_ATTR envelope_output_write_duty_raw(uint32_t duty);
 
-// The highest valid raw duty count, i.e. (1<<RSET_MOD_LEDC_RES)-1 - a
-// getter rather than making callers reach for RSET_MOD_LEDC_RES
-// themselves, since that's an ledc_timer_bit_t enum from driver/ledc.h,
-// which only THIS file's .cpp includes; serial_commands.cpp (the only
-// other caller) has no reason to need that header itself.
+// The highest valid raw override index - under PWM, (1<<RSET_MOD_LEDC_RES)-1
+// (a literal LEDC duty count); under SDM, 2*SDM_DENSITY_CLAMP (see
+// envelope_output_write_duty_raw()'s .cpp comment for the index<->density
+// mapping); 0 if neither comparison path is compiled in. A getter rather
+// than making callers reach for RSET_MOD_LEDC_RES/SDM_DENSITY_CLAMP
+// themselves, since RSET_MOD_LEDC_RES in particular is an ledc_timer_bit_t
+// enum from driver/ledc.h, which only THIS file's .cpp includes;
+// serial_commands.cpp (the only other caller) has no reason to need that
+// header itself.
 uint32_t envelope_output_get_max_duty(void);
 
-// While enabled, envelope_output_write_pwm() above becomes a no-op every
-// tick - the LEDC hardware just continues outputting whatever duty
-// envelope_output_write_duty_raw() last wrote (LEDC holds its duty
-// register between explicit updates, so dsp_task doesn't need to keep
-// re-writing it - and by skipping the write entirely rather than trying
-// to race it, dsp_task's normal envelope pipeline can never fight the
-// override). 'd' toggles this; entering it resets the working duty value
-// to 0 - see serial_commands.cpp.
+// While enabled, envelope_output_write_pwm()/write_sdm() above become a
+// no-op every tick - the active peripheral just continues outputting
+// whatever value envelope_output_write_duty_raw() last wrote (both LEDC
+// and SDM hold their last-commanded output between explicit updates, so
+// dsp_task doesn't need to keep re-writing it - and by skipping the write
+// entirely rather than trying to race it, dsp_task's normal envelope
+// pipeline can never fight the override). 'd' toggles this; entering it
+// resets the working index to 0 - see serial_commands.cpp.
 bool envelope_output_duty_override_get_enabled(void);
 void envelope_output_duty_override_set_enabled(bool enable);
 
