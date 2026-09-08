@@ -5,8 +5,9 @@
  *
  * Everything that turns the computed envelope into an actual analog
  * signal: the LEDC/RC "PWM comparison" path (RSET modulation via a
- * BS170 gate) and the MCP4725 I2C DAC path (currently disconnected
- * hardware, kept for side-by-side comparison), plus the envelope-to-PWM-
+ * BS170 gate), the MCP4725 I2C DAC path (currently disconnected
+ * hardware, kept for side-by-side comparison), and (2026-09-08) a third
+ * SDM (Sigma-Delta Modulation) comparison path, plus the envelope-to-PWM-
  * duty range mapping knobs ('u'/'j'/'i'/'k').
  *
  * Why a DAC instead of PWM+RC filter: at a -70dBc spurious target, a
@@ -20,6 +21,22 @@
  * driven from the same envelope value as the DAC, purely so the two can
  * be scoped side by side against the same source signal. Set to 0 once
  * you're done comparing.
+ *
+ * Why SDM, and why now: the whole PWM interpolation investigation
+ * (pwm_envelope_interpolation_report.md) found two independent write-
+ * rate-related noise costs baked into the LEDC peripheral (a wake-rate/
+ * CPU-margin cost and a hardware-fade-engine-inherent cost), neither
+ * fixed by any of five architectures tried. SDM is architecturally
+ * different: its 1-bit output free-runs continuously at its own internal
+ * comparator rate (SDM_SAMPLE_RATE_HZ below), decoupled from how often
+ * software updates the target density - in principle sidestepping both
+ * costs with a single plain register write per real (16kHz) dsp_task
+ * tick, no interpolation architecture needed. It was set aside earlier
+ * (2026-09-08) over its 8-bit signed resolution (vs. LEDC's 10-bit duty)
+ * given this project's prior linearity/resolution battles - being tried
+ * anyway now because the only way to really settle it is on the bench.
+ * SDM_COMPARISON_ENABLED (config.h) gates this path; off by default,
+ * not yet bench-verified in any form.
  */
 
 #include <stdint.h>
@@ -72,6 +89,60 @@
 // rather than derived from anything.
 #define RSET_MOD_LEDC_FREQ_HZ 64000
 #define RSET_MOD_LEDC_RES     LEDC_TIMER_10_BIT
+
+// ---- SDM comparison path, 2026-09-08 - see this file's header comment
+// for the "why SDM, why now" reasoning. Third leg alongside PWM/RC and the
+// DAC, driven from the same envelope value, gated by SDM_COMPARISON_ENABLED
+// (config.h).
+//
+// 2026-09-08, later: SDM_OUT_GPIO changed from its own separate pin (was
+// GPIO1) to REUSE RSET_MOD_LEDC_GPIO - user's call, since this is meant as
+// an EITHER/OR comparison against PWM (one test point/filter on the bench,
+// not two), not a simultaneous three-way A/B like the PWM+DAC pair above.
+// Reusing the #define (rather than a second hardcoded "2") means the two
+// can never silently drift apart if RSET_MOD_LEDC_GPIO itself ever moves.
+//
+// IMPORTANT - genuinely one-or-the-other, not just "usually": PWM_COMPARISON_
+// ENABLED and SDM_COMPARISON_ENABLED must never both be 1 at the same time
+// now that they share a pin - ledc_channel_config() and sdm_new_channel()
+// would both try to route this same GPIO through the GPIO matrix to two
+// different peripherals, which is a real conflict (undefined which one
+// actually wins the pin, not a benign no-op). Enforced below with a
+// build-time #error rather than left as a "remember not to" comment - see
+// that #error's own text for how to fix it if it fires.
+#define SDM_OUT_GPIO           RSET_MOD_LEDC_GPIO
+
+#if PWM_COMPARISON_ENABLED && SDM_COMPARISON_ENABLED
+#error "PWM_COMPARISON_ENABLED and SDM_COMPARISON_ENABLED both 1: they now share SDM_OUT_GPIO/RSET_MOD_LEDC_GPIO (same physical pin) and cannot both drive it at once. Set exactly one of these to 1 in config.h before building."
+#endif
+
+// SDM's own free-running comparator/carrier rate - NOT a rate anything in
+// this codebase writes at (see envelope_output_write_sdm()'s call site,
+// envelope_interp.cpp's on_full_tick(), which writes once per real
+// SAMPLE_RATE_HZ dsp_task tick, currently 16kHz, regardless of this
+// value - a brief ISR-commit variant tried writing on its own separate
+// schedule instead and measured WORSE on real hardware, see that
+// function's own comment below for the full story). 1MHz is Espressif's
+// own driver/sdm.h reference example value, and an exact integer division
+// of the 80MHz APB clock (80,000,000/80) -
+// picked for the same "commensurate with a clean divisor" reasoning
+// RSET_MOD_LEDC_FREQ_HZ's own comment used, though SDM's clock divider
+// isn't chasing phase-lock with anything the way the LEDC retune was -
+// there's no software-driven sub-stepping here to stay in phase with.
+#define SDM_SAMPLE_RATE_HZ     1000000u
+
+// sdm_channel_set_pulse_density()'s density argument is a signed 8-bit
+// value, -128..127 (driver/sdm.h). Espressif's own docs recommend
+// keeping to roughly +/-90 of that "for better randomness" (fewer near-
+// fixed-density stuck/periodic patterns) rather than the full span.
+// Starting at the FULL range here - this project has already fought
+// resolution/dynamic-range battles elsewhere (predistort LUT, envelope-
+// null floor) and the point of trying SDM at all is to see what it can
+// actually do, not to hobble it pre-emptively. Drop to 90 (and re-test)
+// if a spurious/stuck-pattern tone shows up on the spectrum analyzer that
+// isn't there at the reduced range - not yet checked either way on real
+// hardware.
+#define SDM_DENSITY_CLAMP      127
 
 // Target max DAC update rate. The envelope only carries content up to
 // ~3.5-4kHz, so ~10kHz comfortably clears Nyquist. Deliberately throttling
@@ -139,6 +210,58 @@ void IRAM_ATTR envelope_output_start_hw_fade(float target_envelope, uint32_t ste
 // ENVELOPE_INTERP_USE_HW_FADE comment for why this matters and why it only
 // works now that RSET_MOD_LEDC_FREQ_HZ is commensurate with the tick rate.
 void envelope_output_sync_ledc_timer_now(void);
+
+// 2026-09-08: SDM comparison path - see this file's header comment and the
+// SDM_OUT_GPIO/SDM_SAMPLE_RATE_HZ/SDM_DENSITY_CLAMP defines above. Maps the
+// [0,1] envelope linearly onto [-SDM_DENSITY_CLAMP,+SDM_DENSITY_CLAMP] and
+// writes it straight to the SDM channel's pulse density - envelope=0 maps
+// to the most-negative density (Vout nearest 0), envelope=1 to the most-
+// positive (Vout nearest VDD_IO), the same sense as
+// envelope_output_write_pwm()'s duty=0..max_duty mapping. Called once per
+// real dsp_task tick from envelope_interp_on_full_tick() (envelope_interp.
+// cpp), deliberately BEFORE that function's own 'I'/HW_FADE/curve
+// branching - this path always writes the freshest full-tick value
+// directly, completely independent of whatever interpolation the PWM leg
+// is doing, since SDM's whole premise (see header comment) is that no
+// interpolation should be needed for it at all. No-op if
+// SDM_COMPARISON_ENABLED is 0, or if channel init failed (see
+// envelope_output_init()'s SDM boot log line).
+//
+// 2026-09-08, later: BRIEFLY split into a stage/commit pair (dsp_task
+// stages the density, on_timer_alarm() ISR commits it via
+// sdm_channel_set_pulse_density(), which driver/sdm.h documents as ISR-
+// safe) to try to shave the ~1dB IMD gap this single-function version
+// measured against the best PWM/RC result, on the theory that dsp_task's
+// own cross-core wake/scheduling latency was adding jitter to the write.
+// REVERTED - real hardware came back WORSE (another ~1dB down, close-in
+// jitter still present or worse), not better. Two suspected reasons, not
+// mutually exclusive, both amounting to "the ISR became less
+// trustworthy, not more": (1) sdm_channel_set_pulse_density()'s IRAM
+// residency is gated by a separate Kconfig option
+// (CONFIG_SDM_CTRL_FUNC_IN_IRAM) this project has no way to confirm is
+// set in the installed Arduino-ESP32 core - if it isn't, that call is
+// FLASH-resident, and calling flash-resident code from inside the
+// project's single highest-priority ISR risks exactly the kind of cache-
+// line stall this project already found and fixed once before (dac_task's
+// I2C driver activity on Core 1 - see dsp_task's own IRAM_ATTR comment,
+// ssb_mic_test.ino), except now inside the ISR itself, which also delays
+// the vTaskNotifyGiveFromISR() call right after it - compounding rather
+// than just adding. (2) the stage happens LATE in dsp_task's own per-tick
+// work (after the full ADC/Hilbert/gdeq/ampeq/predistort/relative-delay
+// chain - see the .ino's own "PWM write goes FIRST... before the AD9851
+// SPI transfer" comment for why it's placed there), i.e. at the point in
+// the tick where dsp_task's own accumulated timing variance is largest;
+// if dsp_task ever finishes late enough to spill past the NEXT tick's
+// alarm (a real, already-documented possibility - see dsp_task's own
+// elapsed_fast_ticks/coalescing-fix comment), the ISR at that next tick
+// commits a value stale by MORE than the intended one tick, an irregular
+// hiccup rather than the clean fixed delay the design assumed. Full
+// writeup: group_delay_fit_notes.md's matching entry. Reverted to this
+// single synchronous function - real hardware evidence beats the
+// theoretical benefit here, same standing project convention as
+// everywhere else this happened (v5 hardware fade, the ENVELOPE_INTERP_
+// FACTOR correction, etc.).
+void IRAM_ATTR envelope_output_write_sdm(float envelope);
 
 // ---- Direct duty override ('d' + '>'/'<'/'N'/'B', serial_commands.cpp) ----
 // For characterizing the RSET/PWM/filter/AD9851 chain directly against a

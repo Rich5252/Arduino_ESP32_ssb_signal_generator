@@ -157,6 +157,26 @@ static bool IRAM_ATTR on_timer_alarm(gptimer_handle_t timer, const gptimer_alarm
     // over almost as soon as they start.
     GPIO_FAST_CLR(TIMING_DEBUG_GPIO_ISR);
 #endif
+    // 2026-09-08: a direct-from-ISR SDM commit briefly lived here
+    // (envelope_output_commit_sdm_from_isr()), trying to remove dsp_task's
+    // own cross-core wake/scheduling latency from the SDM write's timing.
+    // REVERTED - real hardware measured WORSE with it (another ~1dB of IMD
+    // gone, close-in jitter still present or worse), not better. Two
+    // suspected reasons: sdm_channel_set_pulse_density()'s IRAM residency
+    // is gated by a Kconfig option (CONFIG_SDM_CTRL_FUNC_IN_IRAM) this
+    // project can't confirm is set in the installed Arduino-ESP32 core -
+    // if not, that call was FLASH-resident code running inside this ISR,
+    // risking exactly the cache-line-stall class of problem dac_task's I2C
+    // activity already caused once before (see this task's own IRAM_ATTR
+    // comment below); and/or dsp_task occasionally staging its value too
+    // late relative to the NEXT tick's alarm (see the elapsed_fast_ticks/
+    // coalescing comment further down for why that's a real possibility on
+    // this hardware), turning the intended fixed one-tick delay into an
+    // occasional larger, irregular one. Full writeup: envelope_output.h's
+    // own comment on envelope_output_write_sdm(), and group_delay_fit_
+    // notes.md's matching entry. SDM's actual hardware write is back to
+    // being a plain synchronous call from dsp_task (envelope_interp.cpp),
+    // same as the PWM leg.
     BaseType_t high_task_woken = pdFALSE;
 #if ENVELOPE_INTERP_USE_HW_FADE
     // 2026-09-08: see envelope_interp.h's ENVELOPE_INTERP_USE_HW_FADE

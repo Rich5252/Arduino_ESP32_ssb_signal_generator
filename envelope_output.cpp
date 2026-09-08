@@ -7,6 +7,9 @@
 #if PWM_COMPARISON_ENABLED
 #include "driver/ledc.h"
 #endif
+#if SDM_COMPARISON_ENABLED
+#include "driver/sdm.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -84,6 +87,45 @@ static void init_i2c_dac(void)
     i2c_driver_install(MCP4725_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
 }
 
+#if SDM_COMPARISON_ENABLED
+static sdm_channel_handle_t s_sdm_chan = NULL;
+
+// 2026-09-08: brings up the SDM channel on SDM_OUT_GPIO - see
+// envelope_output.h's SDM section for the pin/rate/density reasoning.
+// `sdm_config_t sdm_cfg = {}` zero-initializes everything not explicitly
+// set below (in particular invert_out/io_loop_back/flags, whichever of
+// those turns out to be this IDF version's actual field layout for them -
+// not yet checked against the installed driver/sdm.h, same "CHECK THIS
+// against your actual installed driver" caution as envelope_output_start_
+// hw_fade()'s own comment) to their safe off/false defaults: no output
+// inversion, no loopback debug mode.
+static void init_sdm(void)
+{
+    sdm_config_t sdm_cfg = {};
+    sdm_cfg.clk_src = SDM_CLK_SRC_DEFAULT;
+    sdm_cfg.gpio_num = SDM_OUT_GPIO;
+    sdm_cfg.sample_rate_hz = SDM_SAMPLE_RATE_HZ;
+
+    esp_err_t err = sdm_new_channel(&sdm_cfg, &s_sdm_chan);
+    if (err != ESP_OK) {
+        Serial.printf("SDM channel init FAILED on GPIO%d: %s\r\n", SDM_OUT_GPIO, esp_err_to_name(err));
+        s_sdm_chan = NULL;
+        return;
+    }
+    err = sdm_channel_enable(s_sdm_chan);
+    if (err != ESP_OK) {
+        Serial.printf("SDM channel enable FAILED: %s\r\n", esp_err_to_name(err));
+        return;
+    }
+    // Start at density 0 (~50% average -> mid-scale after filtering) as a
+    // known, safe boot value, same "explicit known state at boot" idea as
+    // the MCP4725 probe's own mid-scale write just below in
+    // envelope_output_init().
+    sdm_channel_set_pulse_density(s_sdm_chan, 0);
+    Serial.printf("SDM channel OK on GPIO%d, sample_rate_hz=%u\r\n", SDM_OUT_GPIO, (unsigned)SDM_SAMPLE_RATE_HZ);
+}
+#endif
+
 #if PWM_COMPARISON_ENABLED
 static void init_rset_mod_pwm(void)
 {
@@ -126,6 +168,9 @@ void envelope_output_init(void)
     init_i2c_dac();
 #if PWM_COMPARISON_ENABLED
     init_rset_mod_pwm();
+#endif
+#if SDM_COMPARISON_ENABLED
+    init_sdm();
 #endif
     // Explicit connectivity probe - writes mid-scale once so success/failure
     // is obvious in the log immediately at boot, rather than inferred later
@@ -258,6 +303,45 @@ void envelope_output_sync_ledc_timer_now(void)
     // grid share a common reference point instead of an arbitrary power-
     // on-to-power-on offset.
     ledc_timer_rst(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_TIMER);
+#endif
+}
+
+// 2026-09-08: see envelope_output.h's own comment on this function for the
+// call-site/timing reasoning (called once per real dsp_task tick,
+// independent of 'I'/HW_FADE/curve state), including the 2026-09-08 "later"
+// note on the stage/commit-from-ISR variant this reverted FROM - real
+// hardware came back worse, not better, with that split (see the header
+// comment and group_delay_fit_notes.md's matching entry for the two
+// suspected mechanisms). No duty-override early-return here unlike
+// envelope_output_write_pwm()/start_hw_fade() above - the 'd' direct-duty-
+// override feature (envelope_output_write_duty_raw()) is PWM/LEDC-specific
+// by construction (it writes a raw LEDC duty count, a concept that doesn't
+// exist on the SDM side), so there is nothing for this path to defer to
+// while that mode is active; it keeps writing normally.
+void IRAM_ATTR envelope_output_write_sdm(float envelope)
+{
+#if SDM_COMPARISON_ENABLED
+    if (s_sdm_chan == NULL) {
+        // Either init_sdm() failed (see its own error log at boot) or
+        // SDM_COMPARISON_ENABLED was flipped on without a successful
+        // channel bring-up - fail silent/no-op rather than dereferencing
+        // a null handle.
+        return;
+    }
+    if (envelope < 0.0f) {
+        envelope = 0.0f;
+    } else if (envelope > 1.0f) {
+        envelope = 1.0f;
+    }
+    int32_t density = (int32_t)(-(float)SDM_DENSITY_CLAMP + envelope * (2.0f * (float)SDM_DENSITY_CLAMP));
+    if (density < -128) {
+        density = -128;
+    } else if (density > 127) {
+        density = 127;
+    }
+    sdm_channel_set_pulse_density(s_sdm_chan, (int8_t)density);
+#else
+    (void)envelope;
 #endif
 }
 

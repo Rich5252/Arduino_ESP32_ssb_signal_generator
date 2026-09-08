@@ -189,6 +189,27 @@ void IRAM_ATTR envelope_interp_on_full_tick(float envelope, int64_t tick_start_u
     // long this tick's own DSP processing took - see header comment.
     s_tick_start_us = tick_start_us;
 
+    // 2026-09-08: SDM comparison path (envelope_output.h) - written here,
+    // once per real full tick, BEFORE any of the 'I'/HW_FADE/curve
+    // branching below that exists purely to interpolate the PWM/LEDC leg
+    // faster than SAMPLE_RATE_HZ. SDM's own free-running internal
+    // comparator (SDM_SAMPLE_RATE_HZ) is what's supposed to relocate its
+    // switching image, not a faster software write rate - see
+    // envelope_output.h's header comment - so this call deliberately does
+    // NOT sit inside any of the interpolation paths below, and always
+    // fires exactly once per tick regardless of 'I'/curve/HW_FADE state.
+    //
+    // 2026-09-08, later: briefly split into stage-here/commit-from-ISR (to
+    // try to remove dsp_task's own scheduling latency from the write's
+    // timing) and then REVERTED back to this single synchronous call - real
+    // hardware measured WORSE with the ISR-commit version, not better. See
+    // envelope_output.h's own comment on envelope_output_write_sdm() and
+    // group_delay_fit_notes.md's matching entry for the two suspected
+    // mechanisms (possible flash-resident driver call inside the ISR;
+    // dsp_task occasionally staging too late relative to the next tick).
+    // No-op when SDM_COMPARISON_ENABLED (config.h) is 0.
+    envelope_output_write_sdm(envelope);
+
     if (!s_enabled) {
         s_last_value = envelope;
         envelope_output_write_pwm(envelope);

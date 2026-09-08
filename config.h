@@ -19,7 +19,8 @@
  * translation unit that references AD9851_ATTACHED, PWM_COMPARISON_ENABLED,
  * etc. - several of those gate #if blocks in OTHER headers (in particular,
  * PWM_COMPARISON_ENABLED must be defined before "driver/ledc.h" is
- * included anywhere, same constraint the original .ino had).
+ * included anywhere, same constraint the original .ino had; SDM_COMPARISON_
+ * ENABLED below has the identical constraint against "driver/sdm.h").
  */
 
 #include <stdint.h>
@@ -64,7 +65,21 @@
 // ---- PWM comparison path enable flag. Defined here (before any header
 // that depends on it) rather than down in envelope_output.h - #if needs
 // this to already be known wherever "driver/ledc.h" gets included. ----
-#define PWM_COMPARISON_ENABLED 1
+#define PWM_COMPARISON_ENABLED 0
+
+// ---- SDM (Sigma-Delta Modulation) comparison path enable flag, 2026-09-08.
+// Same reasoning/placement as PWM_COMPARISON_ENABLED above - defined here so
+// it's already known wherever "driver/sdm.h" gets included (envelope_output.cpp).
+// A third envelope-to-analog leg, alongside the PWM/RC path and the
+// (currently disconnected) MCP4725 DAC path - see envelope_output.h's SDM
+// section and pwm_envelope_interpolation_report.md's Section 3 for why this
+// was originally set aside (8-bit signed density, recommended +/-90 usable
+// range - a real resolution cut vs. LEDC's 10-bit duty) and why it's being
+// tried on real hardware anyway now, on the reasoning that the only way to
+// really know is to try it. Off by default - this is a fresh, NOT YET
+// BENCH-VERIFIED driver; flip to 1 once SDM_OUT_GPIO (envelope_output.h) is
+// wired to its own filter/scope point.
+#define SDM_COMPARISON_ENABLED 1
 
 #define dac_task_enabled 0
 
