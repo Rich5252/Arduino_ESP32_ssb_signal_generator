@@ -65,7 +65,7 @@
 // ---- PWM comparison path enable flag. Defined here (before any header
 // that depends on it) rather than down in envelope_output.h - #if needs
 // this to already be known wherever "driver/ledc.h" gets included. ----
-#define PWM_COMPARISON_ENABLED 0
+#define PWM_COMPARISON_ENABLED 1
 
 // ---- SDM (Sigma-Delta Modulation) comparison path enable flag, 2026-09-08.
 // Same reasoning/placement as PWM_COMPARISON_ENABLED above - defined here so
@@ -79,9 +79,9 @@
 // really know is to try it. Off by default - this is a fresh, NOT YET
 // BENCH-VERIFIED driver; flip to 1 once SDM_OUT_GPIO (envelope_output.h) is
 // wired to its own filter/scope point.
-#define SDM_COMPARISON_ENABLED 1
+#define SDM_COMPARISON_ENABLED 0
 
-#define dac_task_enabled 0
+#define dac_task_enabled 1
 
 // ---- Master enable for the ADC continuous-mode driver (adc_capture_init()/
 // adc_capture_service(), adc_capture.cpp). Set to 0 to skip starting the
