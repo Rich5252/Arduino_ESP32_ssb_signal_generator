@@ -81,7 +81,7 @@
 // wired to its own filter/scope point.
 #define SDM_COMPARISON_ENABLED 0
 
-#define dac_task_enabled 1
+#define dac_task_enabled 0
 
 // ---- Master enable for the ADC continuous-mode driver (adc_capture_init()/
 // adc_capture_service(), adc_capture.cpp). Set to 0 to skip starting the
