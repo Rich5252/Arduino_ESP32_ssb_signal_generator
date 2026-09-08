@@ -248,10 +248,10 @@ AUDIO_SRC_TWOTONE, 0.00f, 0.20f, 0.90f, false, ADC_LPF_MODE_OFF, false, false, -
 SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM },
 
 // Preset 2 - Single-tone test
- { "Shelf2 Baseline pre grp adj#2", AUDIO_SRC_TWOTONE, 2.03f, 0.20f, 0.90f, true, ADC_LPF_MODE_OFF, false, false, -1.4f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, true, true, ENV_GDEQ_VARIANT_DEFAULT },
+ { "Shelf2 Baseline gdeq adj#2", AUDIO_SRC_TWOTONE, 2.03f, 0.20f, 0.90f, true, ADC_LPF_MODE_OFF, false, false, -1.4f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, true, true, ENV_GDEQ_VARIANT_DEFAULT },
 
  // Preset 3 - Envelope / PWM test
- { "Shelf2 Baseline pre grp adj#4", AUDIO_SRC_TWOTONE, 2.00f, 0.20f, 0.90f, true, ADC_LPF_MODE_OFF, false, false, -1.4f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, true, true,  ENV_GDEQ_VARIANT_CANDIDATE_B },
+ { "Shelf2 Baseline gdeq adj#4", AUDIO_SRC_TWOTONE, 2.00f, 0.20f, 0.90f, true, ADC_LPF_MODE_OFF, false, false, -1.4f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, true, true,  ENV_GDEQ_VARIANT_CANDIDATE_B },
     
  // relative_delay_samples
    // env_pwm_offset
