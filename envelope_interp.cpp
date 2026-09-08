@@ -218,6 +218,28 @@ void IRAM_ATTR envelope_interp_on_full_tick(float envelope, int64_t tick_start_u
     s_m1 = 0.5f * (s_p2 - s_p0);
     s_m2 = 0.5f * (s_p3 - s_p1);
 
+#if ENVELOPE_INTERP_USE_HW_FADE
+    // 2026-09-08: v5 - bypass compute_ramp_value() and the whole curve
+    // machinery (CATMULL_ROM/LINEAR/HOLD alike - not just LINEAR, see
+    // envelope_interp.h's "known limitation" note) entirely. Under this
+    // mode, dsp_task's on_timer_alarm()/is_full_tick logic (see the .ino)
+    // guarantee every wake IS a full tick, so there is no separate
+    // on_interp_tick() call left to hand sub-steps to - instead, the LEDC
+    // hardware fade engine takes this tick's freshly-arrived envelope value
+    // and autonomously subdivides the ramp toward it into
+    // ENVELOPE_INTERP_FACTOR hardware steps on its own clock (one PWM
+    // period apart, now that RSET_MOD_LEDC_FREQ_HZ is commensurate with the
+    // tick rate - see that #define's comment), with zero further software/
+    // ISR involvement until the NEXT full tick starts a new fade toward
+    // whatever value arrives then. s_p0..s_p3/s_m1/s_m2 above are kept
+    // updated anyway (same "a few wasted FLOPs" tradeoff v4.4's HOLD mode
+    // already accepts) so nothing goes stale if this flag is ever flipped
+    // off again at runtime without a reflash.
+    envelope_output_start_hw_fade(envelope, ENVELOPE_INTERP_FACTOR);
+    s_last_value = envelope;
+    return;
+#endif
+
     if (s_curve == ENVELOPE_INTERP_CURVE_HOLD) {
         // v4.4: no ramp, no look-ahead needed for this mode - write the
         // fresh value immediately (zero added latency, same as 'I' off
@@ -238,6 +260,14 @@ void IRAM_ATTR envelope_interp_on_full_tick(float envelope, int64_t tick_start_u
 
 void IRAM_ATTR envelope_interp_on_interp_tick(void)
 {
+#if ENVELOPE_INTERP_USE_HW_FADE
+    // 2026-09-08: defensive no-op only - should never actually be reached
+    // under this mode. dsp_task's is_full_tick is unconditionally true when
+    // this flag is on (see the .ino's on_timer_alarm()/dsp_task changes),
+    // so on_timer_alarm() never generates the "interp-only" (sub-tick)
+    // wakes this function exists to handle in the software-ramp modes.
+    return;
+#endif
     if (!s_enabled || s_reseed_pending) {
         // Either disabled (hold - matches pre-feature ZOH behavior
         // exactly), or a reseed is waiting for the next full tick to

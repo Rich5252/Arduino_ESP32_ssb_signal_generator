@@ -11,6 +11,10 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include <Arduino.h>
+// 2026-09-08: only needed for the ENVELOPE_INTERP_USE_HW_FADE flag itself
+// (gates the ledc_fade_func_install() call below) - this file otherwise has
+// no dependency on envelope_interp's own state/API.
+#include "envelope_interp.h"
 
 static volatile float s_env_pwm_offset = 0.2f;   // was a hardcoded constant
 static volatile float s_env_pwm_scale  = 0.9f;   // was a hardcoded constant
@@ -101,6 +105,19 @@ static void init_rset_mod_pwm(void)
         .hpoint = 0,
     };
     ledc_channel_config(&ch_cfg);
+
+#if ENVELOPE_INTERP_USE_HW_FADE
+    // 2026-09-08: required once before ANY ledc_set_fade_*()/
+    // ledc_fade_start() call - installs the LEDC driver's own fade ISR
+    // service, which is what actually steps the duty register forward on
+    // its own clock once envelope_output_start_hw_fade() (below) kicks a
+    // fade off. Argument 0 = no ESP_INTR_FLAG_* fade-ISR allocation flags
+    // needed here (default behaviour is fine - this ISR doesn't need to be
+    // IRAM-resident/shared/etc. for our purposes). Only installed at all
+    // when the flag is on, so the fade ISR isn't silently running unused
+    // in the default (software ramp) build.
+    ledc_fade_func_install(0);
+#endif
 }
 #endif
 
@@ -164,6 +181,83 @@ void IRAM_ATTR envelope_output_write_pwm(float delayed_envelope)
     ledc_update_duty(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_CH);
 #else
     (void)delayed_envelope;
+#endif
+}
+
+// 2026-09-08: see envelope_output.h's own comment on this function for the
+// overall design (why `steps` is a plain parameter, the approximate/not-
+// yet-bench-verified rounding). Implementation notes specific to THIS body:
+//
+// ledc_set_fade_with_step()'s signature, per the ESP-IDF driver/ledc.h this
+// was written against:
+//   esp_err_t ledc_set_fade_with_step(ledc_mode_t speed_mode,
+//       ledc_channel_t channel, uint32_t target_duty, uint32_t scale,
+//       uint32_t cycle_num)
+// - CHECK THIS against your actual installed driver/ledc.h before trusting
+// this compiles/behaves as written; a signature mismatch here would be a
+// clean compile error (easy to fix), but a semantic mismatch (e.g. if some
+// IDF version's `scale` means something other than "duty counts per step")
+// would silently mis-shape the ramp instead - not verified on this bench.
+//
+// `scale` is a per-step DUTY COUNT (not a step count) and `cycle_num` is
+// how many LEDC PWM periods each step holds before advancing - so to land
+// on approximately `steps` hardware steps, back `scale` out as the total
+// current-to-target duty distance divided by `steps` (floor via integer
+// division - see envelope_output.h for why this makes the real step count
+// only approximately `steps`, not exact). cycle_num=1 (advance every PWM
+// period) is what actually spreads the fade across `steps` full
+// RSET_MOD_LEDC_FREQ_HZ periods - the entire point of retuning
+// RSET_MOD_LEDC_FREQ_HZ to be commensurate with the tick rate (see that
+// #define's own comment): ENVELOPE_INTERP_FACTOR periods at 64kHz line up
+// with one gptimer tick interval, which is exactly how envelope_interp.cpp
+// calls this (steps == ENVELOPE_INTERP_FACTOR).
+void IRAM_ATTR envelope_output_start_hw_fade(float target_envelope, uint32_t steps)
+{
+#if PWM_COMPARISON_ENABLED
+    if (s_duty_override_enabled) {
+        // Same early-return as envelope_output_write_pwm() above - direct
+        // duty-set command owns the LEDC duty register right now.
+        return;
+    }
+    if (steps < 1) {
+        steps = 1;   // defensive - avoid a divide-by-zero below; callers
+                      // are expected to always pass ENVELOPE_INTERP_FACTOR (>=1)
+    }
+
+    uint32_t max_duty = (1u << RSET_MOD_LEDC_RES) - 1u;
+    uint32_t target_duty = (uint32_t)(target_envelope * (float)max_duty);
+    if (target_duty > max_duty) {
+        target_duty = max_duty;
+    }
+
+    uint32_t current_duty = ledc_get_duty(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_CH);
+    uint32_t distance = (target_duty > current_duty) ? (target_duty - current_duty)
+                                                       : (current_duty - target_duty);
+    uint32_t scale = distance / steps;
+    if (scale < 1) {
+        // Distance smaller than `steps` (or zero) - still take at least
+        // one real hardware step of size 1 rather than passing scale=0,
+        // which ledc_set_fade_with_step() would likely reject/no-op.
+        scale = 1;
+    }
+
+    ledc_set_fade_with_step(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_CH, target_duty, scale, 1);
+    ledc_fade_start(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_CH, LEDC_FADE_NO_WAIT);
+#else
+    (void)target_envelope;
+    (void)steps;
+#endif
+}
+
+void envelope_output_sync_ledc_timer_now(void)
+{
+#if PWM_COMPARISON_ENABLED
+    // See envelope_output.h's own comment on this function for why this
+    // matters - resets the LEDC timer's internal counter to a known phase
+    // so its autonomous fade-step clock and the sample gptimer's alarm
+    // grid share a common reference point instead of an arbitrary power-
+    // on-to-power-on offset.
+    ledc_timer_rst(LEDC_LOW_SPEED_MODE, RSET_MOD_LEDC_TIMER);
 #endif
 }
 

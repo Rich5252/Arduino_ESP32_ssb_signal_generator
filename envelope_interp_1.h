@@ -379,6 +379,83 @@
 // isn't just "copy Hans's 28x") - not currently exposed as a runtime-
 // tunable the way the slew limiter is; revisit as a live '<'/'>'-style
 // step if/once a fixed 4x is confirmed worthwhile on real hardware.
+//
+// 2026-09-08: TEMPORARILY set to 1 for a specific isolation test - see
+// group_delay_fit_notes.md's matching 2026-09-08 "x1 16kFs with hardware
+// fade" entry. Purpose: v5's hardware-fade result (same session, same day)
+// showed the burble/noise-floor degradation persists at full severity even
+// with dsp_task's wake-rate overhead apparently eliminated, pointing at the
+// WRITE/UPDATE-RATE itself (4x more duty changes/sec) as the dominant cause
+// rather than anything CPU/timing-related - but that conclusion didn't yet
+// rule out one more variable: whether the LEDC hardware fade ENGINE itself
+// (ledc_set_fade_with_step()/ledc_fade_start(), as opposed to a plain
+// ledc_set_duty()/ledc_update_duty() call) adds anything on its own,
+// independent of how often it's invoked. (See the CORRECTION note below
+// this block, though - the factor=4 test that motivated this one turned out
+// to have been run with 'I' OFF by mistake, which changes the read on all
+// of this - kept here verbatim as the reasoning that was live at the time,
+// not edited away.)
+//
+// At FACTOR=1, every tick is already a "full" tick (no sub-tick
+// interpolation exists to test), so this doesn't test interpolation at
+// all - it tests the fade MECHANISM at the SAME 16kHz write rate as the
+// already-confirmed-clean plain-write baseline. With ENVELOPE_INTERP_
+// USE_HW_FADE also 1 (see below), 'I' OFF still takes the plain
+// envelope_output_write_pwm() path (the confirmed-clean x1 baseline,
+// unchanged), while 'I' ON now routes that same once-per-tick write
+// through envelope_output_start_hw_fade(envelope, 1) instead - a single-
+// step fade (scale = the full duty distance, cycle_num=1) that lands at
+// essentially the same PWM-period boundary a plain ledc_update_duty()
+// would anyway. Since 'I' is a live runtime toggle, both conditions can
+// be A/B'd in ONE flash - no rebuild needed between them. If 'I' ON stays
+// clean here, the fade engine itself is exonerated and the earlier
+// degradation is specifically about write RATE (or ramping through
+// intermediate values, which also doesn't happen at steps=1); if 'I' ON
+// degrades even here, that implicates the fade mechanism itself.
+//
+// RESULT, 2026-09-08: 'I' ON at this x1/steps=1 config produces real,
+// audible noise too - clearly less severe than the factor=4 case, but "bad
+// enough" (user's own words) to matter. This is the clean, decisive part
+// of today's testing (unlike the factor=4 result below, this run's 'I'
+// on/off states were confirmed correct): even at a MATCHED 16kHz write
+// rate, with dsp_task's wake rate/ISR overhead genuinely identical to the
+// confirmed-clean baseline (FACTOR=1 here means the physical gptimer
+// itself only fires at 16kHz, no throttling needed or happening), routing
+// a single-step write through ledc_set_fade_with_step()/ledc_fade_start()
+// instead of plain ledc_set_duty()/ledc_update_duty() is measurably worse.
+// The LEDC hardware fade engine is not just "a software-overhead-free way
+// to do the same electrical thing" - it does something the plain duty-
+// write path doesn't, and that something costs real noise even in the
+// single-step case. See group_delay_fit_notes.md's matching entry for the
+// full corrected picture (this finding plus the factor=4 correction
+// combine to make hardware fade look like the wrong direction generally,
+// independent of rate).
+//
+// CORRECTED, 2026-09-08, later still: the line above ("its normal permanent
+// value (4)") was WRONG - caught by the user asking a basic, sharp question
+// ("Presumably the PWM does load the cpu even if it is not written to?")
+// that prompted re-checking this file's actual state instead of assuming.
+// This constant does NOT just set ENVELOPE_INTERP_FACTOR for when 'I' is
+// explicitly on - in the current (non-ENVELOPE_INTERP_USE_HW_FADE) build,
+// on_timer_alarm() (ssb_mic_test.ino) calls vTaskNotifyGiveFromISR() on
+// EVERY real timer alarm unconditionally, with no gate on 'I' at all - so
+// at FACTOR=4 the sample gptimer fires and wakes dsp_task 64,000 times/sec
+// regardless of whether 'I' is on or off. That exact combination (FACTOR=4,
+// 'I' off) was already confirmed, independently, TWICE - on 2026-09-07 via
+// a direct 1-vs-4 real-hardware comparison ("even setting x4 Fs for interp
+// causes audible burble... with I-off"), and again this session via the
+// accidentally-mislabeled hardware-fade test - to burble on its own, with
+// zero LEDC/envelope_interp involvement. So leaving this at 4 while relying
+// on 'I' off at runtime does NOT reproduce the genuinely clean, >30dB-IMD-
+// confirmed baseline this project has actually verified - only FACTOR=1
+// does, because only then does the physical gptimer itself run at plain
+// 16kHz. This project's own established convention (per the user's own
+// 2026-09-07 correction: "Whenever I reported that I was running with
+// I-off now as default is when I also set ENVELOPE_INTERP_FACTOR=1") has
+// always been to treat 1 as the real resting/production value and to bump
+// this to 4 (or higher) ONLY for a deliberate, temporary interpolation-
+// related test build, reflashing back to 1 afterward - not the other way
+// around. Restored to that actual correct resting value now.
 #define ENVELOPE_INTERP_FACTOR 1
 
 // 2026-09-08: v5 experiment - "get x4 interp working at 16kHz" by
@@ -468,6 +545,52 @@
 //     still "a real experiment to validate on the bench, not a guaranteed
 //     fix."
 // See group_delay_fit_notes.md's matching 2026-09-08 entry.
+//
+// RESULT, 2026-09-08 (factor=4 test): burble/noise-floor degradation
+// persists at essentially FULL severity vs. the x1 baseline, despite
+// dsp_task's wake-rate overhead being completely eliminated - see the
+// notes-file entry linked above for the full read (points at write/
+// switching-rate, not CPU/timing, as the dominant mechanism).
+//
+// CORRECTION, 2026-09-08, same day: the factor=4 test result immediately
+// above was run with 'I' OFF by mistake ("Sorry I did the first test
+// incorrectly in that I left I off") - meaning envelope_interp_on_full_
+// tick()'s HW_FADE branch was never actually reached (it sits after the
+// `if (!s_enabled) return;` early-out), so that run never called
+// envelope_output_start_hw_fade() even once. What it actually measured
+// was: FACTOR=4 physically configures the gptimer at 8,000,000Hz
+// resolution/64kHz alarm rate regardless of this flag, and the ISR-
+// throttle logic here only decides whether to NOTIFY dsp_task on a given
+// alarm - the raw gptimer ISR (on_timer_alarm(), ssb_mic_test.ino) still
+// physically FIRES at 64kHz either way, just skipping the cross-core
+// notify on 3 of every 4 calls. So the "burble persists at full severity"
+// result was really showing that the bare 64kHz timer-ISR entry/exit
+// alone - with NO cross-core notify/IPI on 3 of 4 calls, NO dsp_task wake
+// on those calls, and NO LEDC write of any kind beyond one plain
+// envelope_output_write_pwm() per real 16kHz full tick - is enough on its
+// own to reproduce something close to the full symptom. That's actually a
+// SHARPER version of the pre-existing "wake-rate-alone" mechanism from the
+// 2026-09-07 investigation (which still had full notify/IPI/dsp_task-wake
+// overhead on every one of the 4 ticks) - it narrows the culprit down
+// specifically to the timer ISR itself firing that often, not the
+// downstream notify/task-wake machinery. The user then re-ran this exact
+// config with 'I' correctly ON: "With I on it completely destroys the two
+// tones - very high noise levels" - categorically worse than the
+// (mislabeled) 'I'-off run, confirming the hardware fade engine adds a
+// large ADDITIONAL cost on top of the bare-ISR-rate effect once it's
+// actually engaged. See group_delay_fit_notes.md's matching correction
+// entry for the full three-way picture (bare-64kHz-ISR cost + fade-engine-
+// inherent cost + likely rate-scaling of the latter across 4 steps/tick).
+//
+// Combined with the separate, cleanly-isolated x1/steps=1 result above
+// (real audible noise even at a genuinely matched 16kHz rate with zero
+// extra ISR overhead), the fade engine itself now looks like a real,
+// independent noise source - not merely "the same electrical write, done
+// with less CPU cost." CORRECTED BACK to its normal default (0) now that
+// both halves of this test are in - hardware-fade-based interpolation is
+// not currently a promising direction regardless of wake-rate cleverness;
+// see the notes file for candidate next steps (predominantly: accept x1 on
+// this output path, or reconnect the DAC).
 #define ENVELOPE_INTERP_USE_HW_FADE 0
 
 // v4.3: which curve compute_ramp_value() evaluates over the [s_p1,s_p2]

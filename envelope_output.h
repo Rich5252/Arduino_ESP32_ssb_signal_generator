@@ -111,6 +111,35 @@ void envelope_output_init(void);
 // internally so dsp_task itself needed no changes for this feature.
 void IRAM_ATTR envelope_output_write_pwm(float delayed_envelope);
 
+// 2026-09-08: ENVELOPE_INTERP_USE_HW_FADE (envelope_interp.h) support -
+// starts a hardware LEDC fade from whatever duty the channel is CURRENTLY
+// at (read internally by the driver, not passed in) toward target_envelope,
+// autonomously subdividing into `steps` equal-ish increments on the LEDC's
+// own clock, one PWM period apart - no further software/ISR involvement
+// once started. `steps` is a plain parameter (not ENVELOPE_INTERP_FACTOR
+// hardcoded here) so this module stays decoupled from envelope_interp's
+// own constants, same reasoning as envelope_output_write_pwm() taking a
+// plain float rather than reaching into envelope_interp's state itself.
+// Respects the same duty-override early-return as envelope_output_write_
+// pwm() above. Requires envelope_output_init() to have already called
+// ledc_fade_func_install() - see that function's own comment. Approximate,
+// not exact: ledc_set_fade_with_step()'s `scale` is a per-step duty COUNT,
+// not a step COUNT, so the actual number of hardware steps taken to reach
+// target_duty is round-trip via integer division and may come out to
+// `steps` +/-1 depending on how evenly the current-to-target distance
+// divides - not yet bench-verified against a scope whether this rounding
+// is small enough to ignore or needs tighter handling.
+void IRAM_ATTR envelope_output_start_hw_fade(float target_envelope, uint32_t steps);
+
+// 2026-09-08: resets the LEDC timer's own internal counter to a known
+// phase - called once from init_sample_timer() (ssb_mic_test.ino) right
+// after gptimer_start(), so the LEDC's autonomous fade-step clock and the
+// sample gptimer's alarm grid start from a common reference point instead
+// of an arbitrary power-on-to-power-on offset. See envelope_interp.h's
+// ENVELOPE_INTERP_USE_HW_FADE comment for why this matters and why it only
+// works now that RSET_MOD_LEDC_FREQ_HZ is commensurate with the tick rate.
+void envelope_output_sync_ledc_timer_now(void);
+
 // ---- Direct duty override ('d' + '>'/'<'/'N'/'B', serial_commands.cpp) ----
 // For characterizing the RSET/PWM/filter/AD9851 chain directly against a
 // KNOWN, exact commanded duty count, bypassing master gain, envelope,

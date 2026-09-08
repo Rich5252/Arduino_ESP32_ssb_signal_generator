@@ -158,7 +158,26 @@ static bool IRAM_ATTR on_timer_alarm(gptimer_handle_t timer, const gptimer_alarm
     GPIO_FAST_CLR(TIMING_DEBUG_GPIO_ISR);
 #endif
     BaseType_t high_task_woken = pdFALSE;
+#if ENVELOPE_INTERP_USE_HW_FADE
+    // 2026-09-08: see envelope_interp.h's ENVELOPE_INTERP_USE_HW_FADE
+    // comment for the full reasoning. The gptimer hardware still fires at
+    // its usual ENVELOPE_INTERP_FACTOR x SAMPLE_RATE_HZ (64kHz) rate,
+    // unchanged - only whether THIS ISR bothers to cross-core-notify
+    // dsp_task on any given alarm changes. Plain integer counter, no
+    // float, no driver calls beyond the same vTaskNotifyGiveFromISR()
+    // already proven ISR-safe here - deliberately as close to v1/v2's
+    // ISR-safety boundary as this file gets, on purpose, since those two
+    // generations crashed specifically from float math and LEDC driver
+    // calls in ISR context, neither of which happens here.
+    static uint32_t s_isr_fast_tick_counter = 0;
+    s_isr_fast_tick_counter++;
+    if (s_isr_fast_tick_counter >= ENVELOPE_INTERP_FACTOR) {
+        s_isr_fast_tick_counter = 0;
+        vTaskNotifyGiveFromISR(s_dsp_task, &high_task_woken);
+    }
+#else
     vTaskNotifyGiveFromISR(s_dsp_task, &high_task_woken);
+#endif
 #if TIMING_DEBUG_ENABLED
     GPIO_FAST_SET(TIMING_DEBUG_GPIO_ISR);   // rising edge = notify call done, about to return
 #endif
@@ -274,11 +293,26 @@ static void IRAM_ATTR dsp_task(void* arg)
         // the exact boundary the coalesced count landed - so a bad
         // overrun still costs the one sample it made unrecoverable, but
         // never cascades into delaying subsequent ones too.
+#if ENVELOPE_INTERP_USE_HW_FADE
+        // 2026-09-08: under ENVELOPE_INTERP_USE_HW_FADE, on_timer_alarm()
+        // (above) only ever notifies dsp_task on true full-tick
+        // boundaries (1-in-ENVELOPE_INTERP_FACTOR real alarms) - every
+        // wake IS a full tick, there's no separate "interp tick" wake
+        // left to distinguish. The group-based math below assumes
+        // fast_tick_count is counting 64kHz-rate fast ticks (one per
+        // real alarm) and would silently divide the full-tick rate by
+        // ENVELOPE_INTERP_FACTOR AGAIN if left active here - bypassed
+        // entirely instead of trying to adapt it, since there's nothing
+        // left for it to compute. CHIRP mode is NOT compatible with this
+        // flag (see envelope_interp.h's own comment) - don't combine.
+        bool is_full_tick = true;
+#else
         uint32_t fast_tick_group = fast_tick_count / ENVELOPE_INTERP_FACTOR;
         bool is_full_tick = (fast_tick_group != last_full_group);
         if (is_full_tick) {
             last_full_group = fast_tick_group;
         }
+#endif
 
         // Sine-chirp test mode ('w', AUDIO_SRC_CHIRP) - intercepted here,
         // BEFORE the is_full_tick check below, so it runs on EVERY fast
@@ -717,6 +751,22 @@ static void init_sample_timer(void)
 
     gptimer_enable(timer);
     gptimer_start(timer);
+
+#if ENVELOPE_INTERP_USE_HW_FADE
+    // 2026-09-08: see envelope_interp.h's ENVELOPE_INTERP_USE_HW_FADE
+    // comment. Resets the LEDC timer's own free-running counter to a
+    // known phase right as the gptimer starts, so the LEDC's autonomous
+    // fade-step clock and this timer's alarm grid start from a common
+    // reference instead of an arbitrary power-on-to-power-on offset -
+    // the piece v3 never had. Only meaningful now that RSET_MOD_LEDC_
+    // FREQ_HZ is commensurate with ENVELOPE_INTERP_FACTOR x SAMPLE_RATE_
+    // HZ (see envelope_output.h's dated comment) - resetting two clocks
+    // into phase does nothing useful if they're not also the same rate.
+    // Wrapped in envelope_output.cpp so this file doesn't need its own
+    // driver/ledc.h include, matching how every other LEDC detail already
+    // stays inside that module.
+    envelope_output_sync_ledc_timer_now();
+#endif
 }
 
 void setup()
