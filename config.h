@@ -33,7 +33,7 @@
 // Zero-hardware smoke test of the DSP chain. ----
 #define TWOTONE_TEST_MODE   1  // testing default - two-tone on at boot
 #define TWOTONE_F1_HZ        700.0f
-#define TWOTONE_F2_HZ       1900.0f
+#define TWOTONE_F2_HZ       1700.0f
 #define TWOTONE_AMPLITUDE    0.45f   // keep below 0.5 so peaks don't clip when summed
 #define SINGLETONE_HZ        1000.0f  // a clean, unambiguous default - see generate_singletone_sample()
 #define SINGLETONE_AMPLITUDE 0.7f     // single tone alone - more headroom available than the
