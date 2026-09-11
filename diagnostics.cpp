@@ -24,6 +24,49 @@ static volatile float s_dbg_freq_dev = 0.0f;
 static volatile float s_dbg_delayed_freq_dev = 0.0f;   // post-delay-line value, actually used
 static volatile uint32_t s_dbg_tx_freq = 0;             // the exact integer Hz value sent to
                                                           // ad9851_set_frequency() - ground truth
+
+// 2026-09-10: tick-to-tick step-size high-water mark on tx_freq itself, for
+// the random-TX-jump investigation (see moving_forward_notes.md's
+// "new jump occurrence" entries). Unlike null_bias/weighted_bias (already
+// confirmed decoupled from the real jumps) or the canary (which only
+// catches corruption of s_carrier_hz/ftw_reciprocal specifically, and has
+// now stayed clean across two observed jumps), this measures the actual
+// ground-truth signal handed to the chip every tick, directly. If a real
+// jump this size never shows up here even while one is observed at RF, the
+// fault is downstream of every bit of digital math in this pipeline -
+// REF_CLK, the AD9851's internal PLL, or the SPI transfer itself - not
+// anything this firmware computes. s_dbg_have_prev_tx_freq guards the very
+// first call after boot/reset, which has no previous tick to compare
+// against.
+static volatile uint32_t s_dbg_prev_tx_freq = 0;
+static volatile bool s_dbg_have_prev_tx_freq = false;
+static volatile uint32_t s_dbg_max_freq_dev_step_hz = 0;
+static volatile uint32_t s_dbg_max_freq_dev_step_from_hz = 0;
+static volatile uint32_t s_dbg_max_freq_dev_step_to_hz = 0;
+static volatile uint32_t s_dbg_max_freq_dev_step_at_ms = 0;
+
+// 2026-09-11: does a max_freq_dev_step event actually self-correct on the
+// very next tick, or does tx_freq stay elevated/"stuck" for longer? The
+// high-water-mark fields above can't answer that - they only ever record
+// the two values straddling the single worst step, never what happens
+// afterward. User's own objection: a genuine one-tick DSP transient (the
+// EER/polar-transmitter null-crossing effect - see moving_forward_notes.md's
+// 2026-09-11 entry) should recover automatically within one 62.5us tick,
+// since freq_dev is recomputed fresh from atan2(Q,I) every sample with no
+// persistent memory (the slew limiter, the one thing that WOULD carry state
+// tick-to-tick, is currently off/unlimited in every preset - see
+// ssb_dsp.c's freq_dev_slew_limit_hz); a real "sticks rather than blips"
+// symptom (the original, much older canary-motivating theory) would not.
+// This settles it empirically instead of by argument: captures this tick's
+// tx_freq (the post-jump value itself) plus the next FREQ_STEP_TRACE_LEN-1
+// ticks' worth, every time a NEW record-breaking step is set (re-arms and
+// overwrites any still-filling older trace - only the worst event's
+// aftermath matters). Printed as [dsp] post-step trace - see the print site
+// near max_freq_dev_step below.
+#define FREQ_STEP_TRACE_LEN 8
+static volatile uint32_t s_dbg_freq_step_trace[FREQ_STEP_TRACE_LEN];
+static volatile uint8_t  s_dbg_freq_step_trace_fill = 0;    // 0 = no trace captured yet this window
+static volatile bool     s_dbg_freq_step_trace_armed = false;
 #endif
 
 static volatile uint32_t s_dbg_max_busy_us = 0;
@@ -91,6 +134,16 @@ static int64_t s_dsp_tick_start_us = 0;         // captured once at gptimer_star
 static volatile uint32_t s_dbg_dsp_tick_count = 0;  // incremented once per dsp_task tick, unconditionally
 
 static volatile bool s_diag_muted = false;
+
+// 2026-09-09: canary latches for the random-TX-jump investigation (see
+// moving_forward_notes.md) - 0 means "never seen a mismatch since boot/
+// reset", any other value is the esp_timer millis() timestamp of the FIRST
+// mismatch seen, kept even if a later read happens to match again (a
+// glitch this fast could conceivably self-correct on a later corruption
+// event before anyone looks) - same high-water-mark philosophy as
+// s_dbg_max_busy_us etc. elsewhere in this file.
+static volatile uint32_t s_dbg_canary_carrier_bad_since_ms = 0;
+static volatile uint32_t s_dbg_canary_ftw_bad_since_ms = 0;
 
 // Core 1 headroom - see the Fs jitter hunt's crosscore-wake finding: the
 // ~1us->6us stretch on gptimer's notify-from-ISR call only happens when
@@ -227,6 +280,39 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, uint32_t tx_fr
 #if AD9851_ATTACHED
     s_dbg_delayed_freq_dev = delayed_freq_dev_hz;
     s_dbg_tx_freq = tx_freq;
+
+    // See s_dbg_max_freq_dev_step_hz's own declaration comment. tx_freq is
+    // this tick's ground-truth Hz value (carrier_output.h's own doc
+    // comment) - comparing it against last tick's value catches any
+    // one-tick digital discontinuity directly, no matter which upstream
+    // stage (freq_dev_hz, the delay line, or the carrier addition) it came
+    // from. esp_timer_get_time() (not millis()) since this runs on the
+    // dsp_task hot path - it's the IRAM-safe, ISR-callable timer read this
+    // codebase already relies on elsewhere.
+    if (s_dbg_have_prev_tx_freq) {
+        int32_t step = (int32_t)tx_freq - (int32_t)s_dbg_prev_tx_freq;
+        uint32_t abs_step = (step < 0) ? (uint32_t)(-step) : (uint32_t)step;
+        if (abs_step > s_dbg_max_freq_dev_step_hz) {
+            s_dbg_max_freq_dev_step_hz = abs_step;
+            s_dbg_max_freq_dev_step_from_hz = s_dbg_prev_tx_freq;
+            s_dbg_max_freq_dev_step_to_hz = tx_freq;
+            s_dbg_max_freq_dev_step_at_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            // Re-arm the post-step trace - see its declaration comment
+            // above. fill=0 first, then the unconditional capture just
+            // below runs this same call, so trace[0] ends up holding THIS
+            // tick's (the post-jump) tx_freq value.
+            s_dbg_freq_step_trace_fill = 0;
+            s_dbg_freq_step_trace_armed = true;
+        }
+        if (s_dbg_freq_step_trace_armed) {
+            s_dbg_freq_step_trace[s_dbg_freq_step_trace_fill++] = tx_freq;
+            if (s_dbg_freq_step_trace_fill >= FREQ_STEP_TRACE_LEN) {
+                s_dbg_freq_step_trace_armed = false;
+            }
+        }
+    }
+    s_dbg_prev_tx_freq = tx_freq;
+    s_dbg_have_prev_tx_freq = true;
 #else
     (void)delayed_freq_dev_hz;
     (void)tx_freq;
@@ -263,6 +349,34 @@ void diagnostics_reset(void)
     s_core1_busy_adc_svc_us = 0;
     s_core1_busy_diag_us = 0;
     s_core1_busy_delay_us = 0;
+
+#if AD9851_ATTACHED
+    // Reset like every other high-water mark in this file (unlike the
+    // canary two entries below) - the intended use is the same "r, wait,
+    // read" pattern already established for every other test in this
+    // investigation (see moving_forward_notes.md), so a fresh window
+    // should start at zero. s_dbg_have_prev_tx_freq=false (not just
+    // zeroing s_dbg_prev_tx_freq) so the very next tick after a reset
+    // isn't compared against a stale pre-reset value - same reasoning as
+    // s_last_samples_total/s_last_callback_count above.
+    s_dbg_max_freq_dev_step_hz = 0;
+    s_dbg_max_freq_dev_step_from_hz = 0;
+    s_dbg_max_freq_dev_step_to_hz = 0;
+    s_dbg_max_freq_dev_step_at_ms = 0;
+    s_dbg_have_prev_tx_freq = false;
+    s_dbg_freq_step_trace_fill = 0;
+    s_dbg_freq_step_trace_armed = false;
+#endif
+
+    // Deliberately NOT resetting s_dbg_canary_carrier_bad_since_ms /
+    // s_dbg_canary_ftw_bad_since_ms here - they're meant to catch a rare,
+    // possibly once-per-session event (see canary_check_background()), and
+    // this reset gets called often (every 'r' keypress) as part of normal
+    // day-to-day measurement hygiene. Resetting them here would mean any
+    // corruption event that happened before the last 'r' silently
+    // disappears the moment someone starts a fresh measurement window -
+    // exactly the opposite of what a canary is for. They only ever clear
+    // on reboot.
 }
 
 bool diagnostics_get_muted(void)
@@ -348,6 +462,173 @@ static void print_status_line(void)
 #endif
 }
 
+// Null-bias diagnostic - see ssb_dsp_get_null_bias_stats() in ssb_dsp.h.
+// plain_mean is the UNWEIGHTED average freq_dev - CONFIRMED on real
+// hardware NOT to match what an SDR reads (deviations of Hz, not the 100s
+// of Hz plain_mean showed) - kept only so near_null_% / near_null_contrib
+// below can still localize the mechanism (do the near-null samples account
+// for most of plain_mean's nonzero value?). weighted_mean is the
+// physically meaningful one: the envelope^2-weighted average instantaneous
+// frequency, which is what actually equals the transmitted power
+// spectrum's centroid (a standard identity - see ssb_dsp.h) - this is the
+// number to compare against a real spectrum measurement.
+//
+// 2026-09-09: pulled out of print_timing_and_adc_block() into its own
+// function, called on its own schedule from diagnostics_service() and
+// deliberately NOT gated by s_diag_muted (unlike everything else in that
+// block) - see that call site's comment for why. Still gated per-line by
+// diag_room_for() for USB-CDC TX buffer safety, same as every other block
+// in this file.
+static void print_null_bias_block(void)
+{
+    ssb_dsp_null_bias_stats_t nb_stats;
+    ssb_dsp_get_null_bias_stats(dsp_state_get_ssb(), &nb_stats);
+    const float k_two_pi = 6.28318530718f;
+    float plain_mean_hz = (nb_stats.dphi_sample_count > 0)
+        ? (nb_stats.dphi_sum / (float)nb_stats.dphi_sample_count) * SAMPLE_RATE_HZ / k_two_pi
+        : 0.0f;
+    float weighted_mean_hz = (nb_stats.env2_sum > 0.0f)
+        ? (nb_stats.env2_dphi_sum / nb_stats.env2_sum) * SAMPLE_RATE_HZ / k_two_pi
+        : 0.0f;
+    float near_null_pct = (nb_stats.dphi_sample_count > 0)
+        ? 100.0f * (float)nb_stats.near_null_sample_count / (float)nb_stats.dphi_sample_count
+        : 0.0f;
+    float near_null_contrib_hz = (nb_stats.dphi_sample_count > 0)
+        ? (nb_stats.near_null_dphi_sum / (float)nb_stats.dphi_sample_count) * SAMPLE_RATE_HZ / k_two_pi
+        : 0.0f;
+
+    // Expected baseline: for an equal-amplitude two-tone signal, the
+    // analytic-signal instantaneous frequency AWAY from envelope nulls is
+    // the CONSTANT (f1+f2)/2, not ~0 - that's the actual mechanism this
+    // Hilbert/EER technique uses to place two tones (shift the carrier by
+    // their average, let the envelope's own harmonic content produce the
+    // +-spacing/2 sidebands). dphi_sum/env2_dphi_sum are accumulated
+    // BEFORE the LSB sign flip at the end of ssb_dsp_process_sample(), so
+    // both always compare against the USB-convention +(f1+f2)/2 regardless
+    // of the sideband currently selected. weighted_bias is the number that
+    // should actually predict/match a real spectrum measurement;
+    // plain_bias is kept only for the mechanistic (near-null) breakdown
+    // below.
+    float f1 = test_signals_get_twotone_f1_hz();
+    float f2 = test_signals_get_twotone_f2_hz();
+    float expected_center_hz = 0.5f * (f1 + f2);
+    float plain_bias_hz = plain_mean_hz - expected_center_hz;
+    float weighted_bias_hz = weighted_mean_hz - expected_center_hz;
+
+    // Three short calls, each comfortably under this board's usual
+    // free-buffer headroom (see diag_room_for()'s header comment, citing a
+    // real ~162-byte resting measurement) - a single combined printf here
+    // previously needed ~200+ bytes and silently lost its diag_room_for()
+    // gate on every cycle, so it never printed at all. Matches every other
+    // block in this file's own established per-call granularity.
+    if (diag_room_for(140)) {
+        Serial.printf("[dsp]   null_bias: f1=%.0f f2=%.0f expected_center=%.2fHz "
+                      "plain_mean=%.2fHz plain_bias=%.2fHz\r\n",
+                      f1, f2, expected_center_hz, plain_mean_hz, plain_bias_hz);
+    }
+    if (diag_room_for(120)) {
+        Serial.printf("[dsp]   null_bias2: weighted_mean=%.2fHz weighted_bias=%.2fHz "
+                      "(this is the one to compare against the SDR)\r\n",
+                      weighted_mean_hz, weighted_bias_hz);
+    }
+    if (diag_room_for(150)) {
+        Serial.printf("[dsp]   null_bias3: near_null_samples=%.2f%% near_null_contrib=%.2fHz "
+                      "(rest=%.2fHz) threshold=%.3f\r\n",
+                      near_null_pct, near_null_contrib_hz,
+                      plain_mean_hz - near_null_contrib_hz,
+                      ssb_dsp_get_null_bias_threshold(dsp_state_get_ssb()));
+    }
+}
+
+#if AD9851_ATTACHED
+// 2026-09-09: canary check for the random-TX-jump investigation (see
+// moving_forward_notes.md's "leading theory" entry). s_carrier_hz
+// (carrier_output.cpp) and ad9851_s::ftw_reciprocal (AD9851.c) are the only
+// two values anywhere in the freq_dev_hz -> TX-frequency path that are
+// written once at boot and never touched again by any normal code path -
+// every other stage recomputes fresh (or resends its full state) every
+// single 62.5us tick, so a wrong value that PERSISTS rather than
+// self-correcting on the next tick can only mean one of these two got
+// corrupted (RAM bit flip from ESD/RF pickup, or a stray write from an
+// unrelated bug elsewhere). carrier_hz is checked against the compile-time
+// CARRIER_HZ constant itself (immune to RAM corruption); ftw_reciprocal is
+// checked against an independent shadow copy taken once at init (see
+// ad9851_get_canary()'s doc comment, AD9851.h, for why that's not a
+// perfect guarantee but still strong evidence). Deliberately called from
+// the SAME ungated (mute-exempt) 1000ms timer as print_null_bias_block() -
+// see that call site's comment - so this keeps checking even while running
+// muted for the jump hunt.
+// 2026-09-09, revised same day: originally printed an [canary] OK/MISMATCH
+// line every second unconditionally (see the removed history below) so it
+// could be watched live while muted. That turned out to be a real mistake:
+// it meant "muted" no longer actually meant silent - there was now ALWAYS
+// 5 lines/sec of Serial traffic (this plus print_null_bias_block(), also
+// exempted at the time) regardless of 'v', and the user reported a new
+// "noisy" symptom that behaved exactly like the old unmuted-diagnostics
+// noise mechanism despite 'v' genuinely being off - i.e. the fix for
+// watching the canary silently had itself quietly broken "silently".
+// Redesigned to be genuinely silent during normal (healthy) operation:
+// canary_check_background() below is called unconditionally, every
+// diagnostics_service() tick (not on any timer), but only actually prints
+// the FIRST time either check transitions from OK to MISMATCH - after
+// that it's a no-op forever (the transition already happened and latched;
+// re-printing every tick would add back exactly the noise this rework
+// exists to remove). Checking every tick rather than once a second is a
+// free improvement while at it - the event gets reported with far less
+// latency, since there's no cost to checking when there's nothing to print.
+// canary_print_status() is the explicit "show me right now" version for
+// diagnostics_print_now() (on-demand, user-requested output is fine to
+// always print - it isn't a background stream).
+static void canary_check_background(void)
+{
+    uint32_t carrier_hz_now = carrier_output_get_carrier_hz();
+    if (carrier_hz_now != CARRIER_HZ && s_dbg_canary_carrier_bad_since_ms == 0) {
+        s_dbg_canary_carrier_bad_since_ms = millis();
+        if (diag_room_for(130)) {
+            Serial.printf("[canary] carrier_hz=%u (boot=%u) MISMATCH! first seen at t=%ums\r\n",
+                          carrier_hz_now, CARRIER_HZ, s_dbg_canary_carrier_bad_since_ms);
+        }
+    }
+
+    ad9851_canary_t ad_canary;
+    carrier_output_get_canary(&ad_canary);
+    if (ad_canary.ftw_reciprocal_now != ad_canary.ftw_reciprocal_known_good
+        && s_dbg_canary_ftw_bad_since_ms == 0) {
+        s_dbg_canary_ftw_bad_since_ms = millis();
+        if (diag_room_for(150)) {
+            Serial.printf("[canary] ftw_reciprocal=0x%016llx (boot=0x%016llx) MISMATCH! first seen at t=%ums\r\n",
+                          (unsigned long long)ad_canary.ftw_reciprocal_now,
+                          (unsigned long long)ad_canary.ftw_reciprocal_known_good,
+                          s_dbg_canary_ftw_bad_since_ms);
+        }
+    }
+}
+
+static void canary_print_status(void)
+{
+    uint32_t carrier_hz_now = carrier_output_get_carrier_hz();
+    if (carrier_hz_now == CARRIER_HZ) {
+        Serial.printf("[canary] carrier_hz=%u (boot=%u) OK\r\n", carrier_hz_now, CARRIER_HZ);
+    } else {
+        Serial.printf("[canary] carrier_hz=%u (boot=%u) MISMATCH! first seen at t=%ums\r\n",
+                      carrier_hz_now, CARRIER_HZ, s_dbg_canary_carrier_bad_since_ms);
+    }
+
+    ad9851_canary_t ad_canary;
+    carrier_output_get_canary(&ad_canary);
+    if (ad_canary.ftw_reciprocal_now == ad_canary.ftw_reciprocal_known_good) {
+        Serial.printf("[canary] ftw_reciprocal=0x%016llx (boot=0x%016llx) OK\r\n",
+                      (unsigned long long)ad_canary.ftw_reciprocal_now,
+                      (unsigned long long)ad_canary.ftw_reciprocal_known_good);
+    } else {
+        Serial.printf("[canary] ftw_reciprocal=0x%016llx (boot=0x%016llx) MISMATCH! first seen at t=%ums\r\n",
+                      (unsigned long long)ad_canary.ftw_reciprocal_now,
+                      (unsigned long long)ad_canary.ftw_reciprocal_known_good,
+                      s_dbg_canary_ftw_bad_since_ms);
+    }
+}
+#endif // AD9851_ATTACHED
+
 static void print_timing_and_adc_block(uint32_t now)
 {
     // See diag_room_for()'s header comment above (just before
@@ -394,6 +675,50 @@ static void print_timing_and_adc_block(uint32_t now)
                       ad_prof.max_prep_us, ad_prof.max_spi_us,
                       ad_prof.max_prep_us + ad_prof.max_spi_us, s_dbg_max_write_us);
     }
+
+    // 2026-09-10: see s_dbg_max_freq_dev_step_hz's own declaration comment
+    // (top of file) for what this measures and why it was added. from/to
+    // are the two consecutive tx_freq values straddling the worst step
+    // seen, so a real jump's actual Hz values are visible directly, not
+    // just its magnitude - lets this be cross-checked against whatever the
+    // SDR/receiver showed at the same wall-clock time (t=...ms is since
+    // boot, same clock family as the [canary] timestamps).
+    if (diag_room_for(140)) {
+        Serial.printf("[dsp]   max_freq_dev_step: %uHz (%u -> %u Hz, at t=%ums)\r\n",
+                      s_dbg_max_freq_dev_step_hz, s_dbg_max_freq_dev_step_from_hz,
+                      s_dbg_max_freq_dev_step_to_hz, s_dbg_max_freq_dev_step_at_ms);
+    }
+
+    // 2026-09-11: does that step above recover on its own or stick? See
+    // s_dbg_freq_step_trace's declaration comment. Only printed once the
+    // capture has actually filled (fill==0 means no step event has been
+    // recorded yet this window, e.g. right after 'r') - built into one
+    // local buffer first, then a single Serial.print(), same reasoning as
+    // this project's other multi-value diagnostic lines (avoids splitting
+    // one logical line across several diag_room_for()-gated calls, which
+    // could tear it in half if a guard trips mid-line).
+    //
+    // 2026-09-11 CORRECTION, same day: first version of this line asked
+    // diag_room_for(200) - which per THIS FILE's own diag_room_for() header
+    // comment (real hardware measurement: availableForWrite() maxes out
+    // around ~162 bytes even at this board's fully-drained resting state)
+    // is a request that can never succeed. Confirmed on the bench: the line
+    // never printed once across a whole capture, even though
+    // max_freq_dev_step (140-byte request) printed repeatedly in the same
+    // window. Shortened the label text and dropped the request to 130 bytes
+    // - worst case here is ~19 bytes of label + 8 values * up to 9 bytes
+    // each + CRLF =~ 93 bytes, comfortably under both the request and the
+    // board's real ceiling, matching the sibling lines' sizing convention
+    // instead of guessing a round number.
+    if (s_dbg_freq_step_trace_fill > 0 && diag_room_for(130)) {
+        char buf[110];
+        int off = snprintf(buf, sizeof(buf), "[dsp]   post-step:");
+        for (uint8_t i = 0; i < s_dbg_freq_step_trace_fill && off < (int)sizeof(buf) - 12; i++) {
+            off += snprintf(buf + off, sizeof(buf) - off, " %u", s_dbg_freq_step_trace[i]);
+        }
+        Serial.print(buf);
+        Serial.print("\r\n");
+    }
 #endif
 
     if (diag_room_for(100)) {
@@ -437,77 +762,12 @@ static void print_timing_and_adc_block(uint32_t now)
                       fd_stats.max_unclamped_freq_dev_hz, MAX_FREQ_DEV_HZ, fd_stats.clip_count);
     }
 
-    // Null-bias diagnostic - see ssb_dsp_get_null_bias_stats() in
-    // ssb_dsp.h. plain_mean is the UNWEIGHTED average freq_dev - CONFIRMED
-    // on real hardware NOT to match what an SDR reads (deviations of Hz,
-    // not the 100s of Hz plain_mean showed) - kept only so near_null_% /
-    // near_null_contrib below can still localize the mechanism (do the
-    // near-null samples account for most of plain_mean's nonzero value?).
-    // weighted_mean is the physically meaningful one: the envelope^2-
-    // weighted average instantaneous frequency, which is what actually
-    // equals the transmitted power spectrum's centroid (a standard
-    // identity - see ssb_dsp.h) - this is the number to compare against a
-    // real spectrum measurement.
-    {
-        ssb_dsp_null_bias_stats_t nb_stats;
-        ssb_dsp_get_null_bias_stats(dsp_state_get_ssb(), &nb_stats);
-        const float k_two_pi = 6.28318530718f;
-        float plain_mean_hz = (nb_stats.dphi_sample_count > 0)
-            ? (nb_stats.dphi_sum / (float)nb_stats.dphi_sample_count) * SAMPLE_RATE_HZ / k_two_pi
-            : 0.0f;
-        float weighted_mean_hz = (nb_stats.env2_sum > 0.0f)
-            ? (nb_stats.env2_dphi_sum / nb_stats.env2_sum) * SAMPLE_RATE_HZ / k_two_pi
-            : 0.0f;
-        float near_null_pct = (nb_stats.dphi_sample_count > 0)
-            ? 100.0f * (float)nb_stats.near_null_sample_count / (float)nb_stats.dphi_sample_count
-            : 0.0f;
-        float near_null_contrib_hz = (nb_stats.dphi_sample_count > 0)
-            ? (nb_stats.near_null_dphi_sum / (float)nb_stats.dphi_sample_count) * SAMPLE_RATE_HZ / k_two_pi
-            : 0.0f;
-
-        // Expected baseline: for an equal-amplitude two-tone signal, the
-        // analytic-signal instantaneous frequency AWAY from envelope nulls
-        // is the CONSTANT (f1+f2)/2, not ~0 - that's the actual mechanism
-        // this Hilbert/EER technique uses to place two tones (shift the
-        // carrier by their average, let the envelope's own harmonic
-        // content produce the +-spacing/2 sidebands). dphi_sum/env2_dphi_sum
-        // are accumulated BEFORE the LSB sign flip at the end of
-        // ssb_dsp_process_sample(), so both always compare against the
-        // USB-convention +(f1+f2)/2 regardless of the sideband currently
-        // selected. weighted_bias is the number that should actually
-        // predict/match a real spectrum measurement; plain_bias is kept
-        // only for the mechanistic (near-null) breakdown below.
-        float f1 = test_signals_get_twotone_f1_hz();
-        float f2 = test_signals_get_twotone_f2_hz();
-        float expected_center_hz = 0.5f * (f1 + f2);
-        float plain_bias_hz = plain_mean_hz - expected_center_hz;
-        float weighted_bias_hz = weighted_mean_hz - expected_center_hz;
-
-        // Three short calls, each comfortably under this board's usual
-        // free-buffer headroom (see diag_room_for()'s header comment,
-        // citing a real ~162-byte resting measurement) - a single combined
-        // printf here previously needed ~200+ bytes and silently lost its
-        // diag_room_for() gate on every cycle, so it never printed at all.
-        // Matches every other block in this file's own established
-        // per-call granularity.
-        if (diag_room_for(140)) {
-            Serial.printf("[dsp]   null_bias: f1=%.0f f2=%.0f expected_center=%.2fHz "
-                          "plain_mean=%.2fHz plain_bias=%.2fHz\r\n",
-                          f1, f2, expected_center_hz, plain_mean_hz, plain_bias_hz);
-        }
-        if (diag_room_for(120)) {
-            Serial.printf("[dsp]   null_bias2: weighted_mean=%.2fHz weighted_bias=%.2fHz "
-                          "(this is the one to compare against the SDR)\r\n",
-                          weighted_mean_hz, weighted_bias_hz);
-        }
-        if (diag_room_for(150)) {
-            Serial.printf("[dsp]   null_bias3: near_null_samples=%.2f%% near_null_contrib=%.2fHz "
-                          "(rest=%.2fHz) threshold=%.3f\r\n",
-                          near_null_pct, near_null_contrib_hz,
-                          plain_mean_hz - near_null_contrib_hz,
-                          ssb_dsp_get_null_bias_threshold(dsp_state_get_ssb()));
-        }
-    }
+    // Null-bias diagnostic block moved out to its own function,
+    // print_null_bias_block() (above) - see 2026-09-09 moving_forward_notes.md
+    // entry: it's now printed on its own cadence, deliberately EXEMPT from
+    // s_diag_muted (see diagnostics_service()), so it can be watched live
+    // while chasing the random two-tone frequency-jump symptom without
+    // re-enabling the full (noisier) diagnostic stream.
 
     // ADC continuity check: actual samples/callbacks seen in this ~1s
     // window vs. what ADC_CONT_SAMPLE_FREQ_HZ implies, plus any pool
@@ -675,7 +935,34 @@ void diagnostics_service(void)
         int64_t t_diagblock1 = esp_timer_get_time();
         uint32_t diagblock_us = (uint32_t)(t_diagblock1 - t_diagblock0);
         if (diagblock_us > s_dbg_max_diag_block_us) s_dbg_max_diag_block_us = diagblock_us;
+
+        // 2026-09-09: null_bias block used to live here too, then got
+        // pulled out to its own UNGATED (mute-exempt) timer so it could be
+        // watched live while chasing the random two-tone frequency jump.
+        // Reverted same day: (1) that experiment already ran and showed
+        // weighted_bias doesn't track the real jump at all (see
+        // moving_forward_notes.md) - its live-while-muted use case is
+        // gone; (2) worse, running it (and the canary, at the time)
+        // unconditionally meant "muted" no longer actually meant silent -
+        // there was now ALWAYS 5 lines/sec of Serial traffic regardless of
+        // 'v', and the user reported a new "noisy" symptom that behaved
+        // exactly like the old unmuted-diagnostics noise mechanism despite
+        // 'v' genuinely being off. Back under the normal mute gate, same
+        // as everything else in this block - still reachable on demand via
+        // diagnostics_print_now() regardless of mute state.
+        print_null_bias_block();
     }
+
+#if AD9851_ATTACHED
+    // Deliberately OUTSIDE the s_diag_muted gate above, and checked every
+    // call rather than on a timer - see canary_check_background()'s own
+    // comment for why this one is safe to run unconditionally where
+    // null_bias wasn't: it only ever prints once, on the actual transition
+    // to a mismatch, so it costs nothing during normal (healthy) operation
+    // - unlike null_bias/the old canary design, there's no ongoing
+    // steady-state Serial traffic for this to add back.
+    canary_check_background();
+#endif
 }
 
 // 2026-09-07: on-demand snapshot, added because the periodic block above
@@ -687,15 +974,23 @@ void diagnostics_service(void)
 // ongoing 1Hz stream rather than giving one clean read exactly when
 // asked for. This bypasses BOTH gates - prints once, immediately, on
 // request, whether muted or not, without touching last_print_ms/
-// last_timing_print_ms (so it doesn't perturb the periodic block's own
-// independent schedule either). Deliberately does NOT reset any
-// counters - it's a read, not a `'r'`. Still goes through print_status_
-// line()/print_timing_and_adc_block()'s own diag_room_for() guards
-// internally, so it can't block waiting on the TX buffer any more than
-// the periodic path could.
+// last_timing_print_ms/last_null_bias_print_ms (so it doesn't perturb any
+// of the periodic blocks' own independent schedules either). Deliberately
+// does NOT reset any counters - it's a read, not a `'r'`. Still goes
+// through print_status_line()/print_timing_and_adc_block()/
+// print_null_bias_block()'s own diag_room_for() guards internally, so it
+// can't block waiting on the TX buffer any more than the periodic path
+// could. 2026-09-09: added the explicit print_null_bias_block() call here
+// since that block moved out of print_timing_and_adc_block() - without
+// this line the on-demand snapshot would have silently stopped including
+// null_bias/null_bias2/null_bias3.
 void diagnostics_print_now(void)
 {
     Serial.printf("-> on-demand diagnostic snapshot (ignores mute/throttle, doesn't reset counters):\r\n");
     print_status_line();
     print_timing_and_adc_block(millis());
+    print_null_bias_block();
+#if AD9851_ATTACHED
+    canary_print_status();
+#endif
 }

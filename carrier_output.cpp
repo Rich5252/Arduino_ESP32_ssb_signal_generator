@@ -29,9 +29,28 @@ void carrier_output_init(void)
         // jumping straight to what the chip/ESP32 alone could take -
         // AD9851.h's own TIMING note warns getting this wrong produces
         // silently wrong output with "no obvious symptom short of a
-        // spectrum analyser," so verify the transmitted frequency is
-        // still exactly correct on the spectrum analyzer after
-        // reflashing, before considering pushing this higher.
+        // spectrum analyser."
+        //
+        // 2026-09-10 CORRECTION: the "verify on the spectrum analyzer"
+        // caution above couldn't actually have caught a level-shifter
+        // timing problem - AD9851_USE_BITBANG=1 (AD9851.c) has been the
+        // active transport this whole time, and until today this field
+        // was silently ignored under that transport entirely (only the
+        // now-dormant hardware-SPI branch ever read spi_clock_hz), so the
+        // real DATA/W_CLK/FQ_UD edges have been running at whatever raw
+        // back-to-back GPIO writes produce, completely unaffected by this
+        // number. Real bench measurement found that unthrottled rate
+        // sits around 7MHz-equivalent and traced it to a genuine, real
+        // symptom this whole time: two-tone's near-null atan2 noise can
+        // swing freq_dev by thousands of Hz in a single tick, flipping
+        // many DATA bits (including many fresh 0-to-1 transitions) faster
+        // than the BS170 stages' passive, pull-up-limited rising edge can
+        // settle - see moving_forward_notes.md's 2026-09-10 entries for
+        // the full investigation. This value (4000000) now genuinely
+        // throttles the bit-bang transport too (AD9851.c's
+        // ad9851_edge_delay()) rather than being dead code - 4MHz is the
+        // safe upper limit this project's own bench measurement found, so
+        // don't raise it without re-measuring the real edge timing first.
         .spi_clock_hz = 4000000,
     };
     ESP_ERROR_CHECK(ad9851_init(&ad_cfg, &s_ad9851));
@@ -58,6 +77,16 @@ void carrier_output_set_rf_enabled(bool enable)
 void carrier_output_get_profile(ad9851_profile_t *out)
 {
     ad9851_get_profile(s_ad9851, out);
+}
+
+uint32_t carrier_output_get_carrier_hz(void)
+{
+    return s_carrier_hz;
+}
+
+void carrier_output_get_canary(ad9851_canary_t *out)
+{
+    ad9851_get_canary(s_ad9851, out);
 }
 
 #endif // AD9851_ATTACHED

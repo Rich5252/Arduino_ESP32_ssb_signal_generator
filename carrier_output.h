@@ -49,4 +49,17 @@ void carrier_output_set_rf_enabled(bool enable);
 // module, matching how everything else in [timing] is reached.
 void carrier_output_get_profile(ad9851_profile_t *out);
 
+// 2026-09-09: canary check for the random-TX-jump investigation (see
+// moving_forward_notes.md). s_carrier_hz (this module's static, written
+// once in carrier_output_init() and never touched again by any command or
+// preset) is the other half of the two persistent, write-once values that
+// theory points at, alongside ad9851_canary_t's ftw_reciprocal - returns
+// the live value so the caller can compare it against the compile-time
+// CARRIER_HZ constant itself (immune to RAM corruption, unlike a second
+// shadow variable would be).
+uint32_t carrier_output_get_carrier_hz(void);
+
+// Thin wrapper over ad9851_get_canary() - see its doc comment (AD9851.h).
+void carrier_output_get_canary(ad9851_canary_t *out);
+
 #endif // AD9851_ATTACHED

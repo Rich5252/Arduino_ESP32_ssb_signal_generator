@@ -46,6 +46,23 @@ extern "C" {
  *          keeps this electrically identical to what the SPI path
  *          already proved out.
  *
+ *          2026-09-10 CORRECTION: for a long stretch this transport ran
+ *          completely unthrottled - raw back-to-back GPIO register
+ *          writes with zero delay between edges, regardless of
+ *          spi_clock_hz (that field was only ever read by the
+ *          hardware-SPI branch above, a real bug in itself since it made
+ *          an earlier "2MHz vs 4MHz, no difference" A/B test meaningless -
+ *          neither setting was actually reaching this transport). Real
+ *          bench measurement found the unthrottled rate sits around 7MHz-
+ *          equivalent, too fast for this board's BS170 inverting level
+ *          shifters (their LOW-to-HIGH edge is a passive, pull-up-limited
+ *          RC transition - much slower than the actively-driven
+ *          HIGH-to-LOW edge - so a data pattern with many simultaneous
+ *          0-to-1 transitions, exactly what a large one-tick FTW jump
+ *          produces, is the demanding case an unthrottled loop can
+ *          outrun). spi_clock_hz now actually throttles this transport
+ *          too - see ad9851_set_frequency()'s bit-bang branch.
+ *
  * TIMING: ad9851_set_frequency() is intended to be called every audio
  * sample (e.g. from dsp_task at 10kHz) for continuous phase modulation.
  * Check whichever transport is active against your real-time budget
@@ -72,7 +89,19 @@ typedef struct {
     int pin_reset;                ///< RESET - plain GPIO, toggled once at init
     uint32_t ref_clk_hz;          ///< Crystal/reference frequency, e.g. 30000000
     bool use_6x_multiplier;       ///< Enable the internal 6x REFCLK multiplier
-    int spi_clock_hz;             ///< SPI clock rate - see TIMING note above
+    int spi_clock_hz;             ///< 2026-09-10: UNTIL TODAY this was only honored by the
+                                   ///< hardware-SPI transport (AD9851_USE_BITBANG=0) - under the
+                                   ///< bit-bang transport that's actually compiled in, this field
+                                   ///< was silently ignored entirely (no code path under
+                                   ///< AD9851_USE_BITBANG=1 ever read it), so changing it did
+                                   ///< nothing at all to the real DATA/W_CLK/FQ_UD edge rate. Now
+                                   ///< wired up for the bit-bang transport too - see
+                                   ///< ad9851_init()/ad9851_set_frequency() in AD9851.c. Real
+                                   ///< bench measurement (moving_forward_notes.md, 2026-09-10):
+                                   ///< the bit-bang loop's UNTHROTTLED edge rate (raw back-to-back
+                                   ///< GPIO register writes, no delay at all) measured at ~7MHz;
+                                   ///< 4MHz measured as the safe upper limit through this board's
+                                   ///< BS170 inverting level shifters.
 } ad9851_config_t;
 
 typedef struct ad9851_s *ad9851_handle_t;
@@ -121,6 +150,41 @@ typedef struct {
 } ad9851_profile_t;
 
 void ad9851_get_profile(ad9851_handle_t handle, ad9851_profile_t *out);
+
+/**
+ * @brief Canary check for the one persistent, write-once-at-init value in
+ *        this driver's hot path: `ftw_reciprocal` (see the struct field's
+ *        comment in AD9851.c). Every other quantity `ad9851_set_frequency()`
+ *        touches is either recomputed fresh every call or resent in full
+ *        on every single write (see that function) - `ftw_reciprocal` is
+ *        the one exception, computed once in `ad9851_init()` and never
+ *        touched again by any normal code path. Added 2026-09-09 to test a
+ *        theory for an intermittent, unexplained TX-frequency jump that
+ *        "locks" rather than transiently blipping - which points at a
+ *        one-off corruption of a persistent value (RAM bit flip from ESD/
+ *        RF pickup, or a stray write from an unrelated bug elsewhere)
+ *        rather than any DSP/timing mechanism, since nothing in the normal
+ *        per-tick path could otherwise explain a wrong value that STAYS
+ *        wrong instead of self-correcting on the next 62.5us tick.
+ *
+ *        `ftw_reciprocal_now` is the live value `ad9851_set_frequency()`
+ *        is actually using right now. `ftw_reciprocal_known_good` is an
+ *        independent shadow copy taken once in `ad9851_init()` immediately
+ *        after computing the real value, stored in a different struct
+ *        field/RAM address - not a perfect guarantee (a corruption event
+ *        could in principle hit both), but a single-address bit flip
+ *        hitting two different fields at once is far less likely, so a
+ *        mismatch between them is strong evidence of exactly this failure
+ *        mode. Compare the two fields yourself (do not add an "is corrupt"
+ *        bool here - the caller may want to log the actual values either
+ *        way, e.g. to see by how much it drifted).
+ */
+typedef struct {
+    uint64_t ftw_reciprocal_now;
+    uint64_t ftw_reciprocal_known_good;
+} ad9851_canary_t;
+
+void ad9851_get_canary(ad9851_handle_t handle, ad9851_canary_t *out);
 
 /**
  * @brief Enable/disable RF output via the AD9851's own power-down

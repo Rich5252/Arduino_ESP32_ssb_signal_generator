@@ -3,6 +3,13 @@
 #include "driver/gpio.h"
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
+#include "esp_cpu.h"   // esp_cpu_get_cycle_count() - see ad9851_edge_delay()'s comment for why
+                        // esp_rom_delay_us()'s 1us granularity can't do this job. NOT verified
+                        // compilable from here (no ESP-IDF checkout in this environment, same
+                        // caveat as this project's other IDF-API guesses, e.g. the 'L' vTaskList()
+                        // handler in serial_commands.cpp) - if this header/symbol doesn't exist on
+                        // this board's exact IDF version, the older equivalent is
+                        // XTHAL_GET_CCOUNT() from xtensa/hal.h (or portGET_RUN_TIME_COUNTER_VALUE()).
 #include "soc/gpio_reg.h"
 #include "soc/soc.h"   // REG_WRITE()
 
@@ -58,6 +65,28 @@
 // GPIO_OUT1_W1TS_REG/W1TC_REG pair instead).
 #define AD9851_USE_BITBANG 1
 
+// 2026-09-11: REVERTED TO OFF at user's request - see the dated comments at
+// each ad9851_edge_delay() call site below (still present, not deleted) for
+// the full 2026-09-10/11 throttling history. Reason for reverting now: the
+// scope measurement that concluded "4MHz is the safe upper limit" for this
+// board's BS170 level shifters was taken focused on rise-time shape, without
+// separately confirming the toggle RATE actually reaching the probe was the
+// intended throttled 4MHz rather than the original unthrottled ~7MHz-
+// equivalent rate - i.e. that measurement may have unknowingly characterized
+// the ORIGINAL high-speed signal all along, which would make "4MHz measured
+// safe" an unverified conclusion. Setting this to 0 restores the exact
+// original unthrottled bit-bang behavior (raw back-to-back fast_gpio_set/clr
+// calls, no ad9851_edge_delay() calls at all) so the drive signals can be
+// re-scoped correctly this time - rate AND rise time together - before
+// deciding whether any throttling is actually needed. All three
+// ad9851_edge_delay() call sites below are guarded by this flag (not
+// deleted) specifically so re-enabling the 2026-09-10 fix, if the re-scope
+// confirms it's still needed, is a one-line flip back to 1, not a rewrite.
+// If you flip this back to 1: re-read AD9851.h's spi_clock_hz field comment
+// and ad9851_init()'s half_period_cycles derivation too - both assume this
+// path is active.
+#define AD9851_BITBANG_EDGE_DELAY_ENABLED 0
+
 struct ad9851_s {
 #if AD9851_USE_BITBANG
     int pin_data;                  // DATA/D7 - bit-banged directly, no SPI peripheral involved
@@ -80,6 +109,13 @@ struct ad9851_s {
     // steps; here for a continuously-varying frequency instead of a fixed set).
     uint64_t ftw_reciprocal;
 
+    // 2026-09-09: independent shadow copy of ftw_reciprocal, taken once
+    // right after it's first computed in ad9851_init() and never touched
+    // again by anything - see ad9851_get_canary()'s doc comment (AD9851.h)
+    // for why this exists and what a mismatch against ftw_reciprocal above
+    // would mean.
+    uint64_t ftw_reciprocal_known_good;
+
     // Written from a different context (e.g. a serial command handler)
     // than the real-time path that reads it in ad9851_set_frequency() -
     // volatile for the same reason as the other cross-context flags
@@ -100,6 +136,15 @@ struct ad9851_s {
     // transfer - see ad9851_set_frequency().
     uint32_t max_prep_us;
     uint32_t max_spi_us;
+
+#if AD9851_USE_BITBANG
+    // 2026-09-10: half-period edge-settle delay, in CPU cycles, computed
+    // once in ad9851_init() from cfg->spi_clock_hz - see ad9851_edge_delay()
+    // and ad9851_set_frequency()'s bit-bang loop for where this is spent.
+    // Plain uint32_t: written once at init, read only from the same
+    // real-time path that uses it, no cross-context concern.
+    uint32_t half_period_cycles;
+#endif
 };
 
 #define AD9851_CTRL_ENABLE_MULTIPLIER 0x01   // matches the Nano library's AD9851_ENABLE_MULTIPLIER
@@ -121,6 +166,46 @@ static inline void IRAM_ATTR fast_gpio_set(int pin)
 static inline void IRAM_ATTR fast_gpio_clr(int pin)
 {
     REG_WRITE(GPIO_OUT_W1TC_REG, 1UL << pin);
+}
+
+// 2026-09-10: edge-settle delay for the bit-bang transport - see
+// ad9851_config_t's spi_clock_hz field (AD9851.h) and AD9851_USE_BITBANG's
+// header comment for the full story. Real bench measurement found this
+// loop's raw, unthrottled edge rate (fast_gpio_set/clr called back-to-back
+// with nothing between them) sits around 7MHz-equivalent - too fast for
+// this board's BS170 inverting level shifters, whose LOW-to-HIGH edge is a
+// passive, pull-up-charged RC transition (much slower than the actively-
+// driven HIGH-to-LOW edge - see AD9851_INVERTING_LEVEL_SHIFT's own comment
+// for which GPIO level maps to which AD9851-side edge). 4MHz measured as
+// the safe upper limit. Two edges per bit period actually need this
+// margin: DATA settling (specifically the "off" -> "pulled-up HIGH"
+// transition, i.e. a fresh 0-to-1 bit) before W_CLK's own falling call
+// samples it, and W_CLK's OWN falling call itself (which is the AD9851-
+// side RISING/sampling edge, per the same inversion) needing to fully
+// complete before the pulse ends. A large one-tick FTW jump - exactly
+// what two-tone's near-null atan2 noise produces (confirmed real, up to
+// 8562Hz single-tick swings - see moving_forward_notes.md) - can flip many
+// DATA bits at once, including many fresh 0-to-1 transitions, which is
+// precisely the demanding case for this margin; a smooth, slowly-varying
+// FTW (sine, FMTEST) rarely does. This is the leading theory for the
+// two-tone-specific "sticks" symptom this thread has been chasing.
+//
+// esp_rom_delay_us() (used elsewhere in this file, e.g. the RESET pulse)
+// can't do this job - its granularity is 1 WHOLE MICROSECOND, two orders
+// of magnitude coarser than the ~125ns half-period 4MHz needs (1us of
+// delay per edge, times ~80 edges/transfer, would blow the 62.5us dsp_task
+// tick budget on its own). This busy-waits on the CPU cycle counter
+// instead, which resolves single-digit nanoseconds at 240MHz.
+static inline void IRAM_ATTR ad9851_edge_delay(uint32_t cycles)
+{
+    uint32_t start = esp_cpu_get_cycle_count();
+    while ((uint32_t)(esp_cpu_get_cycle_count() - start) < cycles) {
+        // busy-wait - deliberately not esp_rom_delay_us(), see this
+        // function's own header comment. Unsigned subtraction handles the
+        // cycle counter's own wraparound correctly (it's a free-running
+        // 32-bit counter), same reasoning already used elsewhere in this
+        // project for esp_timer_get_time()-based interval math.
+    }
 }
 #else
 // Hardware SPI sends MSB-first by default; the AD9851 wants LSB-first
@@ -171,6 +256,26 @@ esp_err_t ad9851_init(const ad9851_config_t *cfg, ad9851_handle_t *out_handle)
         return ESP_ERR_INVALID_ARG;
     }
     h->ftw_reciprocal = (1ULL << AD9851_FTW_RECIP_SHIFT) / effective_ref_hz_init;
+    h->ftw_reciprocal_known_good = h->ftw_reciprocal;   // shadow copy - see ad9851_get_canary()
+
+#if AD9851_USE_BITBANG
+    // 2026-09-10: derive the bit-bang edge-settle delay from cfg->spi_clock_hz
+    // - see that field's comment (AD9851.h) and ad9851_edge_delay()'s comment
+    // just above for the full story (this field used to be silently ignored
+    // under this transport entirely). One-time division at init, not the
+    // per-call hot path, so plain 64-bit integer math is fine here even
+    // though ad9851_set_frequency() itself avoids it.
+    //
+    // half_period_cycles = (CPU cycles per second) / (2 * spi_clock_hz)
+    //                     = cpu_ticks_per_us * 1,000,000 / (2 * spi_clock_hz)
+    //
+    // e.g. 240 ticks/us, spi_clock_hz=4000000 -> 240e6 / 8e6 = 30 cycles
+    // (~125ns @240MHz) - matches the ~4MHz target edge rate.
+    uint32_t cpu_ticks_per_us = esp_rom_get_cpu_ticks_per_us();
+    uint32_t safe_spi_clock_hz = (cfg->spi_clock_hz > 0) ? (uint32_t)cfg->spi_clock_hz : 4000000u;
+    h->half_period_cycles = (uint32_t)(((uint64_t)cpu_ticks_per_us * 1000000ULL)
+                                        / (2ULL * (uint64_t)safe_spi_clock_hz));
+#endif
 
     gpio_config_t reset_cfg = {
         .pin_bit_mask = 1ULL << cfg->pin_reset,
@@ -406,12 +511,63 @@ void IRAM_ATTR ad9851_set_frequency(ad9851_handle_t handle, uint32_t freq_hz)
 #else
             if (b) fast_gpio_set(handle->pin_data); else fast_gpio_clr(handle->pin_data);
 #endif
+#if AD9851_BITBANG_EDGE_DELAY_ENABLED
+            // 2026-09-10: let DATA settle before W_CLK's sampling edge
+            // below - see ad9851_edge_delay()'s comment for why. Matters
+            // most for a fresh 0-to-1 bit (the level-shifter's slow,
+            // pull-up-charged direction under AD9851_INVERTING_LEVEL_SHIFT);
+            // applied unconditionally rather than only on that specific
+            // transition, since a fixed-cost busy-wait is simpler and
+            // cheaper to reason about than tracking the previous bit's
+            // value just to skip it sometimes.
+            //
+            // 2026-09-11: DISABLED (see AD9851_BITBANG_EDGE_DELAY_ENABLED's
+            // own comment above) pending a re-scope of the real drive-signal
+            // toggle rate.
+            ad9851_edge_delay(handle->half_period_cycles);
+#endif
+
             // Clock pulse: ESP32 W_CLK HIGH->LOW->HIGH. After the
             // inverting level shift this is AD9851-side LOW->HIGH->LOW -
             // DATA is set up above before this transition, so it's valid
             // before the AD9851's own rising edge, same relationship the
             // SPI path's mode-2-compensating-for-mode-0 setup achieves.
             fast_gpio_clr(handle->pin_wclk);
+#if AD9851_BITBANG_EDGE_DELAY_ENABLED
+            // 2026-09-11 RESTORED (then DISABLED again same day - see
+            // AD9851_BITBANG_EDGE_DELAY_ENABLED's own comment above, this
+            // history kept intact underneath): this call IS the AD9851-side
+            // rising/sampling edge (same slow pull-up-charged direction as a
+            // fresh DATA 0-to-1 bit), and needs the same settle margin before
+            // the pulse ends as the DATA-settle delay above gives that
+            // signal - belt-and-suspenders, not redundant, per the original
+            // 2026-09-10 bench test that first added it.
+            //
+            // Trimmed for one day (2026-09-10 -> 2026-09-11) to buy back
+            // margin (max_busy_us 58->46 of the 62.5us budget) after that
+            // noise-increase report. The trim held up under active
+            // delay-sweep testing, but a fresh capture on 2026-09-11 caught
+            // a real hands-off -45Hz jump (max_freq_dev_step 10387Hz at
+            // t=308407ms, digital chain otherwise clean - freq_dev/tx_freq
+            // nominal throughout, canary OK) with delay untouched, i.e. with
+            // no sweep provoking it. That doesn't distinguish "the trim
+            // reopened the gap" from "a separate mechanism the SPI fix was
+            // never going to touch" - restoring this delay is exactly the
+            // comparison needed to tell those apart: if hands-off jumps stop
+            // with both delays back, the trim was the problem and this
+            // margin cost is the real price of the fix; if they still
+            // happen, this specific jump has some other cause and the trim
+            // was fine to make.
+            //
+            // 2026-09-11, LATER SAME DAY: disabled again, along with the
+            // other two delay call sites, before that comparison run
+            // actually happened - see AD9851_BITBANG_EDGE_DELAY_ENABLED.
+            // Superseded by the higher-priority need to re-verify the real
+            // drive-signal toggle rate against the original rise-time
+            // measurement. Re-run the hands-off comparison this comment
+            // describes once that's settled and this flag (if) goes back to 1.
+            ad9851_edge_delay(handle->half_period_cycles);
+#endif
             fast_gpio_set(handle->pin_wclk);
         }
     }
@@ -419,6 +575,17 @@ void IRAM_ATTR ad9851_set_frequency(ad9851_handle_t handle, uint32_t freq_hz)
     // End shift: ESP32 GPIO LOW -> AD9851 side HIGH, the required
     // LOW-to-HIGH latch transition, back at FQ_UD's normal idle level.
     fast_gpio_clr(handle->pin_fqud);
+#if AD9851_BITBANG_EDGE_DELAY_ENABLED
+    // 2026-09-10: this IS the actual latch edge (see the comment above),
+    // and it's the same slow pull-up-charged direction as the per-bit
+    // edges above - give it the same margin before returning, cheap
+    // insurance since it only costs one extra delay per whole transfer
+    // rather than one per bit.
+    //
+    // 2026-09-11: disabled along with the other two call sites - see
+    // AD9851_BITBANG_EDGE_DELAY_ENABLED's comment near the top of this file.
+    ad9851_edge_delay(handle->half_period_cycles);
+#endif
 #else
     spi_transaction_t t = {
         .length = 40,   // bits
@@ -443,6 +610,13 @@ void ad9851_get_profile(ad9851_handle_t handle, ad9851_profile_t *out)
     if (!handle || !out) return;
     out->max_prep_us = handle->max_prep_us;
     out->max_spi_us = handle->max_spi_us;
+}
+
+void ad9851_get_canary(ad9851_handle_t handle, ad9851_canary_t *out)
+{
+    if (!handle || !out) return;
+    out->ftw_reciprocal_now = handle->ftw_reciprocal;
+    out->ftw_reciprocal_known_good = handle->ftw_reciprocal_known_good;
 }
 
 void ad9851_deinit(ad9851_handle_t handle)
