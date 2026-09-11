@@ -3,6 +3,7 @@
  */
 
 #include "envelope_ampeq.h"
+#include <math.h>   // isnan()/isinf() - see envelope_ampeq_get_canary()
 
 static ssb_shelf_biquad_t s_env_ampeq_shelf1;
 static ssb_shelf_biquad_t s_env_ampeq_shelf2;
@@ -54,4 +55,11 @@ void envelope_ampeq_shelf2_set_enabled(bool enable)
     if (enable && !was_on) {
         ssb_shelf_biquad_reset(&s_env_ampeq_shelf2);
     }
+}
+
+void envelope_ampeq_get_canary(env_ampeq_canary_t *out)
+{
+    if (!out) return;
+    out->shelf1_finite = isfinite(s_env_ampeq_shelf1.y1) && isfinite(s_env_ampeq_shelf1.y2);
+    out->shelf2_finite = isfinite(s_env_ampeq_shelf2.y1) && isfinite(s_env_ampeq_shelf2.y2);
 }

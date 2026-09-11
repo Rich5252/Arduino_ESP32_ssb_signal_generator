@@ -12,6 +12,7 @@
 #include "esp_rom_sys.h"
 #include "soc/gpio_struct.h"   // GPIO.out_w1ts/w1tc - see adc_conv_done_cb()'s Fs jitter hunt toggle
 #include <Arduino.h>
+#include <math.h>   // isnan()/isinf() (via isfinite()) - see adc_capture_get_lpf_canary()
 
 #define ADC_UNIT       ADC_UNIT_1
 #define ADC_CHANNEL    ADC_CHANNEL_5   // GPIO6 on ESP32-S3 - Micr input
@@ -410,4 +411,13 @@ void adc_capture_get_diag(adc_capture_diag_t *out)
 int64_t adc_capture_get_start_us(void)
 {
     return s_adc_start_us;
+}
+
+void adc_capture_get_lpf_canary(adc_lpf_canary_t *out)
+{
+    if (!out) return;
+    out->butterworth_finite = isfinite(s_adc_lpf_butterworth.stage1.z1) && isfinite(s_adc_lpf_butterworth.stage1.z2)
+                            && isfinite(s_adc_lpf_butterworth.stage2.z1) && isfinite(s_adc_lpf_butterworth.stage2.z2);
+    out->chebyshev_finite = isfinite(s_adc_lpf_chebyshev.stage1.z1) && isfinite(s_adc_lpf_chebyshev.stage1.z2)
+                          && isfinite(s_adc_lpf_chebyshev.stage2.z1) && isfinite(s_adc_lpf_chebyshev.stage2.z2);
 }

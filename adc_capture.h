@@ -174,7 +174,7 @@
 //     Butterworth above 3000Hz at every order - at 4th order, e.g. -47.7dB
 //     vs -35.1dB at 8kHz, both converging to the same ultimate
 //     -24dB/octave slope far out (filter ORDER, not family, sets that).
-#define ADC_LPF_CUTOFF_HZ             2800.0f
+#define ADC_LPF_CUTOFF_HZ             3000.0f
 #define ADC_LPF_CHEBYSHEV_RIPPLE_DB   1.0f   // standard/commonly-cited spec; small (~1.4dB peak
                                               // at 4th order) in-band ripple bump in exchange for
                                               // the steeper rolloff above - inconsequential for
@@ -265,6 +265,30 @@ const char *adc_capture_lpf_mode_name(adc_lpf_mode_t mode);
 void adc_capture_reset_diag(void);
 
 void adc_capture_get_diag(adc_capture_diag_t *out);
+
+/**
+ * @brief 2026-09-11: NaN/Inf canary for the ADC LPF's two biquad4 cascades
+ *        - same purpose and reasoning as envelope_gdeq_get_canary()/
+ *        envelope_ampeq_get_canary() (see moving_forward_notes.md's
+ *        matching entry): an IIR filter's feedback state (z1/z2 here,
+ *        Direct-Form-II-transposed) can carry a bad value forward forever
+ *        once introduced, and nothing in ssb_adc_filter.c's flush_denorm()
+ *        calls catches NaN/Inf, only near-zero subnormals. Checked
+ *        regardless of which filter (or neither) is currently selected via
+ *        adc_capture_set_lpf_mode() - both are always initialized and kept
+ *        current per adc_capture_init()'s own comment, so both are always
+ *        worth checking. Not currently exercised by two-tone/synthetic
+ *        test modes (adc_capture_read_next_sample() - the only code that
+ *        runs these filters - isn't called for those sources, see
+ *        ssb_mic_test.ino), only relevant once a mic-driven source is
+ *        active - included anyway for completeness/future use.
+ */
+typedef struct {
+    bool butterworth_finite;
+    bool chebyshev_finite;
+} adc_lpf_canary_t;
+
+void adc_capture_get_lpf_canary(adc_lpf_canary_t *out);
 
 // esp_timer microsecond timestamp captured once at adc_continuous_start()
 // (and again on 'r', "restarting the long-window average from now" per

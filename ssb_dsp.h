@@ -147,6 +147,34 @@ bool ssb_dsp_get_eq_enabled(ssb_dsp_handle_t handle);
 bool ssb_dsp_get_compressor_enabled(ssb_dsp_handle_t handle);
 
 /**
+ * @brief 2026-09-11: NaN/Inf canary for this module's three IIR-style
+ *        persistent states (eq_hpf/eq_presence biquad feedback, the
+ *        compressor's envelope follower) - see moving_forward_notes.md's
+ *        matching entry for the full motivation. Unlike freq_dev_hz/phase
+ *        (recomputed fresh from atan2(Q,I) every sample - a bad tick can't
+ *        outlive itself), these carry state forward every tick; a NaN/Inf
+ *        value here would persist indefinitely once introduced, and
+ *        nothing in this file's flush_denorm() calls would catch it (only
+ *        near-zero subnormals are). Found and fixed one real "resumes from
+ *        stale state" bug in ssb_dsp_set_eq_enabled() while adding this
+ *        (see that function) - this canary is the live/ongoing check for
+ *        whether that state is EVER actually non-finite, complementing the
+ *        code-level fix rather than replacing the need for it.
+ *        *_finite reads true (healthy) even while the corresponding stage
+ *        is disabled via ssb_dsp_set_eq_enabled()/set_compressor_enabled()
+ *        - a disabled stage's state is simply frozen, not being fed
+ *        anything, so "still finite" is the correct steady-state answer,
+ *        not a false positive.
+ */
+typedef struct {
+    bool eq_hpf_finite;
+    bool eq_presence_finite;
+    bool compressor_env_finite;
+} ssb_dsp_iir_canary_t;
+
+void ssb_dsp_get_iir_canary(ssb_dsp_handle_t handle, ssb_dsp_iir_canary_t *out);
+
+/**
  * @brief Master gain trim, in dB, applied after EQ/compressor (or
  *        directly to the raw sample if audio_fx wasn't enabled at init -
  *        this always works). Deliberately manual rather than automatic:

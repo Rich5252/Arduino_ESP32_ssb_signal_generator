@@ -7,6 +7,7 @@
 #include "dsp_state.h"
 #include "adc_capture.h"
 #include "envelope_gdeq.h"
+#include "envelope_ampeq.h"
 #include "envelope_output.h"
 #include "ssb_dsp.h"
 #include "carrier_output.h"
@@ -144,6 +145,24 @@ static volatile bool s_diag_muted = false;
 // s_dbg_max_busy_us etc. elsewhere in this file.
 static volatile uint32_t s_dbg_canary_carrier_bad_since_ms = 0;
 static volatile uint32_t s_dbg_canary_ftw_bad_since_ms = 0;
+
+// 2026-09-11: same latch pattern, extended to the IIR filters' own
+// feedback state (see ssb_dsp_get_iir_canary()/envelope_gdeq_get_canary()/
+// envelope_ampeq_get_canary()/adc_capture_get_lpf_canary()'s doc comments,
+// and moving_forward_notes.md's matching entry, for why these specifically
+// - unlike freq_dev_hz/phase, which are recomputed fresh every tick, an
+// IIR filter's own y1/y2/z1/z2/env state can carry a bad (NaN/Inf) value
+// forward indefinitely once introduced). One latch per MODULE rather than
+// per individual float/stage - keeps this list from growing to nine
+// separate high-water marks for what would functionally be "the same
+// canary, checked in five different places"; canary_print_status() names
+// exactly which sub-state was bad when it prints the detail, the latch
+// timestamp itself doesn't need that granularity.
+static volatile uint32_t s_dbg_canary_eq_bad_since_ms = 0;
+static volatile uint32_t s_dbg_canary_comp_bad_since_ms = 0;
+static volatile uint32_t s_dbg_canary_gdeq_bad_since_ms = 0;
+static volatile uint32_t s_dbg_canary_ampeq_bad_since_ms = 0;
+static volatile uint32_t s_dbg_canary_adclpf_bad_since_ms = 0;
 
 // Core 1 headroom - see the Fs jitter hunt's crosscore-wake finding: the
 // ~1us->6us stretch on gptimer's notify-from-ISR call only happens when
@@ -369,9 +388,11 @@ void diagnostics_reset(void)
 #endif
 
     // Deliberately NOT resetting s_dbg_canary_carrier_bad_since_ms /
-    // s_dbg_canary_ftw_bad_since_ms here - they're meant to catch a rare,
-    // possibly once-per-session event (see canary_check_background()), and
-    // this reset gets called often (every 'r' keypress) as part of normal
+    // s_dbg_canary_ftw_bad_since_ms (or, as of 2026-09-11, the five IIR
+    // canary latches - s_dbg_canary_eq_/_comp_/_gdeq_/_ampeq_/_adclpf_
+    // bad_since_ms) here - they're meant to catch a rare, possibly
+    // once-per-session event (see canary_check_background()), and this
+    // reset gets called often (every 'r' keypress) as part of normal
     // day-to-day measurement hygiene. Resetting them here would mean any
     // corruption event that happened before the last 'r' silently
     // disappears the moment someone starts a fresh measurement window -
@@ -602,6 +623,60 @@ static void canary_check_background(void)
                           s_dbg_canary_ftw_bad_since_ms);
         }
     }
+
+    // 2026-09-11: IIR feedback-state canaries - see the latches' own
+    // declaration comment above and each module's *_get_canary() doc
+    // comment for why. Same "check every tick unconditionally, only print
+    // on the first transition to bad" pattern as the two checks above -
+    // cheap (a handful of isfinite() calls) even every tick, and NaN/Inf
+    // in feedback state can't self-correct once introduced, so there's no
+    // risk of missing a fast self-healing event the way there might be for
+    // something that recovers on its own.
+    ssb_dsp_iir_canary_t iir_c;
+    ssb_dsp_get_iir_canary(dsp_state_get_ssb(), &iir_c);
+    if ((!iir_c.eq_hpf_finite || !iir_c.eq_presence_finite) && s_dbg_canary_eq_bad_since_ms == 0) {
+        s_dbg_canary_eq_bad_since_ms = millis();
+        if (diag_room_for(110)) {
+            Serial.printf("[canary] eq biquad state MISMATCH (hpf_ok=%d presence_ok=%d)! first seen at t=%ums\r\n",
+                          (int)iir_c.eq_hpf_finite, (int)iir_c.eq_presence_finite, s_dbg_canary_eq_bad_since_ms);
+        }
+    }
+    if (!iir_c.compressor_env_finite && s_dbg_canary_comp_bad_since_ms == 0) {
+        s_dbg_canary_comp_bad_since_ms = millis();
+        if (diag_room_for(90)) {
+            Serial.printf("[canary] compressor env MISMATCH! first seen at t=%ums\r\n", s_dbg_canary_comp_bad_since_ms);
+        }
+    }
+
+    env_gdeq_canary_t gdeq_c;
+    envelope_gdeq_get_canary(&gdeq_c);
+    if ((!gdeq_c.stage1_finite || !gdeq_c.stage2_finite) && s_dbg_canary_gdeq_bad_since_ms == 0) {
+        s_dbg_canary_gdeq_bad_since_ms = millis();
+        if (diag_room_for(110)) {
+            Serial.printf("[canary] gdeq allpass state MISMATCH (s1_ok=%d s2_ok=%d)! first seen at t=%ums\r\n",
+                          (int)gdeq_c.stage1_finite, (int)gdeq_c.stage2_finite, s_dbg_canary_gdeq_bad_since_ms);
+        }
+    }
+
+    env_ampeq_canary_t ampeq_c;
+    envelope_ampeq_get_canary(&ampeq_c);
+    if ((!ampeq_c.shelf1_finite || !ampeq_c.shelf2_finite) && s_dbg_canary_ampeq_bad_since_ms == 0) {
+        s_dbg_canary_ampeq_bad_since_ms = millis();
+        if (diag_room_for(110)) {
+            Serial.printf("[canary] ampeq shelf state MISMATCH (s1_ok=%d s2_ok=%d)! first seen at t=%ums\r\n",
+                          (int)ampeq_c.shelf1_finite, (int)ampeq_c.shelf2_finite, s_dbg_canary_ampeq_bad_since_ms);
+        }
+    }
+
+    adc_lpf_canary_t adc_c;
+    adc_capture_get_lpf_canary(&adc_c);
+    if ((!adc_c.butterworth_finite || !adc_c.chebyshev_finite) && s_dbg_canary_adclpf_bad_since_ms == 0) {
+        s_dbg_canary_adclpf_bad_since_ms = millis();
+        if (diag_room_for(120)) {
+            Serial.printf("[canary] adc lpf state MISMATCH (butw_ok=%d cheb_ok=%d)! first seen at t=%ums\r\n",
+                          (int)adc_c.butterworth_finite, (int)adc_c.chebyshev_finite, s_dbg_canary_adclpf_bad_since_ms);
+        }
+    }
 }
 
 static void canary_print_status(void)
@@ -625,6 +700,53 @@ static void canary_print_status(void)
                       (unsigned long long)ad_canary.ftw_reciprocal_now,
                       (unsigned long long)ad_canary.ftw_reciprocal_known_good,
                       s_dbg_canary_ftw_bad_since_ms);
+    }
+
+    // 2026-09-11: IIR feedback-state canaries - see canary_check_background()
+    // for why these exist. Printed as ONE compact "OK" line covering all
+    // five modules in the (overwhelmingly common) healthy case - matches
+    // this file's own diag_room_for() lesson about not routinely printing
+    // more than this board's Serial buffer can actually hold - and only
+    // expands into per-module MISMATCH detail lines in the rare case one
+    // is actually bad, same as every other canary here. No diag_room_for()
+    // guard needed - this whole function is the on-demand/user-requested
+    // path (see this function's own doc comment above canary_check_
+    // background()), which is fine to always print in full.
+    ssb_dsp_iir_canary_t iir_c;
+    ssb_dsp_get_iir_canary(dsp_state_get_ssb(), &iir_c);
+    env_gdeq_canary_t gdeq_c;
+    envelope_gdeq_get_canary(&gdeq_c);
+    env_ampeq_canary_t ampeq_c;
+    envelope_ampeq_get_canary(&ampeq_c);
+    adc_lpf_canary_t adc_c;
+    adc_capture_get_lpf_canary(&adc_c);
+
+    bool all_iir_ok = iir_c.eq_hpf_finite && iir_c.eq_presence_finite && iir_c.compressor_env_finite
+                    && gdeq_c.stage1_finite && gdeq_c.stage2_finite
+                    && ampeq_c.shelf1_finite && ampeq_c.shelf2_finite
+                    && adc_c.butterworth_finite && adc_c.chebyshev_finite;
+    if (all_iir_ok) {
+        Serial.printf("[canary] iir_state: OK (eq/comp/gdeq/ampeq/adc_lpf)\r\n");
+    } else {
+        if (!iir_c.eq_hpf_finite || !iir_c.eq_presence_finite) {
+            Serial.printf("[canary] eq biquad state MISMATCH (hpf_ok=%d presence_ok=%d)! first seen at t=%ums\r\n",
+                          (int)iir_c.eq_hpf_finite, (int)iir_c.eq_presence_finite, s_dbg_canary_eq_bad_since_ms);
+        }
+        if (!iir_c.compressor_env_finite) {
+            Serial.printf("[canary] compressor env MISMATCH! first seen at t=%ums\r\n", s_dbg_canary_comp_bad_since_ms);
+        }
+        if (!gdeq_c.stage1_finite || !gdeq_c.stage2_finite) {
+            Serial.printf("[canary] gdeq allpass state MISMATCH (s1_ok=%d s2_ok=%d)! first seen at t=%ums\r\n",
+                          (int)gdeq_c.stage1_finite, (int)gdeq_c.stage2_finite, s_dbg_canary_gdeq_bad_since_ms);
+        }
+        if (!ampeq_c.shelf1_finite || !ampeq_c.shelf2_finite) {
+            Serial.printf("[canary] ampeq shelf state MISMATCH (s1_ok=%d s2_ok=%d)! first seen at t=%ums\r\n",
+                          (int)ampeq_c.shelf1_finite, (int)ampeq_c.shelf2_finite, s_dbg_canary_ampeq_bad_since_ms);
+        }
+        if (!adc_c.butterworth_finite || !adc_c.chebyshev_finite) {
+            Serial.printf("[canary] adc lpf state MISMATCH (butw_ok=%d cheb_ok=%d)! first seen at t=%ums\r\n",
+                          (int)adc_c.butterworth_finite, (int)adc_c.chebyshev_finite, s_dbg_canary_adclpf_bad_since_ms);
+        }
     }
 }
 #endif // AD9851_ATTACHED

@@ -3,6 +3,7 @@
  */
 
 #include "envelope_gdeq.h"
+#include <math.h>   // isnan()/isinf() (via isfinite()) - see envelope_gdeq_get_canary()
 
 static ssb_allpass1_t s_env_gdeq_1;
 static ssb_allpass1_t s_env_gdeq_2;
@@ -142,4 +143,11 @@ void envelope_gdeq_set_variant(env_gdeq_variant_t variant)
     env_gdeq_coefficients_for_variant(s_env_gdeq_variant, &a1, &a2);
     ssb_allpass1_init(&s_env_gdeq_1, a1);
     ssb_allpass1_init(&s_env_gdeq_2, a2);
+}
+
+void envelope_gdeq_get_canary(env_gdeq_canary_t *out)
+{
+    if (!out) return;
+    out->stage1_finite = isfinite(s_env_gdeq_1.y1);
+    out->stage2_finite = isfinite(s_env_gdeq_2.y1);
 }

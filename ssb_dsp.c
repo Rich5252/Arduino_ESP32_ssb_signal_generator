@@ -501,7 +501,28 @@ void ssb_dsp_set_compressor(ssb_dsp_handle_t handle, float threshold, float rati
 void IRAM_ATTR ssb_dsp_set_eq_enabled(ssb_dsp_handle_t handle, bool enable)
 {
     if (!handle || !handle->audio_fx_configured) return;
+    bool was_on = handle->eq_enable;
     handle->eq_enable = enable;
+    // 2026-09-11: reset both biquads' state on re-enable - mirrors
+    // ssb_dsp_set_compressor_enabled()'s identical fix just below, which
+    // this one should have matched from the start. eq_hpf/eq_presence only
+    // update their own x1/x2/y1/y2 state inside biquad_process(), which
+    // isn't called at all while eq_enable is false (see the
+    // audio_fx_configured block in ssb_dsp_process_sample()) - so that
+    // state sits frozen, not decaying, while eq is off. Without this,
+    // re-enabling fed that stale (possibly large, whatever it happened to
+    // be at the instant eq was switched off) state straight into the very
+    // next sample's output - a real discontinuity at the toggle instant,
+    // not "forever" (these are BIBO-stable filters for normal coefficients,
+    // so the stale-state transient decays within a few dozen samples), but
+    // still a genuine bug, and exactly the class of "can a filter's own
+    // memory get stuck on a bad value" question raised this session -
+    // found while checking whether that's possible anywhere in this IIR
+    // chain. See moving_forward_notes.md's 2026-09-11 entry.
+    if (enable && !was_on) {
+        handle->eq_hpf.x1 = handle->eq_hpf.x2 = handle->eq_hpf.y1 = handle->eq_hpf.y2 = 0.0f;
+        handle->eq_presence.x1 = handle->eq_presence.x2 = handle->eq_presence.y1 = handle->eq_presence.y2 = 0.0f;
+    }
 }
 
 void IRAM_ATTR ssb_dsp_set_compressor_enabled(ssb_dsp_handle_t handle, bool enable)
@@ -524,6 +545,24 @@ bool ssb_dsp_get_eq_enabled(ssb_dsp_handle_t handle)
 bool ssb_dsp_get_compressor_enabled(ssb_dsp_handle_t handle)
 {
     return handle && handle->audio_fx_configured && handle->comp_enable;
+}
+
+void ssb_dsp_get_iir_canary(ssb_dsp_handle_t handle, ssb_dsp_iir_canary_t *out)
+{
+    if (!out) return;
+    if (!handle || !handle->audio_fx_configured) {
+        // Nothing was ever set up (see ssb_dsp_set_eq_enabled()'s own
+        // early-return for the same guard) - report healthy rather than
+        // reading uninitialized/zeroed struct fields that were never
+        // actually driven by any filter math.
+        out->eq_hpf_finite = true;
+        out->eq_presence_finite = true;
+        out->compressor_env_finite = true;
+        return;
+    }
+    out->eq_hpf_finite = isfinite(handle->eq_hpf.y1) && isfinite(handle->eq_hpf.y2);
+    out->eq_presence_finite = isfinite(handle->eq_presence.y1) && isfinite(handle->eq_presence.y2);
+    out->compressor_env_finite = isfinite(handle->comp.env);
 }
 
 void IRAM_ATTR ssb_dsp_set_master_gain_db(ssb_dsp_handle_t handle, float gain_db)

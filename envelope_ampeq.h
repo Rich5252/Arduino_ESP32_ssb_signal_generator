@@ -300,3 +300,26 @@ void envelope_ampeq_set_enabled(bool enable);
 // the other's continuity.
 bool envelope_ampeq_shelf2_get_enabled(void);
 void envelope_ampeq_shelf2_set_enabled(bool enable);
+
+/**
+ * @brief 2026-09-11: NaN/Inf canary for this module's two shelf biquads -
+ *        see moving_forward_notes.md's matching entry for why this exists
+ *        (an IIR filter's own feedback state, unlike the memoryless
+ *        freq_dev/atan2 computation, can carry a bad value forward
+ *        indefinitely once introduced - flush_denorm() elsewhere in this
+ *        codebase only catches near-zero subnormals, not NaN/Inf). Checks
+ *        y1/y2 - the values actually fed back into the next sample - not
+ *        x1/x2, since a bad output would already be visible at y before it
+ *        could reach the input-history side anyway, same reasoning as
+ *        checking only y1 for ssb_allpass1_t's canary. true = finite (OK)
+ *        even when the corresponding shelf is currently disabled - a
+ *        disabled shelf's state is frozen, not being fed anything, so
+ *        "still finite" is the right steady-state answer while off, not a
+ *        false positive.
+ */
+typedef struct {
+    bool shelf1_finite;
+    bool shelf2_finite;
+} env_ampeq_canary_t;
+
+void envelope_ampeq_get_canary(env_ampeq_canary_t *out);

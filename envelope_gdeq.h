@@ -637,3 +637,24 @@ const char *envelope_gdeq_variant_name(env_gdeq_variant_t variant);
 // frequencies effect, not a mean-delay one); candidate B hasn't been
 // bench-tuned at all yet, so '['/']' will need finding from scratch there.
 void envelope_gdeq_set_variant(env_gdeq_variant_t variant);
+
+/**
+ * @brief 2026-09-11: NaN/Inf canary for this module's two allpass sections
+ *        - see moving_forward_notes.md's matching entry and
+ *        envelope_ampeq_get_canary()'s identical-purpose sibling
+ *        (envelope_ampeq.h) for the full reasoning: an IIR filter's own
+ *        feedback state can carry a bad value forward forever once
+ *        introduced, unlike the memoryless freq_dev/atan2 computation this
+ *        investigation started with, and nothing in this codebase's
+ *        flush_denorm() calls catches NaN/Inf (only near-zero subnormals).
+ *        Checks y1 - the fed-back output - for each section; true = finite
+ *        (OK), including while gdeq is disabled (state is simply frozen,
+ *        not fed anything, while off - "still finite" is the correct
+ *        steady-state answer there, not a false positive).
+ */
+typedef struct {
+    bool stage1_finite;
+    bool stage2_finite;
+} env_gdeq_canary_t;
+
+void envelope_gdeq_get_canary(env_gdeq_canary_t *out);
