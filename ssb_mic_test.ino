@@ -655,8 +655,19 @@ static void IRAM_ATTR dsp_task(void* arg)
         // fractional.
         float delayed_envelope = envelope;
         float delayed_freq_dev_hz = freq_dev_hz;
+        float envelope_at_freq_time = envelope;      // see relative_delay.h - only meaningfully
+        float envelope_at_freq_time_min = envelope;  // different from plain `envelope` once AD9851_ATTACHED
+        // raw_freq_dev_near/_far (2026-09-12, later same day): the two RAW,
+        // undelayed freq_dev_hz ring values interp_ring() blends to produce
+        // delayed_freq_dev_hz - see relative_delay.h/diagnostics.h for why.
+        // Initialized to freq_dev_hz (this tick's own undelayed value) so
+        // they're sane even when AD9851_ATTACHED is off.
+        float raw_freq_dev_near = freq_dev_hz;
+        float raw_freq_dev_far = freq_dev_hz;
 #if AD9851_ATTACHED
-        relative_delay_apply(freq_dev_hz, envelope, &delayed_freq_dev_hz, &delayed_envelope);
+        relative_delay_apply(freq_dev_hz, envelope, &delayed_freq_dev_hz, &delayed_envelope,
+                              &envelope_at_freq_time, &envelope_at_freq_time_min,
+                              &raw_freq_dev_near, &raw_freq_dev_far);
 #endif
 
         // t_start_us (captured at the very top of this tick, before any
@@ -675,10 +686,20 @@ static void IRAM_ATTR dsp_task(void* arg)
         // been blind to whatever the delay line does), these are what's
         // ACTUALLY sent to the chip - the only way to directly verify
         // from firmware whether changing the relative delay ever alters
-        // the computed frequency itself (it shouldn't - a pure sample
-        // delay can't change frequency content - vs. just when a given
-        // value gets sent).
-        diagnostics_set_tx_info(delayed_freq_dev_hz, tx_freq);
+        // the computed frequency itself.
+        // 2026-09-12 CORRECTION: the line this replaced claimed "it
+        // shouldn't - a pure sample delay can't change frequency content",
+        // which is true of freq_dev_hz's own spectrum in isolation but was
+        // the wrong question - relative_delay shifts freq_dev_hz relative
+        // to envelope, and that CROSS-alignment is what decides whether a
+        // near-null freq_dev spike lands on envelope~=0 (suppressed, no
+        // effect on the transmitted spectrum) or on nonzero envelope (a
+        // real, coherent contamination) - see the jump log
+        // (diagnostics.h/.cpp) and null_bias_investigation.md's 2026-09-12
+        // entries for the full mechanism this was found from.
+        diagnostics_set_tx_info(delayed_freq_dev_hz, delayed_envelope, envelope_at_freq_time,
+                                 envelope_at_freq_time_min, raw_freq_dev_near, raw_freq_dev_far,
+                                 tx_freq);
 #endif
 
         // Non-blocking, always succeeds - overwrites whatever was there.
@@ -703,6 +724,12 @@ static void IRAM_ATTR dsp_task(void* arg)
         uint32_t write_us = (uint32_t)(t_write_done_us - t_dsp_done_us);
         uint32_t busy_us  = (uint32_t)(t_write_done_us - t_start_us);
         diagnostics_record_phase_timings(adc_us, dsp_us, write_us, busy_us);
+
+        // 2026-09-12: finalizes this tick's per-event jump-log entry (if
+        // diagnostics_set_tx_info() above flagged one) now that busy_us is
+        // finally known - see diagnostics.h/.cpp for the full mechanism.
+        // A no-op on every ordinary tick.
+        diagnostics_record_jump_busy_us(busy_us);
 
 #if TIMING_DEBUG_ENABLED
         digitalWrite(TIMING_DEBUG_GPIO, LOW);

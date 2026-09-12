@@ -281,7 +281,7 @@ void ssb_dsp_get_null_bias_stats(ssb_dsp_handle_t handle, ssb_dsp_null_bias_stat
  *        content, not just genuine nulls).
  */
 void IRAM_ATTR ssb_dsp_set_null_bias_threshold(ssb_dsp_handle_t handle, float threshold);
-float ssb_dsp_get_null_bias_threshold(ssb_dsp_handle_t handle);
+float IRAM_ATTR ssb_dsp_get_null_bias_threshold(ssb_dsp_handle_t handle);
 
 /**
  * @brief Optional per-sample SLEW-RATE limit on freq_dev_hz - distinct

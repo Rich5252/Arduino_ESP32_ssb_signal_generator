@@ -96,9 +96,105 @@ void diagnostics_record_core1_loop_timings(uint32_t cmd_us, uint32_t adc_svc_us,
 // original stored in s_dbg_envelope/s_dbg_freq_dev.
 void IRAM_ATTR diagnostics_set_envelope_freqdev(float envelope, float freq_dev_hz);
 
-// AD9851-only: the delayed freq_dev_hz actually used and the exact
-// integer Hz sent to the chip.
-void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, uint32_t tx_freq);
+// AD9851-only: the delayed freq_dev_hz/envelope actually used (post
+// relative_delay_apply()) and the exact integer Hz sent to the chip.
+// delayed_envelope was added 2026-09-12 alongside the per-event jump log
+// below and is kept here for a still-unimplemented future use (a
+// post-delay null_bias variant, proposed in null_bias_investigation.md) -
+// it is NOT what the jump log's near_null classification uses.
+//
+// envelope_at_freq_time (2026-09-12, same day, CORRECTION): the jump log's
+// first bench result (503384 events, 0% near_null, at relative_delay=+4.60)
+// exposed a real bug in using delayed_envelope for that classification -
+// see relative_delay_apply()'s declaration comment (relative_delay.h) for
+// why delayed_envelope isn't time-matched to delayed_freq_dev_hz once
+// delay is large. envelope_at_freq_time IS time-matched (always read at
+// the same lag freq_dev_hz was), and is what the near_null flag/trace/log
+// below now use instead.
+//
+// envelope_at_freq_time_min (2026-09-12, later same day): the SECOND real
+// bench capture (delay=+0.90, 25693 events, 25% near_null, a clean
+// repeating 3-state cycle where only 1 of the 3 states classified
+// near_null) exposed a further subtlety - at a lopsided fractional delay,
+// the blended envelope_at_freq_time can miss a near-null RAW sample that
+// only got a small minority weight in the interpolation. This is the
+// smaller of the two raw samples that blend actually mixes together - see
+// relative_delay_apply()'s declaration comment for the full reasoning.
+// Used for a SECOND, more permissive near_null_either flag alongside the
+// original (now near_null_blended) one, so both questions - "was the
+// transmitted result near a null" and "did anything near a null
+// contribute to it at all" - are answered per event, not just one.
+//
+// raw_freq_dev_near/_far (2026-09-12, later same day): the two RAW,
+// undelayed freq_dev_hz ring values that interp_ring() blended together to
+// produce delayed_freq_dev_hz - see relative_delay_apply()'s declaration
+// comment (relative_delay.h) for the full reasoning. Added after a
+// delay=+4.28 capture (134573 events, 2% near_null_blended, 34%
+// near_null_either) decoded into a clean repeating 3-state cycle where 2
+// of the 3 transitions had a near-null contributor caught only by the
+// more permissive near_null_either test, but the THIRD and LARGEST
+// transition (~5761Hz) showed no near-null involvement by either test.
+// These two raw values answer the next question before jumping to "so
+// there's a null-independent mechanism": do the two individual,
+// undelayed samples already differ by roughly the logged step size (a
+// real discontinuity exists in the raw signal itself, just not one an
+// envelope-near-null test happens to flag), or are they both
+// individually unremarkable (meaning the large DELAYED step is an
+// interpolation artifact from blending across a multi-sample lag during
+// a fast-changing part of the waveform, not evidence of any discrete
+// event at all)? Logged and printed alongside the rest of the jump-log
+// entry, not used for any near_null classification of their own.
+void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_envelope,
+                                        float envelope_at_freq_time, float envelope_at_freq_time_min,
+                                        float raw_freq_dev_near, float raw_freq_dev_far,
+                                        uint32_t tx_freq);
+
+// 2026-09-12: second half of the per-event jump log - call once per
+// dsp_task tick, AFTER busy_us for this tick is known (ssb_mic_test.ino,
+// right after diagnostics_record_phase_timings()). No-op on every tick
+// except the rare one where diagnostics_set_tx_info() just above flagged a
+// qualifying jump (see JUMP_LOG_THRESHOLD_HZ in diagnostics.cpp) - this
+// call supplies the one piece of context not yet available at that
+// earlier point in the tick (this tick's own DSP busy time, which a
+// timing-domain cause would show up in directly) and finalizes the log
+// entry. AD9851-only, same as the rest of this feature.
+void IRAM_ATTR diagnostics_record_jump_busy_us(uint32_t busy_us);
+
+// 'J' serial command - dumps the aggregate near-null/total jump counts
+// plus each of the last JUMP_LOG_LEN qualifying events (oldest to newest)
+// to Serial. Only ever called from Core 1's handle_serial_commands()
+// context, never the dsp_task hot path - see diagnostics.cpp for format.
+void diagnostics_print_jump_log(void);
+
+// 2026-09-12, yet later still: 'K' serial command - a SEPARATE, much
+// slower-timescale trigger from the 'J' log above, built after the user
+// reported (and then directly confirmed on the bench) that 'J' is the
+// wrong tool for "what changed to the frequency I can actually see/hear."
+// 'J' fires on every beat-null crossing - hundreds to thousands of times
+// a second, per the captures in moving_forward_notes.md/
+// null_bias_investigation.md's 2026-09-12 entries - so by the time a
+// human reacts to an observed shift and reads 'J', its ring has wrapped
+// many times over with unrelated routine churn; a capture taken
+// deliberately right after Aux SP showed a real 1000->962Hz shift came
+// back showing the exact same 3-state cycle as every "nothing happened"
+// capture before it, carrying no signal at all about when the
+// human-perceptible shift actually occurred.
+//
+// This instead tracks a fast/slow EMA pair of delayed_freq_dev_hz (fast
+// tau long enough to average out one beat-null cycle several times over;
+// slow tau ~2s, lagging behind as "where this has been sitting") and
+// LATCHES a coarse, before-and-after binned trace the moment they diverge
+// by more than SLOW_JUMP_TRIGGER_HZ (diagnostics.cpp) - calibrated to the
+// user's own independently-reported +/-5Hz visual-read tolerance on Aux
+// SP, not a DSP-internal number, i.e. tuned to "would a human watching
+// the display actually see this." Prints a live "still watching"
+// fast/slow/delta readout if nothing has triggered yet, or the full
+// latched pre/post trace if it has, then re-arms (and resyncs the slow
+// EMA to the fast one, to avoid an immediate re-trigger storm while the
+// slow EMA is still catching up) so the next event isn't missed while
+// this one's being read. Only ever called from Core 1's
+// handle_serial_commands() context - see diagnostics.cpp for format.
+void diagnostics_print_slow_trace(void);
 
 // Zeros every counter/high-water-mark this module owns and restarts the
 // dsp-tick long-window average from now. Does NOT touch any other

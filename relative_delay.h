@@ -72,10 +72,83 @@
 // tick, right after computing freq_dev_hz/envelope for that tick (mirrors
 // exactly where the original inline block sat in dsp_task, immediately
 // before the PWM/AD9851 writes).
+// out_envelope_at_freq_time (2026-09-12): the envelope value from the SAME
+// original sample time as out_delayed_freq_dev_hz, regardless of which
+// direction relative_delay is currently biased. This is NOT the same thing
+// as out_delayed_envelope: when delay>0 (every two-tone preset), envelope
+// itself is read at zero lag (env_back=0 below), so out_delayed_envelope is
+// just the CURRENT tick's envelope - not time-matched to the freq_dev value
+// that got delayed. Added because diagnostics.cpp's jump log needs to ask
+// "was envelope near a null WHEN THIS (now-delayed) freq_dev value was
+// actually computed", which out_delayed_envelope cannot answer once delay
+// is large - see that file's near_null classification and the 2026-09-12
+// entry in null_bias_investigation.md this was found from.
+//
+// out_envelope_at_freq_time_min (2026-09-12, same day): the smaller of the
+// TWO raw envelope samples that out_envelope_at_freq_time actually blends
+// together (via linear interpolation) - i.e. "did EITHER contributing raw
+// sample dip near a null", not "did the blended result end up near a
+// null". Added because a lopsided fractional delay (frac far from 0.5) can
+// blend in a near-null raw sample at only 10-20% weight, which won't pull
+// the BLENDED value below any reasonable near-null threshold even though a
+// genuine null-crossing sample contributed to this output. First real
+// jump-log capture at delay=+0.90 (frac=0.90, a 10%/90% blend) showed
+// exactly this ambiguity - see null_bias_investigation.md's 2026-09-12
+// entry for the full reasoning.
+//
+// out_raw_freq_dev_near/_far (2026-09-12, later same day): the two RAW
+// freq_dev_hz ring entries out_delayed_freq_dev_hz itself blends together
+// (near = the (1-frac)-weighted "just written" side, far = the
+// frac-weighted "one sample further back" side) - not a blend, min, or max,
+// the two individual numbers. Added after a delay=+4.28 capture found a
+// clean 3-state jump cycle where 2 of 3 transitions had a near-null
+// contributor hidden by a lopsided blend (caught by
+// out_envelope_at_freq_time_min above) but the third, largest transition
+// showed NO near-null involvement by either envelope test. Before treating
+// that as proof of a null-independent mechanism, this answers a more basic
+// question: were the two raw freq_dev_hz values already wildly different
+// from each other (a genuine discontinuity exists in the raw, undelayed
+// signal - just not one the envelope-near-null test happens to catch), or
+// are both individually unremarkable (the large DELAYED step is then an
+// artifact of interpolating across a large lag during a fast-changing part
+// of the waveform, not evidence of a discrete event at all)? See
+// null_bias_investigation.md's 2026-09-12 entries for the full reasoning.
+//
+// All four new outputs (this pair plus the two above): pass NULL if a
+// caller doesn't need them (matches every other optional-output convention
+// this codebase uses elsewhere... actually there are none - these are the
+// first - guarded with NULL checks purely for caller-safety, not because
+// any current call site omits them).
 void IRAM_ATTR relative_delay_apply(float freq_dev_hz, float envelope,
-                                     float *out_delayed_freq_dev_hz, float *out_delayed_envelope);
+                                     float *out_delayed_freq_dev_hz, float *out_delayed_envelope,
+                                     float *out_envelope_at_freq_time,
+                                     float *out_envelope_at_freq_time_min,
+                                     float *out_raw_freq_dev_near, float *out_raw_freq_dev_far);
 
-float relative_delay_get_samples(void);
+// 2026-09-12: marked IRAM_ATTR - diagnostics.cpp's new per-event jump log
+// now calls this from diagnostics_set_tx_info(), which runs on the
+// dsp_task hot path (same reasoning as ssb_dsp_get_null_bias_threshold()'s
+// equivalent change, ssb_dsp.h). Trivial single-variable read.
+float IRAM_ATTR relative_delay_get_samples(void);
+
+// 2026-09-12, yet later still: millis() timestamp of the last
+// relative_delay change from ANY source ('['/']'/'''/';' or preset
+// loading via relative_delay_set_samples()) - added after a 'K'
+// slow-trace capture explicitly flagged by the user as "[] scan induced"
+// came back showing NO visible transition in its printed 50ms-before/
+// 50ms-after trace, despite a real fast/slow EMA divergence having
+// fired. Leading theory: the delay-change-induced excursion happened,
+// then fully resolved, before the trace's 50ms pre-window even started -
+// the slow (2s-tau) EMA can still be "remembering" a transient for
+// seconds after it's otherwise fully passed. Rather than growing the
+// trace buffers to multi-second span, this timestamps delay changes
+// directly so 'K' can report "delay last touched Xms before this
+// trigger," letting a human correlate a trigger against their own recent
+// '['/']'/preset actions even when the trace itself doesn't visually
+// capture the causal moment. Not IRAM_ATTR - only ever read from
+// diagnostics_print_slow_trace() (Core 1, on-demand serial command
+// context), never the hot path.
+uint32_t relative_delay_get_last_change_ms(void);
 
 // ']' - increase relative delay by one DELAY_STEP_SAMPLES, clamped to
 // +(PHASE_DELAY_MAX_SAMPLES-2).

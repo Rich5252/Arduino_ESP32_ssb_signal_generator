@@ -11,6 +11,7 @@
 #include "envelope_output.h"
 #include "ssb_dsp.h"
 #include "carrier_output.h"
+#include "relative_delay.h"   // 2026-09-12: relative_delay_get_samples() - per-event jump log below
 #include "test_signals.h"
 #include "esp_timer.h"
 #include "esp_err.h"
@@ -66,8 +67,307 @@ static volatile uint32_t s_dbg_max_freq_dev_step_at_ms = 0;
 // near max_freq_dev_step below.
 #define FREQ_STEP_TRACE_LEN 8
 static volatile uint32_t s_dbg_freq_step_trace[FREQ_STEP_TRACE_LEN];
+// 2026-09-12: parallel envelope capture for the trace above - added
+// alongside the jump log below, same motivation (see that block's comment).
+// The post-step trace could tell us tx_freq recovers within a tick, but not
+// whether the jump itself happened at a near-null sample - this closes that
+// gap for the SAME worst-ever event the tx_freq trace already captures.
+static volatile float    s_dbg_freq_step_trace_envelope[FREQ_STEP_TRACE_LEN];
 static volatile uint8_t  s_dbg_freq_step_trace_fill = 0;    // 0 = no trace captured yet this window
 static volatile bool     s_dbg_freq_step_trace_armed = false;
+
+// 2026-09-12: per-event jump LOG - a deliberately different tool from the
+// high-water-mark fields and the post-step trace above, both of which only
+// ever remember the SINGLE worst tx_freq step seen across an entire run.
+// That's fine for "was there ever a bad one" but it means a multi-hour
+// unattended capture hands back exactly one data point - not enough to
+// settle whether every jump is genuinely explained by the null-crossing
+// mechanism this file's whole investigation has been built around, which
+// is exactly the user's own engineering doubt (moving_forward_notes.md,
+// 2026-09-12: "I still have my engineering doubts that this is the only
+// problem"). This keeps the last JUMP_LOG_LEN qualifying events (a lower,
+// more inclusive bar than "new all-time record" - JUMP_LOG_THRESHOLD_HZ),
+// each stamped with enough context to be judged individually rather than
+// argued about in aggregate:
+//   - envelope: envelope_at_freq_time (relative_delay.h/.cpp) - the
+//     envelope value from the SAME original sample time as the (possibly
+//     delayed) freq_dev value that produced this tx_freq step. 2026-09-12
+//     CORRECTION, same day: this field originally used delayed_envelope
+//     instead - the POST-delay envelope - reasoning that "was this
+//     near-null AT THE MOMENT OF TRANSMISSION" was the physically relevant
+//     question (per the relative_delay/near-null-spike interaction in
+//     null_bias_investigation.md's earlier 2026-09-12 entry). That
+//     reasoning was wrong in one specific way: for delay>0 (every two-tone
+//     preset), envelope itself is read at zero lag inside
+//     relative_delay_apply() (env_back=0), so delayed_envelope is just the
+//     CURRENT tick's envelope - NOT time-matched to the freq_dev value
+//     that got delayed. At large delay this can badly misclassify a
+//     genuine null-crossing event as near_null=false, since the envelope
+//     being compared against is from the wrong moment entirely. The very
+//     first bench capture with this log (relative_delay=+4.60,
+//     503384 events, 0% near_null) is likely exactly this failure mode,
+//     not proof of a second mechanism - see moving_forward_notes.md's
+//     2026-09-12 entry for the full reasoning and what would distinguish
+//     the two.
+//   - relative_delay_samples: current delay setting - lets a delay sweep
+//     be correlated against jump occurrence directly, firmware-side,
+//     instead of only inferring it from Aux SP behavior.
+//   - busy_us: this tick's own DSP busy time - a timing-domain cause (the
+//     Core-1-serial-bleed-into-Core-0 mechanism already root-caused twice
+//     in this project's history) would show up here directly, as an
+//     anomalous busy_us coinciding with the jump.
+//   - audio_source: settles "does this also happen on mic input, not just
+//     the perfectly-periodic two-tone test signal" without a separate
+//     experiment - just leave 'J' logging running across a source change
+//     and compare counts.
+//   - near_null: envelope < ssb_dsp_get_null_bias_threshold() at capture -
+//     the single most direct test of the null-crossing hypothesis. If the
+//     near-null percentage across many logged events stays near 100%, that's
+//     strong, repeated (not anecdotal) support for the existing theory. If a
+//     meaningful fraction of events come back near_null=false, that's
+//     direct, hard evidence of a SEPARATE mechanism at work.
+#define JUMP_LOG_LEN 8
+#define JUMP_LOG_THRESHOLD_HZ 300u   // well above ordinary in-band modulation
+                                     // step sizes, well below every jump
+                                     // magnitude actually observed so far
+                                     // (hundreds to thousands of Hz) - lower
+                                     // this if a run known to have jumps
+                                     // still comes back with jump_log n=0
+
+typedef struct {
+    uint32_t at_ms;
+    uint32_t from_hz;
+    uint32_t to_hz;
+    uint32_t step_hz;
+    float    envelope;                  // envelope_at_freq_time (blended) - time-matched to from_hz/to_hz
+    float    envelope_min;              // envelope_at_freq_time_min - see relative_delay.h/.cpp, 2026-09-12
+    float    relative_delay_samples;
+    uint32_t busy_us;                   // filled in slightly later by diagnostics_record_jump_busy_us()
+    uint8_t  audio_source;              // audio_source_t, narrowed - see audio_source_name()
+    // 2026-09-12: two DIFFERENT near-null questions, not the same one
+    // measured twice - see relative_delay.h's out_envelope_at_freq_time_min
+    // declaration comment for why a lopsided fractional delay needs both.
+    bool     near_null_blended;         // envelope (the blend) < threshold - "was the RESULT near a null"
+    bool     near_null_either;          // envelope_min < threshold - "did ANY contributing raw sample dip near a null"
+    // 2026-09-12, later same day: the two RAW, undelayed freq_dev_hz ring
+    // values interp_ring() blended to produce this event's (delayed)
+    // freq_dev - see diagnostics_set_tx_info()'s declaration comment
+    // (diagnostics.h) and relative_delay_apply()'s (relative_delay.h) for
+    // the full reasoning. Logged for inspection, not used in any
+    // near_null classification of their own.
+    float    raw_freq_dev_near;
+    float    raw_freq_dev_far;
+} jump_log_entry_t;
+
+static jump_log_entry_t s_jump_log[JUMP_LOG_LEN];
+static uint32_t s_jump_log_write_idx = 0;
+static uint32_t s_jump_log_count = 0;          // total qualifying events since boot/reset (can exceed JUMP_LOG_LEN - ring wraps)
+static uint32_t s_jump_log_near_null_blended_count = 0;
+static uint32_t s_jump_log_near_null_either_count = 0;
+static bool           s_jump_pending = false;   // set by diagnostics_set_tx_info(), consumed by
+static jump_log_entry_t s_jump_pending_entry;   // diagnostics_record_jump_busy_us() a few lines later, same tick
+
+// 2026-09-12, yet later still: a SEPARATE, much slower-timescale trigger,
+// built after the user reported (and then directly confirmed on the
+// bench) that the 'J' log above is the wrong tool for "what changed to
+// the frequency I can actually see/hear" - it fires on every single beat-
+// null crossing (hundreds to thousands of times a second, per the
+// captures logged in moving_forward_notes.md/null_bias_investigation.md's
+// 2026-09-12 entries), so by the time a human reacts to an observed
+// frequency shift and reads 'J', the ring has wrapped many times over
+// with unrelated routine churn. Direct confirmation, not just theory: a
+// capture taken deliberately right after Aux SP showed a real 1000->962Hz
+// shift came back showing the EXACT SAME 3-state cycle, same values, as
+// every "nothing happened" capture before it - the low-level log carries
+// no signal at all about when a human-perceptible shift occurred, because
+// its threshold (300Hz, per-tick) is answering a completely different,
+// much smaller and much more frequent question than "did the steady-state
+// frequency someone is watching just move."
+//
+// Approach: track two EMAs of delayed_freq_dev_hz - the same value the
+// periodic [dsp] status line already reports - one "fast" (tau
+// FREQ_EMA_FAST_TAU_S, chosen to be several times longer than one beat-
+// null cycle's ~3-5ms period so the existing per-cycle churn averages out
+// almost completely) and one much slower "reference" (tau
+// FREQ_EMA_SLOW_TAU_S) that lags behind and represents "where this has
+// been sitting." When they diverge by more than SLOW_JUMP_TRIGGER_HZ -
+// deliberately set to the user's own independently-reported +/-5Hz
+// visual-read tolerance on Aux SP (null_bias_investigation.md's
+// 2026-09-12 entries), not a DSP-internal number - that's treated as a
+// change a human watching the display would actually notice.
+//
+// On trigger, a coarse (SLOW_TRACE_BIN_TICKS-tick bins, not raw per-tick -
+// keeps RAM/print-time modest while still showing the shape of the
+// transition) trace spanning SLOW_TRACE_PRE_BINS bins before the trigger
+// and SLOW_TRACE_POST_BINS after is LATCHED - unlike the 'J' ring, which
+// keeps sliding forward forever, this one deliberately STOPS recording
+// once it has an answer, specifically so a human-reaction-time delay
+// before reading it (via the new 'K' command) can't erase it. Printing
+// re-arms it (and resyncs the slow EMA to the fast one, so the two start
+// equal again rather than immediately re-triggering while the slow EMA is
+// still catching up from the just-reported event) for the next one.
+// Deliberately NOT touched by diagnostics_reset()/'r' - same reasoning as
+// the canary latches elsewhere in this file: a rare, significant event
+// capture shouldn't silently vanish just because someone started a fresh
+// routine measurement window before reading it.
+typedef struct {
+    float freq_mean_hz;   // mean of delayed_freq_dev_hz over the bin
+    float env_min;        // min of envelope_at_freq_time over the bin - the most
+                           // null-like single sample seen in that bin, same
+                           // "did anything dip near a null" spirit as
+                           // near_null_either above, just per-bin instead of
+                           // per-blend
+} slow_trace_bin_t;
+
+#define SLOW_TRACE_BIN_TICKS 20     // 1.25ms/bin @ 16kHz - coarse enough to keep
+                                    // the eventual print (PRE_BINS+POST_BINS
+                                    // lines) manageable, fine enough to still
+                                    // show the transition's shape against the
+                                    // ~3-5ms beat-null cycle period
+#define SLOW_TRACE_PRE_BINS  40    // 50ms of context before the trigger
+#define SLOW_TRACE_POST_BINS 40    // 50ms captured after
+
+#define FREQ_EMA_FAST_TAU_S 0.05f  // 50ms - several beat-null cycles' worth
+#define FREQ_EMA_SLOW_TAU_S 2.0f   // 2s - deliberately much slower, so it lags
+                                   // behind as "where this has been sitting"
+static const float FREQ_EMA_DT_S = (float)SSB_SAMPLE_PERIOD_US / 1000000.0f;
+static const float FREQ_EMA_FAST_ALPHA = FREQ_EMA_DT_S / (FREQ_EMA_FAST_TAU_S + FREQ_EMA_DT_S);
+static const float FREQ_EMA_SLOW_ALPHA = FREQ_EMA_DT_S / (FREQ_EMA_SLOW_TAU_S + FREQ_EMA_DT_S);
+#define SLOW_JUMP_TRIGGER_HZ 5.0f  // matches the user's own reported +/-5Hz
+                                   // visual-read tolerance on Aux SP - see
+                                   // this block's header comment
+
+// 2026-09-12, yet later still: FIRST REAL 'K' CAPTURE turned out to be a
+// false positive, caused by the EMA seeding itself, not a real event -
+// before=697.40Hz after=704.63Hz (delta=+7.23Hz) with only 3 pre-bins
+// filled (i.e. this fired within ~4ms of boot/reset) and a post-trace
+// showing the exact same repeating cycle (800/800/800/400Hz, period 4
+// bins) both before AND after the "trigger," with no visible transition
+// anywhere in it. Root cause: both EMAs seed from a single RAW
+// (unaveraged) sample on the very first tick - if that sample happens to
+// land on one extreme of the ongoing periodic churn (800Hz here, not the
+// cycle's ~700Hz time-average), the FAST EMA (tau=50ms) converges toward
+// the true average within tens of ms while the SLOW EMA (tau=2s) is still
+// sitting almost exactly at the biased seed value - diverging by more
+// than SLOW_JUMP_TRIGGER_HZ almost immediately, from initialization bias
+// alone, regardless of whether anything real happened. A resync at re-arm
+// (diagnostics_print_slow_trace()) has the same exposure in miniature -
+// the fast EMA it snaps the slow one to is itself only tau=50ms smoothed,
+// so it can still be offset from the true multi-second average right
+// after a busy cycle.
+//
+// FIRST FIX ATTEMPT (an 8s, ~4x-slow-tau warm-up hold on the trigger
+// check) turned out to be UNDERSIZED, not wrong in kind - a follow-up
+// capture at t=9239ms (i.e. AFTER that 8s hold had already lifted) still
+// fired, and its new TREND block (added for exactly this reason) showed
+// why directly: `fast` was already rock-steady at 699.07-699.08Hz for the
+// entire visible 2s history, while `slow` was still climbing smoothly and
+// monotonically (666.23 -> 687.31Hz over that same 2s, a textbook
+// exponential settling curve) - i.e. still visibly converging from its
+// boot seed value nearly 9.2s in. Extrapolating that curve back
+// implies a seed value hundreds to over a thousand Hz away from the true
+// ~699Hz average - entirely plausible given this project's own
+// well-documented near-null freq_dev spikes (thousands of Hz, see the
+// 'J' captures elsewhere in this file) landing on the single raw sample
+// used to seed both EMAs. The "4 tau -> ~98% converged" heuristic behind
+// the original 8s figure assumed a "reasonably-sized" initial error - it
+// doesn't hold when the seed itself can be a thousand-Hz outlier, where
+// even a small residual PERCENTAGE is still tens of Hz.
+//
+// REAL fix: stop seeding the slow EMA from a raw sample at all. Seed only
+// the FAST EMA that way (its own short tau, ~50ms, makes it converge to
+// the true running average almost immediately regardless of what the
+// seed was), let it run alone for FREQ_EMA_BOOT_SETTLE_MS (~10x its own
+// tau - by then it's converged from even a large seed error to within a
+// small fraction of a percent), THEN snap slow = fast's already-converged
+// value - never seeding slow from a potentially-extreme raw sample in the
+// first place, rather than trying to out-wait an error whose size was
+// never bounded to begin with. A short residual FREQ_EMA_WARMUP_MS hold
+// on the trigger check remains afterward, purely as insurance (e.g.
+// against the snap instant itself landing mid-spike) - now starting from
+// an already-good value instead of a raw one, so it only needs to cover
+// ordinary EMA noise, not an unbounded seed error.
+#define FREQ_EMA_BOOT_SETTLE_MS 500.0f   // ~10x FREQ_EMA_FAST_TAU_S
+static const uint32_t FREQ_EMA_BOOT_SETTLE_TICKS =
+    (uint32_t)(FREQ_EMA_BOOT_SETTLE_MS * 1000.0f / (float)SSB_SAMPLE_PERIOD_US);
+#define FREQ_EMA_WARMUP_MS 8000.0f
+static const uint32_t FREQ_EMA_WARMUP_TICKS =
+    (uint32_t)(FREQ_EMA_WARMUP_MS * 1000.0f / (float)SSB_SAMPLE_PERIOD_US);
+
+static float    s_freq_ema_fast_hz = 0.0f;
+static float    s_freq_ema_slow_hz = 0.0f;
+static bool     s_freq_ema_fast_inited = false;   // fast EMA seeded from the first-ever raw sample
+static bool     s_freq_ema_slow_inited = false;   // slow EMA snapped from fast after the boot settle
+static uint32_t s_freq_ema_boot_settle_ticks_left = 0;   // counts down FREQ_EMA_BOOT_SETTLE_TICKS
+                                                          // before the slow-EMA snap happens
+static uint32_t s_freq_ema_warmup_ticks_left = 0;   // set to FREQ_EMA_WARMUP_TICKS once slow is
+                                                     // snapped (boot) or resynced (re-arm) -
+                                                     // trigger check is held off while nonzero
+
+typedef enum { SLOW_TRACE_WATCHING = 0, SLOW_TRACE_CAPTURING_POST, SLOW_TRACE_LATCHED } slow_trace_state_t;
+static slow_trace_state_t s_slow_trace_state = SLOW_TRACE_WATCHING;
+
+static slow_trace_bin_t s_slow_pre_ring[SLOW_TRACE_PRE_BINS];
+static uint32_t s_slow_pre_write_idx = 0;
+static uint32_t s_slow_pre_fill = 0;   // like jump_log_count's own "have we wrapped yet"
+
+static slow_trace_bin_t s_slow_post_bins[SLOW_TRACE_POST_BINS];
+static uint32_t s_slow_post_fill = 0;
+
+static float    s_slow_bin_sum_freq = 0.0f;
+static float    s_slow_bin_min_env = 1e9f;
+static uint32_t s_slow_bin_count = 0;
+
+static uint32_t s_slow_trigger_at_ms = 0;
+static float    s_slow_trigger_before_hz = 0.0f;   // slow (reference) EMA at the trigger instant
+static float    s_slow_trigger_after_hz = 0.0f;    // fast EMA once the post capture completes
+static float    s_slow_trigger_delta_hz = 0.0f;
+static float    s_slow_trigger_relative_delay = 0.0f;
+static uint32_t s_slow_trigger_delay_change_ms = 0;   // relative_delay_get_last_change_ms() at
+                                                       // the trigger instant - see that
+                                                       // function's declaration comment
+                                                       // (relative_delay.h)
+
+// 2026-09-12, yet later still: a SECOND, much-longer-timescale companion
+// to the fine (1.25ms/bin) trace above - added after TWO consecutive real
+// (non-boot-artifact) 'K' captures, one user-flagged "[] scan induced"
+// and one flagged "spontaneous," BOTH came back showing a perfectly
+// steady, non-drifting repeating cycle throughout their entire 50ms
+// pre+50ms post window, with no visible transition anywhere - despite a
+// genuine 8-11Hz fast/slow EMA gap having triggered them. If the signal
+// were truly unchanging for as long as it's been running, a periodic
+// waveform this regular (both EMAs' cutoffs sit far below the ~200Hz
+// cycle-repeat rate) should long since have pulled BOTH EMAs to within
+// a fraction of a Hz of the true periodic mean - an 8-11Hz gap that
+// persists despite a locally flat 100ms window is best explained by a
+// REAL change that happened, and fully resolved, on a timescale longer
+// than 50ms but shorter than the slow EMA's ~2s memory - i.e. a
+// continuous drift too gradual to show any visible slope over 50ms, but
+// fast enough to separate a 50ms average from a 2s one. (Direct
+// precedent: the +3.85 capture, this file's first genuinely real one,
+// already showed this project's cycle mean drifting continuously over
+// its own 50ms window - this is the same phenomenon at whatever slower
+// rate applies at THIS delay/pair, now inferred rather than directly
+// seen because it's too slow for the fine trace to resolve.)
+//
+// Rather than growing the fine trace's own span to multiple seconds
+// (expensive - RAM and, more so, print volume - and it would just push
+// the same "still not long enough" edge case further out), this instead
+// periodically snapshots the two EMAs THEMSELVES (not raw bin data) over
+// a much longer horizon (EMA_TREND_LEN samples, EMA_TREND_SAMPLE_TICKS
+// apart) - directly answering "was fast/slow already diverging smoothly
+// over the last couple of seconds" without needing fine per-tick detail
+// over that whole span. Freezes the same way the pre-bin ring does -
+// simply stops advancing once state leaves WATCHING - rather than an
+// explicit copy-out.
+#define EMA_TREND_LEN 80              // 80 samples
+#define EMA_TREND_SAMPLE_TICKS 400    // 25ms/sample @ 16kHz -> 2s of total history,
+                                       // matching FREQ_EMA_SLOW_TAU_S itself
+static float    s_trend_fast_hz[EMA_TREND_LEN];
+static float    s_trend_slow_hz[EMA_TREND_LEN];
+static uint32_t s_trend_write_idx = 0;
+static uint32_t s_trend_fill = 0;
+static uint32_t s_trend_tick_count = 0;
 #endif
 
 static volatile uint32_t s_dbg_max_busy_us = 0;
@@ -294,11 +594,126 @@ void IRAM_ATTR diagnostics_set_envelope_freqdev(float envelope, float freq_dev_h
     s_dbg_freq_dev = freq_dev_hz;
 }
 
-void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, uint32_t tx_freq)
+void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_envelope,
+                                        float envelope_at_freq_time, float envelope_at_freq_time_min,
+                                        float raw_freq_dev_near, float raw_freq_dev_far,
+                                        uint32_t tx_freq)
 {
 #if AD9851_ATTACHED
     s_dbg_delayed_freq_dev = delayed_freq_dev_hz;
     s_dbg_tx_freq = tx_freq;
+    (void)delayed_envelope;   // stored nowhere yet - kept for a future post-delay null_bias variant, see header
+
+    // 2026-09-12, yet later still: slow-mean trigger - see its declaration
+    // comment (this file, just above the struct/statics it uses) for the
+    // full "the horse has bolted, and it's not even close" motivation.
+    // Runs unconditionally every tick, independent of the >300Hz-step
+    // jump log below and of s_dbg_have_prev_tx_freq (this doesn't need a
+    // "previous tick" in that sense - the EMAs seed themselves from the
+    // very first sample).
+    {
+        float dev = delayed_freq_dev_hz;
+        if (!s_freq_ema_fast_inited) {
+            // Fast EMA seeds from the first-ever raw sample, same as
+            // before - but its own short tau converges it to the true
+            // running average within a few tens of ms regardless of how
+            // far off that raw seed was (see FREQ_EMA_BOOT_SETTLE_MS's
+            // declaration comment). This starts the boot-settle countdown
+            // that decides when slow is allowed to snap from it.
+            s_freq_ema_fast_hz = dev;
+            s_freq_ema_fast_inited = true;
+            s_freq_ema_boot_settle_ticks_left = FREQ_EMA_BOOT_SETTLE_TICKS;
+        } else {
+            s_freq_ema_fast_hz += FREQ_EMA_FAST_ALPHA * (dev - s_freq_ema_fast_hz);
+        }
+
+        if (!s_freq_ema_slow_inited) {
+            // Slow EMA deliberately does NOT update from raw samples
+            // during this window - it has nothing valid to converge from
+            // yet. Once the boot-settle countdown reaches zero, fast has
+            // had ~10 of its own time constants to converge from
+            // whatever the raw seed was - snap slow to that, a clean
+            // transfer instead of a raw single-sample seed, then arm the
+            // short residual warmup before the trigger check is trusted.
+            if (s_freq_ema_boot_settle_ticks_left > 0) s_freq_ema_boot_settle_ticks_left--;
+            if (s_freq_ema_boot_settle_ticks_left == 0) {
+                s_freq_ema_slow_hz = s_freq_ema_fast_hz;
+                s_freq_ema_slow_inited = true;
+                s_freq_ema_warmup_ticks_left = FREQ_EMA_WARMUP_TICKS;
+            }
+        } else {
+            s_freq_ema_slow_hz += FREQ_EMA_SLOW_ALPHA * (dev - s_freq_ema_slow_hz);
+            if (s_freq_ema_warmup_ticks_left > 0) s_freq_ema_warmup_ticks_left--;
+        }
+
+        // Long-timescale EMA trend ring - see its own declaration comment
+        // (this file, near jump_log_entry_t) for why. Deliberately keyed
+        // off SLOW_TRACE_WATCHING AND slow being initialized, same
+        // freeze-by-stop-writing pattern as the fine pre-bin ring just
+        // below, so it holds exactly the run-up to whichever trigger just
+        // fired, and never records a meaningless pre-snap slow value.
+        if (s_slow_trace_state == SLOW_TRACE_WATCHING && s_freq_ema_slow_inited) {
+            s_trend_tick_count++;
+            if (s_trend_tick_count >= EMA_TREND_SAMPLE_TICKS) {
+                s_trend_tick_count = 0;
+                s_trend_fast_hz[s_trend_write_idx] = s_freq_ema_fast_hz;
+                s_trend_slow_hz[s_trend_write_idx] = s_freq_ema_slow_hz;
+                s_trend_write_idx = (s_trend_write_idx + 1) % EMA_TREND_LEN;
+                if (s_trend_fill < EMA_TREND_LEN) s_trend_fill++;
+            }
+        }
+
+        if (s_slow_trace_state != SLOW_TRACE_LATCHED) {
+            s_slow_bin_sum_freq += dev;
+            if (envelope_at_freq_time < s_slow_bin_min_env) s_slow_bin_min_env = envelope_at_freq_time;
+            s_slow_bin_count++;
+
+            if (s_slow_bin_count >= SLOW_TRACE_BIN_TICKS) {
+                slow_trace_bin_t bin;
+                bin.freq_mean_hz = s_slow_bin_sum_freq / (float)s_slow_bin_count;
+                bin.env_min = s_slow_bin_min_env;
+                s_slow_bin_sum_freq = 0.0f;
+                s_slow_bin_min_env = 1e9f;
+                s_slow_bin_count = 0;
+
+                if (s_slow_trace_state == SLOW_TRACE_WATCHING) {
+                    s_slow_pre_ring[s_slow_pre_write_idx] = bin;
+                    s_slow_pre_write_idx = (s_slow_pre_write_idx + 1) % SLOW_TRACE_PRE_BINS;
+                    if (s_slow_pre_fill < SLOW_TRACE_PRE_BINS) s_slow_pre_fill++;
+
+                    // Trigger check held off until slow is actually
+                    // initialized (the boot-settle snap, see
+                    // FREQ_EMA_BOOT_SETTLE_TICKS) AND the short residual
+                    // warmup since then has elapsed (FREQ_EMA_WARMUP_TICKS)
+                    // - see both constants' declaration comments for the
+                    // two-stage false-positive history this replaced. The
+                    // pre-ring above keeps filling throughout regardless,
+                    // so real history is already available the moment the
+                    // hold lifts.
+                    float delta = s_freq_ema_fast_hz - s_freq_ema_slow_hz;
+                    if (delta < 0.0f) delta = -delta;
+                    if (s_freq_ema_slow_inited && s_freq_ema_warmup_ticks_left == 0
+                        && delta > SLOW_JUMP_TRIGGER_HZ) {
+                        s_slow_trigger_at_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                        s_slow_trigger_before_hz = s_freq_ema_slow_hz;
+                        s_slow_trigger_delta_hz = s_freq_ema_fast_hz - s_freq_ema_slow_hz;
+                        s_slow_trigger_relative_delay = relative_delay_get_samples();
+                        s_slow_trigger_delay_change_ms = relative_delay_get_last_change_ms();
+                        s_slow_post_fill = 0;
+                        s_slow_trace_state = SLOW_TRACE_CAPTURING_POST;
+                    }
+                } else {   // SLOW_TRACE_CAPTURING_POST
+                    if (s_slow_post_fill < SLOW_TRACE_POST_BINS) {
+                        s_slow_post_bins[s_slow_post_fill++] = bin;
+                    }
+                    if (s_slow_post_fill >= SLOW_TRACE_POST_BINS) {
+                        s_slow_trigger_after_hz = s_freq_ema_fast_hz;
+                        s_slow_trace_state = SLOW_TRACE_LATCHED;
+                    }
+                }
+            }
+        }
+    }
 
     // See s_dbg_max_freq_dev_step_hz's own declaration comment. tx_freq is
     // this tick's ground-truth Hz value (carrier_output.h's own doc
@@ -324,17 +739,239 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, uint32_t tx_fr
             s_dbg_freq_step_trace_armed = true;
         }
         if (s_dbg_freq_step_trace_armed) {
+            s_dbg_freq_step_trace_envelope[s_dbg_freq_step_trace_fill] = envelope_at_freq_time;
             s_dbg_freq_step_trace[s_dbg_freq_step_trace_fill++] = tx_freq;
             if (s_dbg_freq_step_trace_fill >= FREQ_STEP_TRACE_LEN) {
                 s_dbg_freq_step_trace_armed = false;
             }
+        }
+
+        // 2026-09-12: per-event jump log - see its declaration comment
+        // (top of file) for full rationale. Deliberately independent of,
+        // and a lower bar than, the "new all-time record" gate above, so
+        // ordinary RECURRING jumps get captured too, not just a single
+        // once-per-run worst case. busy_us isn't known yet at this point
+        // in the tick - stashed as "pending" and finalized a few lines
+        // later in ssb_mic_test.ino by diagnostics_record_jump_busy_us(),
+        // once this tick's busy_us has actually been computed.
+        if (abs_step > JUMP_LOG_THRESHOLD_HZ) {
+            s_jump_pending_entry.at_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            s_jump_pending_entry.from_hz = s_dbg_prev_tx_freq;
+            s_jump_pending_entry.to_hz = tx_freq;
+            s_jump_pending_entry.step_hz = abs_step;
+            s_jump_pending_entry.envelope = envelope_at_freq_time;
+            s_jump_pending_entry.envelope_min = envelope_at_freq_time_min;
+            s_jump_pending_entry.relative_delay_samples = relative_delay_get_samples();
+            s_jump_pending_entry.audio_source = (uint8_t)dsp_state_get_audio_source();
+            s_jump_pending_entry.raw_freq_dev_near = raw_freq_dev_near;
+            s_jump_pending_entry.raw_freq_dev_far = raw_freq_dev_far;
+            {
+                float thr = ssb_dsp_get_null_bias_threshold(dsp_state_get_ssb());
+                s_jump_pending_entry.near_null_blended = (envelope_at_freq_time < thr);
+                s_jump_pending_entry.near_null_either  = (envelope_at_freq_time_min < thr);
+            }
+            s_jump_pending_entry.busy_us = 0;   // filled in shortly - see above
+            s_jump_pending = true;
         }
     }
     s_dbg_prev_tx_freq = tx_freq;
     s_dbg_have_prev_tx_freq = true;
 #else
     (void)delayed_freq_dev_hz;
+    (void)delayed_envelope;
+    (void)envelope_at_freq_time;
+    (void)envelope_at_freq_time_min;
+    (void)raw_freq_dev_near;
+    (void)raw_freq_dev_far;
     (void)tx_freq;
+#endif
+}
+
+void IRAM_ATTR diagnostics_record_jump_busy_us(uint32_t busy_us)
+{
+#if AD9851_ATTACHED
+    // No-op on every ordinary tick - only ever true in the same tick
+    // diagnostics_set_tx_info() just flagged a qualifying jump, a few
+    // lines earlier in ssb_mic_test.ino. dsp_task runs single-threaded per
+    // tick, so there's no re-entrancy risk between the two calls.
+    if (!s_jump_pending) return;
+    s_jump_pending_entry.busy_us = busy_us;
+    s_jump_log[s_jump_log_write_idx] = s_jump_pending_entry;
+    s_jump_log_write_idx = (s_jump_log_write_idx + 1) % JUMP_LOG_LEN;
+    s_jump_log_count++;
+    if (s_jump_pending_entry.near_null_blended) s_jump_log_near_null_blended_count++;
+    if (s_jump_pending_entry.near_null_either)  s_jump_log_near_null_either_count++;
+    s_jump_pending = false;
+#else
+    (void)busy_us;
+#endif
+}
+
+void diagnostics_print_jump_log(void)
+{
+#if AD9851_ATTACHED
+    uint32_t n = (s_jump_log_count < JUMP_LOG_LEN) ? s_jump_log_count : JUMP_LOG_LEN;
+    // Two near-null percentages, deliberately - see near_null_blended/
+    // near_null_either's declaration comments (jump_log_entry_t above) and
+    // relative_delay.h's out_envelope_at_freq_time_min comment for why a
+    // lopsided fractional delay can make these read very differently, and
+    // why "either" (not just "blended") is the more complete answer to
+    // "did a near-null sample contribute to this jump at all".
+    Serial.printf("[dsp] jump_log: %u qualifying step(s) >%uHz since last reset, %u near-null-blended (%.0f%%), "
+                  "%u near-null-either (%.0f%%) - ring holds the last %u\r\n",
+                  s_jump_log_count, (unsigned)JUMP_LOG_THRESHOLD_HZ,
+                  s_jump_log_near_null_blended_count,
+                  s_jump_log_count ? (100.0f * (float)s_jump_log_near_null_blended_count / (float)s_jump_log_count) : 0.0f,
+                  s_jump_log_near_null_either_count,
+                  s_jump_log_count ? (100.0f * (float)s_jump_log_near_null_either_count / (float)s_jump_log_count) : 0.0f,
+                  n);
+    if (n == 0) return;
+
+    // If the ring hasn't wrapped yet (count < LEN), the oldest entry is
+    // simply index 0. Once it has wrapped, the oldest SURVIVING entry is
+    // whatever the write index is about to overwrite next.
+    uint32_t start = (s_jump_log_count < JUMP_LOG_LEN) ? 0 : s_jump_log_write_idx;
+    for (uint32_t k = 0; k < n; k++) {
+        jump_log_entry_t *e = &s_jump_log[(start + k) % JUMP_LOG_LEN];
+        Serial.printf("[dsp]   jump[%u]: t=%ums %u->%uHz (step=%uHz) env=%.3f/%.3f%s%s delay=%+.2f "
+                      "busy_us=%u src=%s\r\n",
+                      (unsigned)k, e->at_ms, e->from_hz, e->to_hz, e->step_hz, e->envelope, e->envelope_min,
+                      e->near_null_blended ? " NEAR_NULL" : "",
+                      (e->near_null_either && !e->near_null_blended) ? " NEAR_NULL(either)" : "",
+                      e->relative_delay_samples, e->busy_us,
+                      audio_source_name(e->audio_source));
+        // 2026-09-12, later same day: the two RAW (undelayed) freq_dev_hz
+        // values this event's delayed step was interpolated from, plus
+        // their own delta - see diagnostics_set_tx_info()'s declaration
+        // comment (diagnostics.h) for why. A raw_delta close to step_hz
+        // means the discontinuity already exists in the raw signal (a real
+        // event, just not one the envelope-near-null test flags); a
+        // raw_delta much smaller than step_hz means this was mostly an
+        // interpolation artifact from blending across a large lag.
+        float raw_delta = e->raw_freq_dev_near - e->raw_freq_dev_far;
+        if (raw_delta < 0.0f) raw_delta = -raw_delta;
+        Serial.printf("[dsp]     jump[%u] raw_freq_dev: near=%.1fHz far=%.1fHz raw_delta=%.1fHz\r\n",
+                      (unsigned)k, e->raw_freq_dev_near, e->raw_freq_dev_far, raw_delta);
+    }
+#endif
+}
+
+// 2026-09-12, yet later still: 'K' serial command - see the slow-mean-
+// trigger struct/statics' own declaration comment (above, near
+// jump_log_entry_t) for the full motivation and design. Prints either a
+// live "still watching" readout (nothing has crossed SLOW_JUMP_TRIGGER_HZ
+// yet) or the full latched pre/post trace (it has), then re-arms for the
+// next event - see the header comment for why re-arming also resyncs the
+// slow EMA to the fast one.
+void diagnostics_print_slow_trace(void)
+{
+#if AD9851_ATTACHED
+    if (s_slow_trace_state != SLOW_TRACE_LATCHED) {
+        // Two distinct holds, reported separately so it's never ambiguous
+        // which one (if either) is currently blocking a trigger:
+        // boot-settle (slow not snapped from fast yet at all - only ever
+        // nonzero once, right after boot) and the short residual warmup
+        // after slow IS initialized (also re-armed after every trigger is
+        // read). See FREQ_EMA_BOOT_SETTLE_TICKS/FREQ_EMA_WARMUP_TICKS's
+        // declaration comments for why both exist.
+        if (!s_freq_ema_slow_inited) {
+            float settle_ms_left = (float)s_freq_ema_boot_settle_ticks_left * (float)SSB_SAMPLE_PERIOD_US / 1000.0f;
+            Serial.printf("[dsp] slow_trace: still watching - slow EMA not yet initialized "
+                          "(boot_settle_left=%.0fms, fast_ema=%.2fHz so far) pre_bins_filled=%u/%u\r\n",
+                          settle_ms_left, s_freq_ema_fast_hz, s_slow_pre_fill, (unsigned)SLOW_TRACE_PRE_BINS);
+            return;
+        }
+        float warmup_ms_left = (float)s_freq_ema_warmup_ticks_left * (float)SSB_SAMPLE_PERIOD_US / 1000.0f;
+        Serial.printf("[dsp] slow_trace: still watching - fast_ema=%.2fHz slow_ema=%.2fHz "
+                      "delta=%.2fHz (fires at +/-%.1fHz, warmup_left=%.0fms) pre_bins_filled=%u/%u\r\n",
+                      s_freq_ema_fast_hz, s_freq_ema_slow_hz,
+                      s_freq_ema_fast_hz - s_freq_ema_slow_hz, (float)SLOW_JUMP_TRIGGER_HZ, warmup_ms_left,
+                      s_slow_pre_fill, (unsigned)SLOW_TRACE_PRE_BINS);
+        return;
+    }
+
+    Serial.printf("[dsp] slow_trace: TRIGGERED at t=%ums before=%.2fHz after=%.2fHz delta=%+.2fHz "
+                  "delay=%+.2f - %u pre-bin(s) + %u post-bin(s), %.2fms/bin\r\n",
+                  s_slow_trigger_at_ms, s_slow_trigger_before_hz, s_slow_trigger_after_hz,
+                  s_slow_trigger_delta_hz, s_slow_trigger_relative_delay,
+                  s_slow_pre_fill, s_slow_post_fill,
+                  (double)((float)(SLOW_TRACE_BIN_TICKS * SSB_SAMPLE_PERIOD_US) / 1000.0f));
+
+    // 2026-09-12, yet later still: correlates this trigger against the
+    // user's own recent '['/']'/preset actions - see
+    // relative_delay_get_last_change_ms()'s declaration comment
+    // (relative_delay.h) for why. A 0 reading means no delay change has
+    // ever been recorded this boot (nothing to correlate against).
+    if (s_slow_trigger_delay_change_ms != 0) {
+        int32_t since_ms = (int32_t)s_slow_trigger_at_ms - (int32_t)s_slow_trigger_delay_change_ms;
+        Serial.printf("[dsp]   relative_delay was last changed %dms before this trigger\r\n",
+                      (int)since_ms);
+    } else {
+        Serial.printf("[dsp]   relative_delay has not been changed since boot\r\n");
+    }
+
+    // Oldest-surviving-entry math mirrors diagnostics_print_jump_log()'s
+    // own ring-read logic just above. Bin indices are printed relative to
+    // the trigger (negative = before, the LAST pre-bin - index -1 - is the
+    // bin where the delta first crossed threshold; positive = after).
+    uint32_t start = (s_slow_pre_fill < SLOW_TRACE_PRE_BINS) ? 0 : s_slow_pre_write_idx;
+    int32_t first_label = -(int32_t)s_slow_pre_fill;
+    for (uint32_t k = 0; k < s_slow_pre_fill; k++) {
+        slow_trace_bin_t *b = &s_slow_pre_ring[(start + k) % SLOW_TRACE_PRE_BINS];
+        bool is_last_pre = (k == s_slow_pre_fill - 1);
+        Serial.printf("[dsp]   slow_trace[%+4d]: freq=%.1fHz env_min=%.3f%s\r\n",
+                      (int)(first_label + (int32_t)k), b->freq_mean_hz, b->env_min,
+                      is_last_pre ? " <-- TRIGGER (delta first exceeded threshold here)" : "");
+    }
+    for (uint32_t k = 0; k < s_slow_post_fill; k++) {
+        slow_trace_bin_t *b = &s_slow_post_bins[k];
+        Serial.printf("[dsp]   slow_trace[%+4d]: freq=%.1fHz env_min=%.3f\r\n",
+                      (int)(k + 1), b->freq_mean_hz, b->env_min);
+    }
+
+    // Long-timescale EMA trend - see EMA_TREND_LEN's declaration comment
+    // for why this exists. Added after two consecutive real triggers
+    // showed a perfectly flat fine trace above despite a genuine
+    // fast/slow gap - this shows whether that gap built up as a smooth,
+    // multi-second drift (too slow for the fine trace above to resolve)
+    // or something more abrupt. Same oldest-to-newest ring-read pattern
+    // as the fine trace, frozen at the trigger instant the same way.
+    Serial.printf("[dsp]   slow_trace TREND (last ~%.1fs, %.0fms/sample, frozen at the trigger):\r\n",
+                  (double)((float)EMA_TREND_LEN * (float)EMA_TREND_SAMPLE_TICKS * (float)SSB_SAMPLE_PERIOD_US / 1000000.0f),
+                  (double)((float)EMA_TREND_SAMPLE_TICKS * (float)SSB_SAMPLE_PERIOD_US / 1000.0f));
+    uint32_t tstart = (s_trend_fill < EMA_TREND_LEN) ? 0 : s_trend_write_idx;
+    int32_t tfirst_label = -(int32_t)s_trend_fill;
+    for (uint32_t k = 0; k < s_trend_fill; k++) {
+        uint32_t idx = (tstart + k) % EMA_TREND_LEN;
+        Serial.printf("[dsp]     trend[%+4d]: fast=%.2fHz slow=%.2fHz\r\n",
+                      (int)(tfirst_label + (int32_t)k), s_trend_fast_hz[idx], s_trend_slow_hz[idx]);
+    }
+
+    // Re-arm for the next event now that this one's been read - matches
+    // this command's "read it, then watch for the next one" design (see
+    // this function's own declaration comment). Resyncing slow to fast
+    // avoids an immediate re-trigger storm: right after a genuine step,
+    // the slow (2s-tau) EMA is still catching up to the fast one and would
+    // otherwise stay >SLOW_JUMP_TRIGGER_HZ apart - and hence keep
+    // re-triggering with an near-empty pre-buffer - for up to several
+    // seconds after every real event. Also re-arms the warm-up hold
+    // (FREQ_EMA_WARMUP_TICKS's declaration comment) - the resync above
+    // uses the fast EMA's OWN value, which is only tau=50ms smoothed and
+    // so can itself still be offset from the true multi-second average;
+    // without this, the false-positive failure mode that motivated the
+    // warm-up in the first place could recur right after every real event
+    // too, just in a smaller, "re-arm bias" form instead of "boot bias."
+    s_freq_ema_slow_hz = s_freq_ema_fast_hz;
+    s_freq_ema_warmup_ticks_left = FREQ_EMA_WARMUP_TICKS;
+    s_slow_trace_state = SLOW_TRACE_WATCHING;
+    s_slow_pre_write_idx = 0;
+    s_slow_pre_fill = 0;
+    s_slow_bin_sum_freq = 0.0f;
+    s_slow_bin_min_env = 1e9f;
+    s_slow_bin_count = 0;
+    s_trend_write_idx = 0;
+    s_trend_fill = 0;
+    s_trend_tick_count = 0;
 #endif
 }
 
@@ -385,6 +1022,27 @@ void diagnostics_reset(void)
     s_dbg_have_prev_tx_freq = false;
     s_dbg_freq_step_trace_fill = 0;
     s_dbg_freq_step_trace_armed = false;
+
+    // 2026-09-12: per-event jump log - same "r, wait, read" pattern as
+    // every other high-water mark in this file. Deliberately NOT clearing
+    // s_jump_log[]'s actual contents - stale entries just get overwritten
+    // as new ones arrive after the reset, and s_jump_log_count going back
+    // to 0 is what diagnostics_print_jump_log() treats as "empty".
+    s_jump_log_write_idx = 0;
+    s_jump_log_count = 0;
+    s_jump_log_near_null_blended_count = 0;
+    s_jump_log_near_null_either_count = 0;
+    s_jump_pending = false;
+
+    // 2026-09-12, yet later still: the slow-mean trigger (see its own
+    // declaration comment, near jump_log_entry_t above) is deliberately
+    // NOT touched here - same reasoning as the canary latches just below:
+    // it exists to catch a rare, significant event, and 'r' gets pressed
+    // routinely as part of normal measurement hygiene. Resetting it here
+    // would risk silently discarding a captured (or capturing-in-progress)
+    // event the user hasn't read yet just because they started an
+    // unrelated fresh window. It only ever clears via 'K' actually
+    // printing a latched trace (see diagnostics_print_slow_trace()).
 #endif
 
     // Deliberately NOT resetting s_dbg_canary_carrier_bad_since_ms /
@@ -840,6 +1498,46 @@ static void print_timing_and_adc_block(uint32_t now)
         }
         Serial.print(buf);
         Serial.print("\r\n");
+    }
+
+    // 2026-09-12: envelope alongside the tx_freq trace above, for the SAME
+    // worst-ever event - the direct, per-event test of whether that one
+    // recorded jump happened at a near-null (low transmitted power) sample.
+    // Kept as its own line/gate rather than folded into the line above -
+    // same reasoning already on record just above (the 2026-09-11
+    // correction) for why this file splits multi-value lines rather than
+    // risking a single oversized request that silently never printed.
+    // Budget: ~21-byte label + 8 * up to 7 bytes ("-0.123 ") + CRLF ~= 80
+    // bytes worst case, comfortably under the 100-byte request.
+    if (s_dbg_freq_step_trace_fill > 0 && diag_room_for(100)) {
+        char buf[95];
+        int off = snprintf(buf, sizeof(buf), "[dsp]   post-step-env:");
+        for (uint8_t i = 0; i < s_dbg_freq_step_trace_fill && off < (int)sizeof(buf) - 9; i++) {
+            off += snprintf(buf + off, sizeof(buf) - off, " %.3f", s_dbg_freq_step_trace_envelope[i]);
+        }
+        Serial.print(buf);
+        Serial.print("\r\n");
+    }
+
+    // 2026-09-12: per-event jump log aggregate - see diagnostics_print_jump_log()
+    // for the full per-event dump ('J'). This one-line summary is cheap
+    // enough to leave in the always-on periodic block (unlike the full
+    // dump) so an unattended run's serial log shows both near-null
+    // percentages building up over hours without needing 'J' pressed at
+    // just the right moment. Two percentages now, not one - see
+    // near_null_blended/near_null_either's declaration comments above.
+    // Budget re-computed for the extra field: worst case (10-digit
+    // counters, never realistically reached) is ~103 bytes - rounded up to
+    // 150 for margin, same "compute it, then round up, don't guess a round
+    // number" approach as this file's other lines after the 2026-09-11
+    // diag_room_for(200) lesson.
+    if (diag_room_for(150)) {
+        Serial.printf("[dsp]   jump_log: n=%u blended=%u (%.0f%%) either=%u (%.0f%%) - 'J' for detail\r\n",
+                      s_jump_log_count,
+                      s_jump_log_near_null_blended_count,
+                      s_jump_log_count ? (100.0f * (float)s_jump_log_near_null_blended_count / (float)s_jump_log_count) : 0.0f,
+                      s_jump_log_near_null_either_count,
+                      s_jump_log_count ? (100.0f * (float)s_jump_log_near_null_either_count / (float)s_jump_log_count) : 0.0f);
     }
 #endif
 

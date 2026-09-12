@@ -625,7 +625,13 @@ void IRAM_ATTR ssb_dsp_set_null_bias_threshold(ssb_dsp_handle_t handle, float th
     handle->null_bias_threshold = threshold;
 }
 
-float ssb_dsp_get_null_bias_threshold(ssb_dsp_handle_t handle)
+// 2026-09-12: marked IRAM_ATTR (previously wasn't, unlike the setter above)
+// because diagnostics.cpp's new per-event jump log now calls this from
+// diagnostics_set_tx_info(), which runs on the dsp_task hot path - same
+// IRAM discipline this codebase applies everywhere else on that path.
+// Trivial single-field read, so this is a pure classification change, not
+// a behavior change.
+float IRAM_ATTR ssb_dsp_get_null_bias_threshold(ssb_dsp_handle_t handle)
 {
     return handle ? handle->null_bias_threshold : 0.05f;
 }

@@ -433,6 +433,47 @@ void handle_serial_commands(void)
                           d, d * 1000000.0f / SAMPLE_RATE_HZ,
                           d > 0.0f ? "phase held back" :
                           d < 0.0f ? "envelope held back" : "aligned");
+        } else if (c == 'J') {
+            // 2026-09-12: dumps the per-event jump log (diagnostics.h/.cpp) -
+            // added in response to a direct engineering doubt that every
+            // random TX-frequency jump is explained by the null-crossing
+            // mechanism this project's whole null_bias/dither investigation
+            // has been chasing. Grouped here with the relative-delay keys
+            // rather than alphabetically/near 'Q' - the log's own
+            // relative_delay_samples field makes it most useful checked
+            // right after a '['/']'/preset change, and this keeps every
+            // AD9851-only command in the same guarded block.
+            serial_reply("-> jump log: env=blended/min, both time-matched to the SAME "
+                          "original sample as the logged freq_dev value (not just the "
+                          "current tick). NEAR_NULL = blended envelope was below "
+                          "threshold; NEAR_NULL(either) = only the MIN of the two raw "
+                          "samples the interpolation blended was. raw_freq_dev near/far "
+                          "= the two RAW undelayed freq_dev_hz values blended together - "
+                          "raw_delta close to step_hz means the discontinuity is real and "
+                          "already in the raw signal, not an interpolation artifact - see "
+                          "null_bias_investigation.md's 2026-09-12 entries:\r\n");
+            diagnostics_print_jump_log();
+        } else if (c == 'K') {
+            // 2026-09-12, yet later still: the slow-mean trigger
+            // (diagnostics.h/.cpp) - a deliberately SEPARATE tool from 'J'
+            // above, built after direct bench confirmation that 'J' can't
+            // answer "what changed to the frequency I can actually see" -
+            // it fires on every beat-null crossing (hundreds-thousands/sec)
+            // and a capture taken right after a real, observed Aux SP
+            // shift (1000->962Hz) came back showing the same routine cycle
+            // as every "nothing happened" capture. This instead triggers
+            // off a much slower fast/slow EMA divergence, calibrated to
+            // the user's own +/-5Hz visual-read tolerance, and freezes a
+            // before/after trace so a human-reaction-time delay before
+            // reading it can't erase the answer - see diagnostics.h's
+            // declaration comment for the full design.
+            serial_reply("-> slow-freq trigger: fires when fast/slow EMAs of the "
+                          "actually-transmitted freq_dev diverge by more than the "
+                          "threshold (calibrated to your own +/-5Hz Aux SP visual-read "
+                          "tolerance), not on any single-tick step. Prints a live readout "
+                          "if still watching, or the full before/after trace if "
+                          "triggered, then re-arms for the next one:\r\n");
+            diagnostics_print_slow_trace();
 #endif
         } else if (c == 'u') {
             envelope_output_raise_pwm_offset();
@@ -657,6 +698,41 @@ void handle_serial_commands(void)
             adc_capture_reset_diag();
             ssb_dsp_reset_freq_dev_stats(dsp_state_get_ssb());
             serial_reply("-> diagnostics reset, clean window starting now\r\n");
+        } else if (c == 'Z') {
+            // Clean, deliberate reboot back to a known state - added
+            // 2026-09-12, motivated directly by the 'K' slow-trace
+            // investigation (see null_bias_investigation.md/
+            // moving_forward_notes.md's 2026-09-12 entries): getting back
+            // to a fresh, fully-known starting point (delay=0.00 at boot,
+            // both freq_dev EMAs re-seeded from scratch via the
+            // boot-settle path, every 'J'/'K' ring and diagnostic counter
+            // cleared) previously meant physically power-cycling the
+            // board or unplugging/replugging USB - this does the same
+            // thing from the bench seat, one keystroke, no need to reach
+            // the hardware at all.
+            //
+            // Single keystroke, no confirmation prompt - matches every
+            // other one-shot command in this file ('r' diagnostics reset,
+            // 'V' on-demand snapshot, 'L' task list): nothing here is a
+            // destructive, hard-to-undo action the way e.g. a filesystem
+            // erase would be, a stray press just costs a few seconds of
+            // the board reconnecting and re-enumerating over USB.
+            //
+            // Serial.flush() + a short delay before restarting: without
+            // this, ESP.restart() can tear down the USB CDC peripheral
+            // before the "-> rebooting..." reply above has actually left
+            // the TX buffer, so the confirmation can silently never reach
+            // the terminal - same underlying USB CDC timing class as the
+            // 64-byte packet issue documented at the top of this file for
+            // serial_reply() (this is the opposite end of a transfer:
+            // making sure output finishes going out, not making sure the
+            // host can tell where it ends). Not IRAM_ATTR-relevant - only
+            // ever reached from this on-demand serial command context,
+            // never the dsp_task hot path.
+            serial_reply("-> rebooting now...\r\n");
+            Serial.flush();
+            delay(100);
+            ESP.restart();
         } else if (c == 'e') {
             bool now_on = !ssb_dsp_get_eq_enabled(dsp_state_get_ssb());
             ssb_dsp_set_eq_enabled(dsp_state_get_ssb(), now_on);
