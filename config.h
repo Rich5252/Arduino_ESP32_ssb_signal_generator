@@ -33,7 +33,7 @@
 // Zero-hardware smoke test of the DSP chain. ----
 #define TWOTONE_TEST_MODE   1  // testing default - two-tone on at boot
 #define TWOTONE_F1_HZ        700.0f
-#define TWOTONE_F2_HZ       1900.0f
+#define TWOTONE_F2_HZ       1700.0f
 #define TWOTONE_AMPLITUDE    0.45f   // keep below 0.5 so peaks don't clip when summed
 
 // ---- 2026-09-11: two-tone null-uncertainty dither ('Q') - see

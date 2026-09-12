@@ -224,6 +224,304 @@ NO literature precedent for dithering as a fix for that other problem, and
 recommended an upstream I/Q trajectory reshape instead. The two shouldn't be
 conflated even though both start with "there's a problem at the null."
 
+## 2026-09-11: first two `Q` bench results — averaged bias insensitive to
+## dither amplitude, real-time spread looks threshold-like, not graded
+
+Two captures on the 700/1900Hz (wide legacy) pair, both against this file's
+own confirmed baseline for that pair above (`weighted_bias` -20.72Hz, SDR
+~8Hz, dither off):
+
+- **`Q` on, +/-0.5Hz**: board read as a noisy peak +/- ~6Hz around zero.
+  `weighted_bias` -16.4Hz. Not a clean isolated A/B — this capture came right
+  after reflashing the `Q` build, so settle time wasn't independently
+  controlled for.
+- **`Q` on, +/-0.05Hz** (`TWOTONE_DITHER_MAX_HZ` reduced 10x): board read as
+  "continuous" shifting, roughly -10Hz to +3Hz. `weighted_bias` -17.4Hz.
+
+Two findings, taken together:
+
+1. **`weighted_bias` barely moved** (-16.4 -> -17.4Hz) despite the dither
+   amplitude shrinking 10x. If dither worked by smoothly smearing the bias in
+   proportion to how far off-grid it pushes tone2, the averaged bias should
+   have shrunk back toward the -20.72Hz undithered baseline (or trended
+   toward 0) as amplitude fell. It didn't move in either direction by much.
+2. **The real-time spread stayed roughly the same overall size at both
+   amplitudes** (~12Hz peak-to-peak at 0.5Hz dither vs. ~12-13Hz at 0.05Hz
+   dither). A swing of similar magnitude at dither depths 10x apart is the
+   signature of a threshold/discontinuity effect, not a graded one: once
+   dither is nonzero at all, it appears sufficient to occasionally knock a
+   null onto the other side of whatever discrete sample-grid boundary drives
+   the coherent bias described in "Root mechanism identified" above,
+   producing a close-to-full-scale jump regardless of how small the nudge
+   actually is.
+
+**Open discrepancy, not yet resolved**: the -17.4Hz `weighted_bias` average
+from the +/-0.05Hz run sits well outside the user's reported real-time range
+(-10 to +3Hz, midpoint ~-3.5Hz). Two live hypotheses, not yet distinguished:
+
+- `weighted_bias` and whatever instrument produces the board's reading are
+  different statistics of the same underlying signal (different
+  integration/settling behavior) and simply aren't required to agree
+  numerically even if both are "correct" in their own terms.
+- The continuous re-dithering (a fresh random target every 250ms at
+  `TWOTONE_DITHER_UPDATE_HZ=4.0`) may be preventing that instrument from ever
+  reaching steady state — i.e. some or all of the "continuous shifting" could
+  be a measurement-methodology artifact of the test itself never settling,
+  not a property of the transmitted signal.
+
+Proposed follow-up, not yet run: slow `TWOTONE_DITHER_UPDATE_HZ` down a lot
+(e.g. to 0.2Hz — a new target every 5s) while keeping amplitude small, and
+see whether the board's reading can settle between updates. If the swings
+shrink at a slower update rate, that points at the settling-artifact
+hypothesis; if they don't, that favors either the two-different-statistics
+explanation or the null-boundary-crossing read above being real and
+independent of update rate. Also still unconfirmed: exactly what "the board"
+is and how it derives a frequency reading (SDR waterfall peak vs. a
+frequency counter vs. a tracking/PLL demod would each have very different
+settling behavior).
+
+## 2026-09-12: "the board" identified — an FFT panadapter, not a tracking
+## loop, which resolves most of the open discrepancy above via basic
+## integration-time math, no settling-artifact needed
+
+User confirmed "the board" is SDRUno's "Aux SP" high-resolution FFT display,
+currently set to 0.18Hz/bin, with the receiver's absolute frequency
+reference (a 10MHz OCXO/ref) independently estimated accurate to +/-1Hz.
+That +/-1Hz figure rules out RX calibration drift as an explanation for a
+~12Hz-wide swing, but it also means every individual Aux SP reading can be
+taken at face value as a real measurement, not an artifact of the receiver's
+own frequency accuracy — so the -10 to +3Hz swing is genuinely showing
+something about the signal (or about how a short window samples it), not
+about the SDR being mistuned.
+
+**This is an FFT panadapter, not a PLL/tracking demodulator** — worth
+correcting the framing from the previous entry above, which floated "the
+instrument not settling" as if a tracking loop were involved. There's no
+loop here to settle; each Aux SP redraw is a fresh (or overlapped) spectral
+snapshot integrated over however many samples its resolution setting
+requires. That integration TIME is the number that matters, and it can be
+worked out directly from the stated resolution:
+
+- Basic FFT resolution identity: bin spacing = 1 / (window duration in
+  seconds), for a rectangular window. 0.18Hz/bin → window duration ~= 5.56s.
+  SDRUno's Aux SP most likely applies a lower-sidelobe window (Hann/
+  Blackman-Harris-family, standard for panadapter displays) rather than a
+  bare rectangular one, which widens the effective mainlobe for the same
+  window length by roughly 1.5-2x — so achieving 0.18Hz of DISPLAYED
+  resolution probably means an actual capture length somewhat longer than
+  5.56s, plausibly out to 8-11s. Call it "on the order of 5-10 seconds"
+  per spectrum snapshot.
+- `Q`'s dither redraws an independent random target every
+  `1/TWOTONE_DITHER_UPDATE_HZ` = 0.25s (`config.h`,
+  `TWOTONE_DITHER_UPDATE_HZ=4.0`) and ramps linearly toward it in between —
+  so within one ~5-10s Aux SP snapshot, only about **20-40 independent
+  dither realizations** get folded into that single spectral picture.
+- `weighted_bias` (`env2_sum`/`env2_dphi_sum` in `ssb_dsp.c`) is a plain
+  lifetime accumulator that only resets on `'r'` — never a decaying/moving
+  average. By the time it's read at, say, t=706s into a run, it has
+  integrated across ~706s / 0.25s = **~2800 independent dither
+  realizations** — roughly 70-130x more than a single Aux SP snapshot sees.
+
+Given the two bench results directly above already established that this
+null-bias effect behaves like a threshold/discontinuity rather than a
+smoothly-graded one (each dither realization can swing the LOCAL average by
+close to a full-scale amount, not a small increment), an estimator built
+from only ~20-40 such realizations (one Aux SP snapshot) is expected to have
+much higher variance than one built from ~2800 of them (`weighted_bias` at
+the point of reading) — even though both are, in principle, converging
+toward the same true long-run mean as more realizations accumulate. That is
+a completely ordinary small-N-vs-large-N sampling-variance effect once the
+underlying per-realization distribution is skewed/bimodal-ish rather than
+tightly clustered, and needs no receiver-settling mechanism to explain it.
+This makes the "two different statistics of the same signal" hypothesis
+from the entry above the better-supported one specifically because of *how*
+different their integration times are (~10x per snapshot vs. potentially
+hundreds-to-thousands of accumulated seconds for `weighted_bias`), not just
+that they're different in some general sense.
+
+**Cleaner next experiment than varying the dither update rate**: toggle `Q`
+OFF and watch Aux SP on the same 700/1900Hz pair for a comparable stretch.
+The undithered baseline (this file's confirmed-measurement table) already
+gives a single steady `weighted_bias` (-20.72Hz for this pair) — the open
+question is whether Aux SP *also* shows several-Hz snapshot-to-snapshot
+scatter with dither off (which would mean much of the ~12Hz spread seen with
+`Q` on isn't new — the receiver/signal already had comparable short-window
+noise for other reasons, e.g. residual phase noise or ADC-referred jitter
+unrelated to the coherent null-bias mechanism), or whether it's rock-steady
+without dither (which would confirm the scatter is specifically
+dither-induced, via the small-N sampling-variance mechanism above). This is
+a single-variable toggle on hardware already in hand, cheaper to run than
+the slow-update-rate experiment proposed above, and worth doing first — not
+yet run.
+
+## 2026-09-12, later same day: CORRECTION to the entry above (Aux SP is
+## exponential-averaging, not a fixed-window FFT snapshot) — plus two new
+## hardware facts (visual read resolution, AD9851 XO thermal drift) — and a
+## direct answer to "shouldn't dither have centered this on zero?"
+
+User corrected the entry above: Aux SP uses **exponential averaging**, not
+a fixed-length rectangular/Hann window — so the "~5-10s snapshot, ~20-40
+independent dither draws per snapshot" arithmetic above is the wrong model
+and is superseded by this entry (left in place rather than deleted, per this
+file's convention, since the underlying "short effective memory sees more
+variance than a long one" conclusion still holds, just via a different
+mechanism — see below). Two more relevant facts: (1) the user's own visual
+read of the moving trace is reliable only to about +/-5Hz (cursor-based
+static measurements are much better) — some of the apparent -10..+3Hz
+spread is eyeballing uncertainty on top of whatever the display is actually
+doing; (2) the AD9851's reference is a plain 30MHz XO (not an OCXO) —
+confirmed stable once warmed up, but a physical disturbance (touching it to
+cool it) shifts the synthesized output by **~20Hz**, i.e. an effect of
+comparable magnitude to the whole swing being investigated here.
+
+**Why exponential averaging still predicts persistent, never-settling
+scatter (arguably better than the fixed-window model did):** an EWMA has a
+FIXED asymptotic variance that does not keep shrinking the longer you watch
+it — it continuously "forgets" older samples at a constant rate, so its
+noise floor is set by its time constant, not by total elapsed observation
+time. `weighted_bias` (`env2_sum`/`env2_dphi_sum`, plain lifetime
+accumulator, never resets except on `'r'`) is the opposite: its variance
+keeps shrinking like 1/(elapsed time) for as long as you let it run. So Aux
+SP is expected to go on fluctuating around whatever its true underlying mean
+is indefinitely, while `weighted_bias` keeps getting quieter — which matches
+"continuous shifting" being observed as an ongoing, non-settling behavior
+rather than something that would eventually stop if watched longer.
+
+**The AD9851 XO point matters because it's a confound `weighted_bias` is
+immune to and Aux SP is not.** `weighted_bias` is computed entirely in the
+digital/audio domain from the DSP's own I/Q (`ssb_dsp.c`) — it has no
+dependency on the AD9851's actual reference clock accuracy. Whatever Aux SP
+reads on-air, by contrast, is the ACTUAL transmitted RF frequency, which
+rides on top of the real DDS output and therefore includes any real thermal
+drift of the 30MHz reference. A confirmed ~20Hz/disturbance sensitivity on
+that XO means ordinary ambient thermal movement over the course of a
+multi-minute test could plausibly contribute several Hz of genuine,
+real-world frequency drift — layered on top of, and NOT distinguishable
+from, whatever the null-bias/dither mechanism itself is doing, when reading
+Aux SP alone. **This makes `weighted_bias` the cleaner of the two signals
+for judging whether `Q` is working**, precisely because it can't see XO
+drift at all — Aux SP is the necessary real-world validation channel, but
+it's reading two superimposed effects, not one.
+
+**Direct answer to "I expected dither to center the frequency on zero — is
+that not happening, and if so why?"** Judged on `weighted_bias` (the
+XO-drift-immune channel), the answer is: partially, and the shortfall looks
+structural, not a tuning problem. Undithered on this pair: -20.72Hz. With
+`Q` on: -16.4Hz (0.5Hz dither) and -17.4Hz (0.05Hz dither) — a real
+improvement over the undithered case, but plateaued around -17Hz rather than
+continuing toward 0, and unmoved by a 10x change in dither amplitude. The
+mechanism `Q` targets (per "Root mechanism identified" above) is
+specifically the *coherent amplification* that comes from every null
+recurring at the identical sample-grid alignment — breaking that coherence
+should convert "the single worst-case alignment's bias, repeated forever"
+into "the bias averaged over MANY different alignments." That is a
+different claim from "the per-null bias averages to zero across alignments"
+— it only nets out to ~0 if the underlying bias-vs-alignment function is
+itself roughly zero-mean, which nothing in this investigation has actually
+established. The amplitude-insensitivity of the ~-17Hz plateau (same result
+at 0.5Hz and 0.05Hz dither, i.e. across two very different samplings of the
+alignment space) is consistent with `Q` already fully achieving its
+designed job — decorrelating alignment — and what's left (-17Hz) being the
+genuine alignment-averaged mean of the near-null bias mechanism itself,
+which this evidence suggests is NOT zero-mean. If so, no amount of further
+dither tuning (amplitude or update rate) would be expected to close that
+remaining ~17Hz gap — a different fix (one of the two "Targeted"/
+"Principled" directions in "Open, un-actioned next steps" below, which
+change how the ±π resolution is computed at a null rather than just
+scrambling which alignment gets hit) would be needed for that part.
+
+**Two concrete follow-ups, not yet run:**
+- **Repeat the `Q` on/off comparison on a pair that starts near zero
+  undithered** — e.g. 1500/1700 (`+0.11Hz` undithered per the confirmed
+  table above) rather than 700/1900 (`-20.72Hz`, and separately already
+  flagged elsewhere in this codebase as a group-delay outlier vs. the
+  tighter-spaced bands). If `Q` leaves a near-zero pair still near zero,
+  that's reassuring — dither isn't introducing a new artifact of its own
+  (e.g. via its own 4Hz update periodicity). If it PUSHES a near-zero pair
+  away from zero, that would suggest the alignment-averaged mean of the
+  bias function varies by pair in a way that isn't simply "coherent bias
+  good, dithered bias better," and would need its own explanation.
+- **For any future real-world (not just `weighted_bias`) comparison, use
+  Aux SP's cursor-based static measurement (confirmed by the user to be far
+  more precise than eyeballing the moving trace) rather than reading the
+  live display**, and take several such readings over a run rather than one,
+  to separate genuine signal movement from both the +/-5Hz visual-read
+  limit and the EWMA's own non-settling noise floor.
+
+## 2026-09-12, later still: mechanism found for "changing relative_delay
+## (or switching presets) shifts the measured tone frequency" — and a real
+## gap identified in every weighted_bias reading taken so far
+
+User reports (back on 700/1700 now, and reporting Aux SP readings as offsets
+from a 1000Hz nominal center from here on) that adjusting relative delay
+(`'['`/`']'`) or switching between presets with different delay values
+(e.g. 1 & 3) repeatedly shifts the measured tone frequency - sometimes by a
+few Hz, sometimes by as much as 25Hz - and that the shift often behaves like
+it's "locked in" to one of two discrete values rather than moving smoothly.
+Traced to a real, previously-unflagged interaction between `relative_delay`
+(`relative_delay.cpp`/`.h`) and the near-null bias mechanism this whole file
+is about.
+
+**Mechanism.** `relative_delay_apply()` runs in `ssb_mic_test.ino` AFTER
+`ssb_dsp_process_sample()` has already computed `freq_dev_hz`/`envelope` for
+the tick - it doesn't touch the analytic-signal math, it only holds one of
+the two signals back relative to the other (positive delay holds
+`freq_dev_hz` back; every two-tone preset uses positive delay, so
+`envelope` passes through untouched while `freq_dev_hz` gets time-shifted).
+`weighted_bias`'s env^2-weighting exists specifically because it's supposed
+to match the real transmitted power spectrum's centroid — that only works
+if the near-null `freq_dev` spikes (the thousand-Hz-plus, single-tick
+excursions already characterized via `max_freq_dev_step`/the post-step
+trace) land on samples where `envelope` is genuinely near zero, so their
+contribution to what's actually radiated stays suppressed. `relative_delay`
+directly controls whether that alignment holds: shift `freq_dev_hz` far
+enough relative to the untouched `envelope`, and a spike that used to land
+on envelope~0 now lands on non-negligible envelope - i.e. non-negligible
+transmitted power - at the exact instant the instantaneous frequency is
+badly wrong. Since these spikes recur at the identical coherent sample-grid
+alignment every cycle (the same rational-tone/`SAMPLE_RATE_HZ` mechanism as
+"Root mechanism identified" above), a FIXED delay value produces a FIXED,
+repeatable amount of this contamination - matching the "locks in" behavior
+directly. And because the spike itself is narrow/near-discontinuous (1-2
+samples), how much of it gets exposed is a steep, non-linear function of
+delay - small delay changes near a good alignment barely matter, crossing
+in or out of the spike's window can swing the bias by a lot - matching both
+the "sometimes a few Hz, sometimes 25Hz" and the snap-between-two-values
+observations. Confirmed directly relevant to presets: preset 1 ("TwoTone
+Base") has `relative_delay_samples=0.00`; preset 3 ("Shelf2 Baseline gdeq
+adj#4") has `2.00` (`settings.h`) - a full 2-sample/125us swing baked
+straight into the preset switch, easily enough to move a spike from
+aligned-with-zero to fully exposed.
+
+**Real diagnostic gap, not just a theoretical point.** `ssb_mic_test.ino`
+already carries a comment at the `relative_delay_apply()` call site (added
+some earlier session) noting the null-bias diagnostics are "PRE-delay
+values ... and have always been blind to whatever the delay line does,"
+reasoning "it shouldn't [alter frequency content] - a pure sample delay
+can't change frequency content." That's correct about `freq_dev_hz`'s own
+spectrum in isolation, but it's the wrong question - the effect is in the
+CROSS-alignment between two different signals (`freq_dev_hz` vs the
+untouched `envelope`), not in `freq_dev_hz`'s own frequency content. Net
+effect: **every `weighted_bias` reading taken anywhere in this file,
+including both `Q`-dither bench results above, was computed pre-delay and
+is structurally blind to whatever `relative_delay_samples` (hence '['/']'
+and preset choice) does to the actually-transmitted spectrum.** Aux SP has
+been the only instrument able to see this effect at all so far. This is
+also very plausibly the same underlying event behind this whole codebase's
+extensive delay-tuning-for-two-tone-IMD history (`relative_delay.h`'s doc
+comment) - IMD splatter and this center-frequency shift read as two symptoms
+of the same "spike exposed to nonzero transmitted power" event, not
+separate phenomena.
+
+**Proposed, not yet implemented**: add a post-delay variant of the
+null-bias accumulation, fed from `delayed_freq_dev_hz`/`delayed_envelope`
+right after the `relative_delay_apply()` call in `ssb_mic_test.ino`, so
+there's a firmware-side, AD9851-XO-drift-immune number that actually tracks
+what `'['`/`']'` and preset switches do to the transmitted spectrum, instead
+of relying on Aux SP alone (which per the entry above has its own
+integration-time and XO-drift complications). Asked the user whether to
+implement this - not yet actioned.
+
 ## Open, un-actioned next steps
 
 1. **Two candidate fix directions identified, neither implemented.** This
