@@ -6,6 +6,12 @@
 #include "test_signals.h"
 #include "config.h"
 #include "envelope_interp.h"   // ENVELOPE_INTERP_FACTOR - the chirp's fast-tick rate
+// esp_random() - hardware RNG, used only by the 'Q' dither below (drawn at
+// TWOTONE_DITHER_UPDATE_HZ, not per-sample). Not compiler-verified in this
+// environment (no ESP32/Arduino toolchain available here, same caveat the
+// .ino's own header already carries) - confirm this header/symbol name
+// against your installed Arduino-ESP32 core before flashing.
+#include <esp_random.h>
 
 // Always compiled in now (not gated on TWOTONE_TEST_MODE) since dsp_task
 // branches on the runtime audio-source selector and can switch to this at
@@ -121,13 +127,76 @@ const char* test_signals_next_tone_ratio(void)
     return TONE_RATIO_PRESETS[s_tone_ratio_index].name;
 }
 
+// ---- 2026-09-11: two-tone null-uncertainty dither ('Q') - see
+// test_signals.h's doc comment for the full rationale and validation
+// plan. Off by default (TWOTONE_DITHER_ENABLED, config.h). ----
+//
+// TWOTONE_DITHER_UPDATE_SAMPLES: how many sample periods a freshly-drawn
+// random target is walked toward before the next draw - derived from
+// TWOTONE_DITHER_UPDATE_HZ so it stays correct if SAMPLE_RATE_HZ ever
+// changes, same "derive, don't hardcode" convention DC_BLOCK_TIME_CONSTANT_S
+// (config.h) already uses.
+#define TWOTONE_DITHER_UPDATE_SAMPLES ((uint32_t)((float)SAMPLE_RATE_HZ / TWOTONE_DITHER_UPDATE_HZ))
+
+static volatile bool s_twotone_dither_enable = TWOTONE_DITHER_ENABLED;
+// dsp_task-private (only ever touched from inside generate_twotone_sample(),
+// which always runs on Core 0/dsp_task) - no volatile/locking needed, same
+// reasoning as envelope_interp.cpp's own s_curve comment.
+static float s_dither_current_hz = 0.0f;   // tone2's current offset from nominal
+static float s_dither_step_hz = 0.0f;      // per-sample increment toward the current target
+static uint32_t s_dither_countdown = 0;    // samples remaining until the next target draw (0 = draw now)
+
+bool test_signals_get_twotone_dither_enabled(void) { return s_twotone_dither_enable; }
+
+void test_signals_set_twotone_dither_enabled(bool enable)
+{
+    s_twotone_dither_enable = enable;
+    if (!enable) {
+        // Snap back to exactly zero offset and force a fresh draw next
+        // time this is re-enabled, rather than leaving/resuming whatever
+        // the walk last landed on - 't'/'T'/'R' without 'Q' should behave
+        // bit-for-bit like it always has, not "off but still wherever the
+        // dither happened to be", and a later 'Q' shouldn't inherit a
+        // large step_hz computed against a stale, possibly very different
+        // starting point from minutes ago.
+        s_dither_current_hz = 0.0f;
+        s_dither_step_hz = 0.0f;
+        s_dither_countdown = 0;
+    }
+}
+
 float IRAM_ATTR generate_twotone_sample(void)
 {
     const float two_pi = 2.0f * (float)M_PI;
     float sample = s_tone1_amplitude * sinf(s_tone1_phase) +
                    s_tone2_amplitude * sinf(s_tone2_phase);
+
+    // tone1 is left completely undithered (fixed reference) - only tone2's
+    // EFFECTIVE frequency for this sample is nudged, s_tone2_hz itself
+    // (and therefore test_signals_get_twotone_f2_hz()'s reported value)
+    // never changes, so 'T'/'v'/'V' status lines keep reading the nominal
+    // pair even while 'Q' is active.
+    float tone2_hz = s_tone2_hz;
+    if (s_twotone_dither_enable) {
+        if (s_dither_countdown == 0) {
+            // esp_random() returns a uint32_t; map to a float in [-1, 1]
+            // via a fixed-range modulo rather than dividing by UINT32_MAX,
+            // to sidestep any question about this core's uint32->float
+            // rounding at the very top of that range - resolution here
+            // (1 part in 20000) is already far finer than this dither
+            // needs.
+            float r = (float)(esp_random() % 20001) / 10000.0f - 1.0f;   // [-1, +1]
+            float target_hz = TWOTONE_DITHER_MAX_HZ * r;
+            s_dither_step_hz = (target_hz - s_dither_current_hz) / (float)TWOTONE_DITHER_UPDATE_SAMPLES;
+            s_dither_countdown = TWOTONE_DITHER_UPDATE_SAMPLES;
+        }
+        s_dither_current_hz += s_dither_step_hz;
+        s_dither_countdown--;
+        tone2_hz += s_dither_current_hz;
+    }
+
     s_tone1_phase += two_pi * s_tone1_hz / (float)SAMPLE_RATE_HZ;
-    s_tone2_phase += two_pi * s_tone2_hz / (float)SAMPLE_RATE_HZ;
+    s_tone2_phase += two_pi * tone2_hz / (float)SAMPLE_RATE_HZ;
     if (s_tone1_phase > two_pi) s_tone1_phase -= two_pi;
     if (s_tone2_phase > two_pi) s_tone2_phase -= two_pi;
     return sample;

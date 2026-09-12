@@ -8,6 +8,41 @@ audibly worse, not just subtly worse — see item 5 under "Open, un-actioned
 next steps" below. Treat that as higher priority than the null-bias fix
 itself when this is picked back up.**
 
+**UPDATE 2026-09-09 — important caveat on `weighted_bias`, discovered while
+chasing an unrelated random-frequency-jump symptom (see
+`moving_forward_notes.md`):** `weighted_bias` was assumed to be a fast,
+stable, per-tone-pair constant (reset with `'r'`, read a second or two
+later). Live-watching it continuously (a new firmware change exempts the
+`null_bias*` lines from the diagnostics mute, so they stream at 1Hz
+regardless of `'v'`) on 700/1700Hz showed instead that after an `'r'` reset
+it keeps drifting for TENS OF SECONDS TO MINUTES — not settling quickly —
+and can wander by 10-30Hz over that time even with the tone pair, presets,
+and hardware completely unchanged (one capture went from -34Hz shortly
+after reset, up toward -0.2Hz, back down past -19Hz, with no external event
+at all). Loading a different settings preset (which changes
+gdeq/ampeq/predistort, and therefore the actual envelope shape through each
+null) also visibly shifted where it was heading, which makes physical sense
+given the root mechanism below - but the sheer slowness/magnitude of the
+drift even with NOTHING changed was not expected or previously
+characterized. **This means the "Confirmed measurement table" below,
+captured "freshly reset, read ~1-2s later" per its own reproduction recipe,
+may not represent settled/steady-state values** - a longer, fixed dwell
+time (and ideally logging the full time-series to see whether/when it
+actually plateaus, rather than a single point read shortly after reset)
+would be needed before trusting those numbers as precise per-tone-pair
+constants. It also directly explains the previously-unresolved puzzle in
+item 4 under "Open, un-actioned next steps" below (the ~15Hz drift observed
+"on the timescale of typing a sentence" that confounded the `I` on/off
+comparison) - that's most likely this same slow-convergence behavior, not
+noise or a separate mechanism. Real-world takeaway confirmed on the bench
+the same session: this metric's wandering does NOT track the actual
+transmitted frequency - the SDR showed a stable carrier while
+`weighted_bias` swung by tens of Hz, so it is unrelated to (and not usable
+as a live detector for) the separate random ~40Hz two-tone frequency-jump
+symptom it was being tested against. Not yet root-caused *why* the
+convergence is so slow - worth understanding before trusting this
+diagnostic for anything time-sensitive again.
+
 **Cross-reference, 2026-09-01:** the new PNP BC327+attn filter's group-delay
 equalizer testing (`group_delay_fit_notes.md`, "2026-09-01 refit" Status
 section) raised the same null-region-fidelity question from the other end —
@@ -153,6 +188,41 @@ thread. Not verified against real speech/mic input.
   three `null_bias*` lines. See `ssb_mic_test_commands.md`'s "Null-crossing
   frequency bias diagnostic" section for the quick-reference version of all
   of this.
+
+## 2026-09-11: null-uncertainty dither ('Q') added — untested
+
+A third candidate fix, added this session in response to a direct "what about
+dithering?" question and NOT yet bench-tested. Unlike the two "Targeted"/
+"Principled" directions in item 1 below (which change how the ±π resolution
+is computed at a null), this one leaves that computation alone and instead
+attacks the *coherence* called out in "Root mechanism identified" above: the
+test tones are exact phase-accumulator multiples of `SAMPLE_RATE_HZ`, so every
+null lands at an identical sample-grid position every cycle, and whatever
+tiny bias one null produces, every null produces identically — that's what
+lets it accumulate instead of averaging out. `Q` (`test_signals.cpp`/`.h`)
+adds a small (+/-0.5Hz), slowly and continuously varying frequency offset to
+tone2 only (tone1 stays exactly at nominal as an undithered reference),
+specifically to make successive nulls drift across the sample grid instead of
+recurring at the same spot — the same role this file's own "likely real-world
+significance" section says real voice's unpredictable null timing already
+plays for free.
+
+Validation plan, not yet run: compare `[dsp] null_bias2` (`weighted_bias`)
+across several `r` resets on the SAME tone-pair preset, `Q` off vs. on, with a
+LONG dwell before reading (see the 2026-09-09 update above — `weighted_bias`
+drifts for tens of seconds to minutes after reset even with nothing changed,
+so a quick point-read would just compare noise to noise). Looking for the
+off-case's tightly-repeatable, tone-pair-specific constant to turn into
+something that scatters and/or trends toward a smaller magnitude on-case,
+given enough integration time. Full details/rationale: `test_signals.h`'s
+doc comment on `test_signals_get_twotone_dither_enabled()`.
+
+Note this targets the null-bias *measurement* artifact specifically, not the
+separate "theoretically infinite phase bandwidth at the origin" EER/polar
+problem `group_delay_fit_notes.md` researched (2026-09-03) — that entry found
+NO literature precedent for dithering as a fix for that other problem, and
+recommended an upstream I/Q trajectory reshape instead. The two shouldn't be
+conflated even though both start with "there's a problem at the null."
 
 ## Open, un-actioned next steps
 

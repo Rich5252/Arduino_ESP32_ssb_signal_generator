@@ -33,8 +33,28 @@
 // Zero-hardware smoke test of the DSP chain. ----
 #define TWOTONE_TEST_MODE   1  // testing default - two-tone on at boot
 #define TWOTONE_F1_HZ        700.0f
-#define TWOTONE_F2_HZ       1700.0f
+#define TWOTONE_F2_HZ       1900.0f
 #define TWOTONE_AMPLITUDE    0.45f   // keep below 0.5 so peaks don't clip when summed
+
+// ---- 2026-09-11: two-tone null-uncertainty dither ('Q') - see
+// test_signals.h/.cpp for the mechanism and null_bias_investigation.md's
+// "Root mechanism identified" section for why it might help: these test
+// tones are exact phase-accumulator multiples of SAMPLE_RATE_HZ, so every
+// null in a run recurs at an IDENTICAL alignment to the sample grid - the
+// tiny per-null dphi-resolution bias then accumulates coherently instead
+// of averaging out the way real voice's randomly-timed nulls do. Off by
+// default so plain 't'/'T'/'R' two-tone behavior is completely unchanged
+// unless 'Q' is explicitly pressed. UNTESTED ON REAL HARDWARE.
+#define TWOTONE_DITHER_ENABLED   0     // 'Q' toggles this at runtime; this is just the boot default
+#define TWOTONE_DITHER_MAX_HZ    0.05f  // +/- excursion applied to tone2 only - small enough to stay
+                                        // well under typical two-tone spectrum-analyzer resolution
+                                        // bandwidth, large enough to fully re-walk a null's sample-
+                                        // grid alignment over a several-second integration window
+#define TWOTONE_DITHER_UPDATE_HZ 4.0f  // how often a fresh random target is drawn; the offset then
+                                        // ramps LINEARLY toward it sample-by-sample in between, so
+                                        // the instantaneous tone2 frequency varies continuously, not
+                                        // in steps - avoids adding a second, different exact
+                                        // periodicity of its own on top of the one being broken up
 #define SINGLETONE_HZ        1000.0f  // a clean, unambiguous default - see generate_singletone_sample()
 #define SINGLETONE_AMPLITUDE 0.7f     // single tone alone - more headroom available than the
                                       // two-tone sum needs, comparable to a moderately hot mic level

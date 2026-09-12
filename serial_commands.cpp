@@ -364,6 +364,37 @@ void handle_serial_commands(void)
                           "(linear ratio %.4f)%s\r\n",
                           ratio_name, test_signals_get_tone2_gain(),
                           was_twotone_r ? "" : ", two-tone mode enabled");
+        } else if (c == 'Q') {
+            // Two-tone null-uncertainty dither - see test_signals.h's doc
+            // comment for the full rationale (null_bias_investigation.md's
+            // "Root mechanism identified" section: this test's own exact
+            // phase-accumulator tone generation makes every null recur at
+            // an identical sample-grid alignment, so the tiny per-null
+            // dphi-resolution bias accumulates coherently in null_bias/
+            // null_bias2 instead of averaging out the way real voice's
+            // randomly-timed nulls do). Toggles a small, slow, continuous
+            // frequency offset on tone2 only, meant to break that exact
+            // recurrence. Different problem, and a different fix, from
+            // the "theoretically infinite phase bandwidth at the origin"
+            // question in group_delay_fit_notes.md - see test_signals.h.
+            // UNTESTED ON REAL HARDWARE - see that same doc comment for
+            // the validation plan (long-dwell 'r'-reset comparison of
+            // null_bias2, on vs. off) before trusting results either way.
+            // Switches into two-tone mode too if not already there, same
+            // convention as 'T'/'R' (this toggle has no effect on any
+            // other source).
+            bool was_twotone_q = (src == AUDIO_SRC_TWOTONE);
+            bool dither_now_on = !test_signals_get_twotone_dither_enabled();
+            test_signals_set_twotone_dither_enabled(dither_now_on);
+            if (!was_twotone_q) {
+                dsp_state_set_audio_source(AUDIO_SRC_TWOTONE);
+            }
+            serial_reply("-> two-tone null-uncertainty dither %s (+/-%.2fHz on tone2, new target every "
+                          "%.0fms)%s - UNTESTED, compare null_bias2 across several 'r' resets with a "
+                          "long dwell (see null_bias_investigation.md)\r\n",
+                          dither_now_on ? "ON" : "off", (double)TWOTONE_DITHER_MAX_HZ,
+                          (double)(1000.0f / TWOTONE_DITHER_UPDATE_HZ),
+                          was_twotone_q ? "" : ", two-tone mode enabled");
 #if AD9851_ATTACHED
         } else if (c == ']') {
             relative_delay_increase();

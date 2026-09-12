@@ -64,6 +64,47 @@ const char* test_signals_next_twotone_band(void);
 float test_signals_get_tone2_gain(void);
 const char* test_signals_next_tone_ratio(void);
 
+// Two-tone null-uncertainty dither ('Q', 2026-09-11) - see test_signals.cpp
+// for the full rationale (null_bias_investigation.md's "Root mechanism
+// identified" section). In short: these test tones are exact phase-
+// accumulator multiples of SAMPLE_RATE_HZ, so every destructive-
+// interference null in a run recurs at an IDENTICAL alignment to the
+// sample grid - whatever tiny dphi-resolution bias one null produces,
+// every null produces identically, so it accumulates coherently in
+// null_bias/null_bias2 instead of averaging out the way real voice's
+// randomly-timed nulls apparently do. This is a DIFFERENT, narrower
+// target than the "theoretically infinite phase bandwidth at the origin"
+// problem group_delay_fit_notes.md researched (2026-09-03) - that one has
+// no dithering precedent in the EER/polar literature and needs an
+// upstream I/Q trajectory fix instead; THIS is the two-tone TEST's own
+// measurement-repeatability artifact, where "break an exact coincidental
+// periodicity with a little dither" is a well-precedented DSP technique
+// (same idea as ADC dither breaking limit cycles/idle tones).
+//
+// Off by default (TWOTONE_DITHER_ENABLED, config.h) so plain 't'/'T'/'R'
+// behavior is bit-for-bit unchanged unless 'Q' is explicitly pressed.
+// When on, adds a small (+/-TWOTONE_DITHER_MAX_HZ), continuously and
+// slowly varying frequency offset to tone2 ONLY - tone1 is left exactly
+// at its nominal frequency as an undithered reference, so the pair's
+// spacing still reads close to nominal at a glance. The offset is large
+// enough, over a several-second integration window, to walk every null's
+// position relative to the sample grid all the way around, but far too
+// small/slow to show up as its own resolvable line on a spectrum analyzer
+// at normal two-tone dwell times.
+//
+// UNTESTED ON REAL HARDWARE. Validation plan: compare `[dsp] null_bias2`
+// (weighted_bias) behavior across several 'r' resets on the SAME preset,
+// with 'Q' off vs. on - looking for the biased constant to turn into a
+// value that scatters/trends toward zero given a long enough window.
+// Important caveat from null_bias_investigation.md's 2026-09-09 update:
+// weighted_bias itself was found to drift for TENS OF SECONDS TO MINUTES
+// after a reset even with absolutely nothing changed - so this comparison
+// needs a long, logged dwell (or better, the full time series), not a
+// quick point-read a second or two after 'r', or you'll be comparing
+// noise to noise rather than seeing what 'Q' actually does.
+bool test_signals_get_twotone_dither_enabled(void);
+void test_signals_set_twotone_dither_enabled(bool enable);
+
 // Envelope step test ('p') - slow square wave direct to the envelope
 // output, carrier held fixed, bypassing ssb_dsp_process_sample()
 // entirely. master_gain_linear is dsp_state_get_master_gain_linear() -
