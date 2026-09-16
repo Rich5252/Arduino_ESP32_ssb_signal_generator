@@ -33,7 +33,21 @@
 // Zero-hardware smoke test of the DSP chain. ----
 #define TWOTONE_TEST_MODE   1  // testing default - two-tone on at boot
 #define TWOTONE_F1_HZ        700.0f
-#define TWOTONE_F2_HZ       1700.0f
+// 2026-09-16: found this had drifted back to 1900.0f (the legacy, wide,
+// NOT-Fs-commensurate pair - see TWOTONE_BAND_PRESETS[]'s own comment in
+// test_signals.cpp and moving_forward_notes.md's 2026-09-09 "retire
+// 700/1900Hz" entry) via commit 8fd8349 ("Add dither on tone2... current
+// 2tone set to 700/1900", 2026-09-12), which silently undid de32ffd's
+// earlier "Change tone pair to 700/1700 so syncs with Fs". This repo clone
+// had been sitting on the stale 1900 value ever since - unnoticed because
+// every capture analyzed in this file and null_bias_investigation.md since
+// 2026-09-12 was actually run against the user's own bench firmware, whose
+// config.h they confirmed (2026-09-16 bench session) still reads 700/1700.
+// Restored here to match the bench and stop this repo clone silently
+// disagreeing with reality - see this date's null_bias_investigation.md
+// entry for the full story and why it mattered for that session's
+// held_trace/slow_trace interpretation.
+#define TWOTONE_F2_HZ        1700.0f
 #define TWOTONE_AMPLITUDE    0.45f   // keep below 0.5 so peaks don't clip when summed
 
 // ---- 2026-09-11: two-tone null-uncertainty dither ('Q') - see
@@ -422,7 +436,7 @@
                                  // timing residual - see relative_delay.h's fractional delay
                                  // line, added specifically to test that instead. Must stay ODD
                                  // if changed again.
-#define MAX_FREQ_DEV_HZ    7999.0f  // Originally raised from 2800.0f for a diagnostic A/B test -
+#define MAX_FREQ_DEV_HZ    20000.0f  // Originally raised from 2800.0f for a diagnostic A/B test -
                                      // real hardware showed a consistent ~+100Hz offset on BOTH
                                      // tones of a 700/1900Hz two-tone test (landed at 800/1999Hz)
                                      // while a single 1000Hz tone was exactly on frequency;

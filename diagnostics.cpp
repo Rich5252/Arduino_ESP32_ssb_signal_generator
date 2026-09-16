@@ -296,6 +296,68 @@ static const uint32_t FREQ_EMA_WARMUP_TICKS =
 
 static float    s_freq_ema_fast_hz = 0.0f;
 static float    s_freq_ema_slow_hz = 0.0f;
+
+// 2026-09-16: post-delay, envelope^2-weighted companion to the plain fast
+// EMA above - see this date's null_bias_investigation.md entry for the
+// full story. The existing null_bias/weighted_bias diagnostic
+// (print_null_bias_block(), fed by ssb_dsp.c's env2_dphi_sum/env2_sum) was
+// already found, back on 2026-09-12, to accumulate PRE-delay - inside
+// ssb_dsp_process_sample(), before relative_delay_apply() re-pairs
+// freq_dev_hz against envelope at whatever lag relative_delay is actually
+// set to. That's exactly why "weighted_bias doesn't track the real jump at
+// all" (2026-09-09 finding, moving_forward_notes.md) and why a "post-delay
+// null_bias variant" was proposed that same day (see diagnostics.h's
+// delayed_envelope comment) but never implemented. This is that variant,
+// built the same way the plain fast/slow EMA above is (same alpha, same
+// per-tick update site, so it's directly comparable via 'H'), but fed from
+// delayed_freq_dev_hz and envelope_at_freq_time specifically - NOT
+// delayed_envelope, which relative_delay.h's own declaration comment
+// already warns is not time-matched to delayed_freq_dev_hz once delay is
+// nonzero (envelope_at_freq_time is always read at the same lag freq_dev_hz
+// was, which is why the jump log switched to it back on 2026-09-12 too).
+//
+// Implemented as a running numerator/denominator pair - an EMA of
+// (envelope^2 * dev) over an EMA of (envelope^2) - whose ratio is the
+// standard envelope^2-weighted mean (the same identity ssb_dsp.h's own
+// null_bias doc comment establishes: this equals the transmitted power
+// spectrum's centroid, the number an SDR actually reads). Den is guarded
+// against being near-zero (sustained near-total silence) in the getter
+// below, not here - see energy_weighted_fast_hz().
+static float    s_freq_ema_energy_num_fast = 0.0f;
+static float    s_freq_ema_energy_den_fast = 0.0f;
+
+// 2026-09-16, later same day: shared with energy_weighted_fast_hz() below -
+// promoted out of that function so diagnostics_set_tx_info()'s anchor-seed
+// block (near s_freq_anchor_hz) can use the exact same guard when seeding
+// s_freq_energy_anchor_hz, instead of duplicating the threshold and risking
+// the two silently drifting apart later.
+static const float MIN_ENERGY_DEN = 1.0e-6f;
+
+// Forward declaration - definition (with its own full doc comment) lives
+// near diagnostics_print_held_status() below, but the slow-jump trigger
+// arm/close sites (diagnostics_set_tx_info(), well above that point in
+// this file) and the new energy-weighted held-detector need to call it
+// too. Kept as one real function rather than three copies of the same
+// numerator/denominator ratio.
+static float energy_weighted_fast_hz(void);
+
+// 2026-09-16, later same day: found on first bench test (see this date's
+// null_bias_investigation.md entry, "energy_weighted dev compared against
+// the wrong anchor") that the energy-weighted line's dev=+410Hz etc. was
+// meaningless - it was being measured against s_freq_anchor_hz, which is
+// seeded from the PLAIN fast EMA, not this one. A plain-mean and an
+// energy-weighted mean of the same signal are legitimately different
+// numbers even with nothing wrong (see ssb_dsp.h's own null_bias doc
+// comment on why an equal-amplitude two-tone's time-average and
+// power-weighted-average differ) - comparing energy-weighted's absolute
+// level against the plain anchor will ALWAYS show a large, static, gap
+// that has nothing to do with any real event. Gives the energy-weighted
+// EMA its own anchor, seeded at the exact same boot-settle instant as
+// s_freq_anchor_hz, so ITS dev is measured against ITS OWN baseline -
+// the only way "dev" is comparable to a real SDR-observed deviation.
+static float    s_freq_energy_anchor_hz = 0.0f;
+static bool     s_freq_energy_anchor_inited = false;
+
 static bool     s_freq_ema_fast_inited = false;   // fast EMA seeded from the first-ever raw sample
 static bool     s_freq_ema_slow_inited = false;   // slow EMA snapped from fast after the boot settle
 static uint32_t s_freq_ema_boot_settle_ticks_left = 0;   // counts down FREQ_EMA_BOOT_SETTLE_TICKS
@@ -327,6 +389,21 @@ static uint32_t s_slow_trigger_delay_change_ms = 0;   // relative_delay_get_last
                                                        // the trigger instant - see that
                                                        // function's declaration comment
                                                        // (relative_delay.h)
+
+// 2026-09-16, later same day: energy-weighted companion snapshot for this
+// SAME trigger - see this date's null_bias_investigation.md entry
+// ("correction - the recurring ~153.6s rise/recovery pattern is very
+// likely a plain-EMA null-noise artifact"). K_out_7.txt showed 12 of 13
+// occurrences of this exact plain fast/slow trigger produced NO real SDR
+// movement at all (+/-4Hz), while the one that DID coincide with real
+// movement (-38Hz/+8Hz) was numerically indistinguishable from the other
+// 12 by before/after/delta alone. Recording the energy-weighted reading
+// at the same two instants (trigger, and post-capture-close) lets every
+// FUTURE auto-capture answer "was this one real" from its own printout,
+// without needing a coincidentally-timed manual 'H' press the way this
+// correction had to rely on.
+static float    s_slow_trigger_energy_before_hz = 0.0f;   // energy_weighted_fast_hz() at the trigger instant
+static float    s_slow_trigger_energy_after_hz = 0.0f;    // energy_weighted_fast_hz() once post capture completes
 
 // 2026-09-12, yet later still: a SECOND, much-longer-timescale companion
 // to the fine (1.25ms/bin) trace above - added after TWO consecutive real
@@ -444,6 +521,27 @@ static bool     s_freq_anchor_inited = false;
 
 static uint32_t s_held_tx_freq[HELD_TRACE_LEN];
 static float    s_held_fast_hz[HELD_TRACE_LEN];
+
+// 2026-09-16, later still: added directly in response to the
+// log_20260916_122436.txt held_trace phantom-tx_freq finding
+// (null_bias_investigation.md) - a ~8000Hz "phantom" tx_freq reading, sustained
+// for a full ~153.6s cycle, that the corruption canary, fast/slow, and the SDR
+// all agreed never really happened. Leading theory: an occasional skipped/
+// double-counted DSP tick shifts held_trace's own sampling phase (it's
+// exactly-multiple-aliased to the two-tone period already) onto a more
+// extreme point of the periodic waveform. These three are simple per-sample
+// SNAPSHOTS of the existing, already-tested cumulative counters
+// (s_dbg_overrun_count/s_dbg_late_tick_count/s_dbg_max_busy_us -
+// diagnostics_record_phase_timings()/diagnostics_record_tick_start() above) -
+// deliberately not new accumulation/reset logic of their own, to avoid adding
+// a second novel mechanism right where we're hunting for one. Since each is
+// monotonically non-decreasing, a step between two consecutive printed
+// samples in print_held_trace() pinpoints exactly which 500ms bin saw a real
+// DSP-timing hiccup - if one lines up with the next tx_freq phantom episode's
+// onset/recovery, that confirms the tick-slip theory outright.
+static uint32_t s_held_overrun_count[HELD_TRACE_LEN];
+static uint32_t s_held_late_tick_count[HELD_TRACE_LEN];
+static uint32_t s_held_max_busy_us[HELD_TRACE_LEN];
 static uint32_t s_held_trace_write_idx = 0;
 static uint32_t s_held_trace_fill = 0;
 static uint32_t s_held_trace_tick_count = 0;
@@ -465,6 +563,31 @@ static volatile bool s_held_pending_confirm = false;
 static volatile bool s_held_pending_reannounce = false;
 static volatile bool s_held_pending_recovery = false;
 static volatile uint32_t s_held_pending_recovery_duration_ms = 0;
+
+// 2026-09-16, later same day: energy-weighted's own "held" detector -
+// same structure as s_held_active etc. just above, built directly off
+// this date's correction (null_bias_investigation.md, "the recurring
+// ~153.6s rise/recovery pattern is very likely a plain-EMA null-noise
+// artifact"): 12 of 13 plain-EMA slow-jump triggers in K_out_7.txt
+// produced no real SDR movement at all, so the plain fast/anchor pair
+// above can no longer be trusted alone to mean "something real is
+// happening." This tracks the SAME kind of sustained-deviation condition
+// but against s_freq_energy_anchor_hz / energy_weighted_fast_hz()
+// instead - the quantity that DID match the SDR to within 0.4Hz on its
+// one real bench test (K_out_6.txt, -38.37Hz vs -38Hz). Deliberately
+// reuses HELD_TRIGGER_HZ/HELD_MIN_DURATION_MS/HELD_REANNOUNCE_MS rather
+// than inventing new untuned constants - split them later if bench data
+// shows the energy-weighted case needs different numbers.
+static volatile bool     s_energy_held_active = false;
+static volatile bool     s_energy_held_confirmed = false;
+static volatile uint32_t s_energy_held_started_ms = 0;
+static volatile uint32_t s_energy_held_last_reannounce_ms = 0;
+static volatile float    s_energy_held_last_dev_hz = 0.0f;
+
+static volatile bool s_energy_held_pending_confirm = false;
+static volatile bool s_energy_held_pending_reannounce = false;
+static volatile bool s_energy_held_pending_recovery = false;
+static volatile uint32_t s_energy_held_pending_recovery_duration_ms = 0;
 #endif
 
 static volatile uint32_t s_dbg_max_busy_us = 0;
@@ -699,7 +822,9 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_
 #if AD9851_ATTACHED
     s_dbg_delayed_freq_dev = delayed_freq_dev_hz;
     s_dbg_tx_freq = tx_freq;
-    (void)delayed_envelope;   // stored nowhere yet - kept for a future post-delay null_bias variant, see header
+    (void)delayed_envelope;   // stored nowhere - NOT time-matched to delayed_freq_dev_hz once delay
+                              // is nonzero (see relative_delay.h) - envelope_at_freq_time below is
+                              // the correct pairing, and is what the energy-weighted EMA now uses.
 
     // 2026-09-12, yet later still: slow-mean trigger - see its declaration
     // comment (this file, just above the struct/statics it uses) for the
@@ -710,6 +835,15 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_
     // very first sample).
     {
         float dev = delayed_freq_dev_hz;
+
+        // 2026-09-16: post-delay energy weighting for the SAME dev/tick -
+        // see s_freq_ema_energy_num_fast's declaration comment above for
+        // the full story (completes the 2026-09-12 "post-delay null_bias
+        // variant" proposal). env2 uses envelope_at_freq_time specifically
+        // (time-matched to dev), not delayed_envelope.
+        float env_at_freq = envelope_at_freq_time;
+        float env2 = env_at_freq * env_at_freq;
+
         if (!s_freq_ema_fast_inited) {
             // Fast EMA seeds from the first-ever raw sample, same as
             // before - but its own short tau converges it to the true
@@ -720,8 +854,15 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_
             s_freq_ema_fast_hz = dev;
             s_freq_ema_fast_inited = true;
             s_freq_ema_boot_settle_ticks_left = FREQ_EMA_BOOT_SETTLE_TICKS;
+            // Energy-weighted numerator/denominator seed the same tick,
+            // from the same raw sample - same convergence reasoning as
+            // the plain fast EMA (short tau washes out a bad seed fast).
+            s_freq_ema_energy_num_fast = env2 * dev;
+            s_freq_ema_energy_den_fast = env2;
         } else {
             s_freq_ema_fast_hz += FREQ_EMA_FAST_ALPHA * (dev - s_freq_ema_fast_hz);
+            s_freq_ema_energy_num_fast += FREQ_EMA_FAST_ALPHA * (env2 * dev - s_freq_ema_energy_num_fast);
+            s_freq_ema_energy_den_fast += FREQ_EMA_FAST_ALPHA * (env2 - s_freq_ema_energy_den_fast);
         }
 
         if (!s_freq_ema_slow_inited) {
@@ -796,6 +937,9 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_
                         s_slow_trigger_delta_hz = s_freq_ema_fast_hz - s_freq_ema_slow_hz;
                         s_slow_trigger_relative_delay = relative_delay_get_samples();
                         s_slow_trigger_delay_change_ms = relative_delay_get_last_change_ms();
+                        // 2026-09-16, later same day: see s_slow_trigger_energy_before_hz's
+                        // declaration comment - the "was this one real" companion reading.
+                        s_slow_trigger_energy_before_hz = energy_weighted_fast_hz();
                         s_slow_post_fill = 0;
                         s_slow_trace_state = SLOW_TRACE_CAPTURING_POST;
                     }
@@ -805,6 +949,7 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_
                     }
                     if (s_slow_post_fill >= SLOW_TRACE_POST_BINS) {
                         s_slow_trigger_after_hz = s_freq_ema_fast_hz;
+                        s_slow_trigger_energy_after_hz = energy_weighted_fast_hz();
                         s_slow_trace_state = SLOW_TRACE_LATCHED;
                     }
                 }
@@ -824,6 +969,19 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_
         s_freq_anchor_inited = true;
     }
 
+    // 2026-09-16, later same day: energy-weighted's own anchor - see
+    // s_freq_energy_anchor_hz's declaration comment for why this can't
+    // reuse s_freq_anchor_hz above. Same boot-settle instant, same
+    // reasoning (fast/energy-weighted have each had ~10 of their own time
+    // constants to converge by here). Guarded by MIN_ENERGY_DEN the same
+    // way the getter below is - seeding from a near-zero-energy ratio at
+    // boot (e.g. RF not yet enabled) would latch a meaningless anchor.
+    if (!s_freq_energy_anchor_inited && s_freq_ema_slow_inited
+        && s_freq_ema_energy_den_fast >= MIN_ENERGY_DEN) {
+        s_freq_energy_anchor_hz = s_freq_ema_energy_num_fast / s_freq_ema_energy_den_fast;
+        s_freq_energy_anchor_inited = true;
+    }
+
     // Always-on rolling flight recorder of the real tx_freq/fast_hz -
     // independent of held-state, so history is already available the
     // instant a held event is confirmed (see this block's declaration
@@ -834,6 +992,11 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_
         s_held_trace_tick_count = 0;
         s_held_tx_freq[s_held_trace_write_idx] = tx_freq;
         s_held_fast_hz[s_held_trace_write_idx] = s_freq_ema_fast_hz;
+        // Cumulative-since-last-'r'-reset snapshots - see s_held_overrun_count's
+        // declaration comment for why these aren't per-bin deltas.
+        s_held_overrun_count[s_held_trace_write_idx] = s_dbg_overrun_count;
+        s_held_late_tick_count[s_held_trace_write_idx] = s_dbg_late_tick_count;
+        s_held_max_busy_us[s_held_trace_write_idx] = s_dbg_max_busy_us;
         s_held_trace_write_idx = (s_held_trace_write_idx + 1) % HELD_TRACE_LEN;
         if (s_held_trace_fill < HELD_TRACE_LEN) s_held_trace_fill++;
     }
@@ -869,6 +1032,49 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_
                 }
                 s_held_active = false;
                 s_held_confirmed = false;
+            }
+        }
+    }
+
+    // 2026-09-16, later same day: energy-weighted's own held check - see
+    // s_energy_held_active's declaration comment for the full motivation.
+    // Same structure as the plain block just above, against
+    // s_freq_energy_anchor_hz/energy_weighted_fast_hz() instead of
+    // s_freq_anchor_hz/s_freq_ema_fast_hz. Deliberately a separate,
+    // independent state machine - a real event might move one without
+    // the other (that's the whole point after today's correction), so
+    // this must be able to confirm/recover on its own schedule.
+    if (s_freq_energy_anchor_inited) {
+        float edev = energy_weighted_fast_hz() - s_freq_energy_anchor_hz;
+        float edev_abs = (edev < 0.0f) ? -edev : edev;
+        uint32_t enow_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+        if (edev_abs > HELD_TRIGGER_HZ) {
+            if (!s_energy_held_active) {
+                s_energy_held_active = true;
+                s_energy_held_started_ms = enow_ms;
+                s_energy_held_confirmed = false;
+            }
+            s_energy_held_last_dev_hz = edev;
+
+            if (!s_energy_held_confirmed
+                && (enow_ms - s_energy_held_started_ms) >= (uint32_t)HELD_MIN_DURATION_MS) {
+                s_energy_held_confirmed = true;
+                s_energy_held_last_reannounce_ms = enow_ms;
+                s_energy_held_pending_confirm = true;
+            } else if (s_energy_held_confirmed
+                       && (enow_ms - s_energy_held_last_reannounce_ms) >= (uint32_t)HELD_REANNOUNCE_MS) {
+                s_energy_held_last_reannounce_ms = enow_ms;
+                s_energy_held_pending_reannounce = true;
+            }
+        } else {
+            if (s_energy_held_active) {
+                if (s_energy_held_confirmed) {
+                    s_energy_held_pending_recovery_duration_ms = enow_ms - s_energy_held_started_ms;
+                    s_energy_held_pending_recovery = true;
+                }
+                s_energy_held_active = false;
+                s_energy_held_confirmed = false;
             }
         }
     }
@@ -1048,6 +1254,18 @@ static void print_and_rearm_slow_trace(const char *label)
                   s_slow_trigger_delta_hz, s_slow_trigger_relative_delay,
                   s_slow_pre_fill, s_slow_post_fill,
                   (double)((float)(SLOW_TRACE_BIN_TICKS * SSB_SAMPLE_PERIOD_US) / 1000.0f));
+
+    // 2026-09-16, later same day: the "was this one real" companion line -
+    // see s_slow_trigger_energy_before_hz's declaration comment. anchor_dev
+    // is the after-reading's own deviation from the energy-weighted
+    // anchor (s_freq_energy_anchor_hz) - the number to actually judge
+    // against the SDR, the same quantity 'H's energy-weighted line prints.
+    // A plain-EMA trigger with a small anchor_dev here is the K_out_7.txt
+    // signature of a null-noise artifact; a large one is the signature a
+    // real event should leave.
+    Serial.printf("[dsp]   energy_weighted before=%.2fHz after=%.2fHz anchor=%.2fHz anchor_dev=%+.2fHz\r\n",
+                  s_slow_trigger_energy_before_hz, s_slow_trigger_energy_after_hz,
+                  s_freq_energy_anchor_hz, s_slow_trigger_energy_after_hz - s_freq_energy_anchor_hz);
 
     // 2026-09-12, yet later still: correlates this trigger against the
     // user's own recent '['/']'/preset actions - see
@@ -1241,9 +1459,16 @@ static void print_held_trace(void)
     int32_t first_label = -(int32_t)s_held_trace_fill;
     for (uint32_t k = 0; k < s_held_trace_fill; k++) {
         uint32_t idx = (start + k) % HELD_TRACE_LEN;
-        Serial.printf("[dsp]   held_trace[%+5d]: tx_freq=%luHz fast=%.2fHz\r\n",
+        // overruns/late/max_busy_us are cumulative-since-'r'-reset snapshots
+        // (see s_held_overrun_count's declaration comment) - since each is
+        // monotonically non-decreasing, a step between one line and the next
+        // pinpoints exactly which 500ms bin saw a real DSP-timing hiccup.
+        Serial.printf("[dsp]   held_trace[%+5d]: tx_freq=%luHz fast=%.2fHz overruns=%lu late=%lu max_busy_us=%lu\r\n",
                       (int)(first_label + (int32_t)k),
-                      (unsigned long)s_held_tx_freq[idx], s_held_fast_hz[idx]);
+                      (unsigned long)s_held_tx_freq[idx], s_held_fast_hz[idx],
+                      (unsigned long)s_held_overrun_count[idx],
+                      (unsigned long)s_held_late_tick_count[idx],
+                      (unsigned long)s_held_max_busy_us[idx]);
     }
 }
 #endif
@@ -1305,6 +1530,41 @@ static void diagnostics_check_held_freq(void)
                       now_ms, (double)((float)s_held_pending_recovery_duration_ms / 1000.0f),
                       s_freq_anchor_hz);
     }
+
+    // 2026-09-16, later same day: energy-weighted's own confirm/reannounce/
+    // recovery prints - see s_energy_held_active's declaration comment.
+    // Mirrors the three prints above exactly, labeled ENERGY-WEIGHTED so a
+    // saved log makes plain which detector fired - this one is the number
+    // to trust against the SDR after today's correction, so a
+    // plain-only CONFIRMED STUCK above with no matching one here is itself
+    // the signature of a null-noise artifact rather than a real event.
+    if (s_energy_held_pending_confirm) {
+        s_energy_held_pending_confirm = false;
+        uint32_t confirmed_at_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        Serial.printf("[dsp] held_freq: ENERGY-WEIGHTED CONFIRMED STUCK - energy_weighted fast has been "
+                      "%+.2fHz from its own anchor (%.2fHz) for >=%.0fs (started_at t=%ums, "
+                      "confirmed_at t=%ums) - compare against the SDR now.\r\n",
+                      s_energy_held_last_dev_hz, s_freq_energy_anchor_hz,
+                      (double)(HELD_MIN_DURATION_MS / 1000.0f),
+                      s_energy_held_started_ms, confirmed_at_ms);
+        print_held_trace();
+    }
+    if (s_energy_held_pending_reannounce) {
+        s_energy_held_pending_reannounce = false;
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        uint32_t held_s = (now_ms - s_energy_held_started_ms) / 1000;
+        Serial.printf("[dsp] held_freq: ENERGY-WEIGHTED still stuck, %us so far (t=%ums) - dev=%+.2fHz "
+                      "from anchor=%.2fHz\r\n",
+                      (unsigned)held_s, now_ms, s_energy_held_last_dev_hz, s_freq_energy_anchor_hz);
+    }
+    if (s_energy_held_pending_recovery) {
+        s_energy_held_pending_recovery = false;
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        Serial.printf("[dsp] held_freq: ENERGY-WEIGHTED RECOVERED at t=%ums - was stuck %.1fs total "
+                      "(anchor=%.2fHz)\r\n",
+                      now_ms, (double)((float)s_energy_held_pending_recovery_duration_ms / 1000.0f),
+                      s_freq_energy_anchor_hz);
+    }
 #endif
 }
 
@@ -1313,6 +1573,25 @@ static void diagnostics_check_held_freq(void)
 // unlike 'K' it doesn't re-arm or reset anything (there is nothing to
 // re-arm: the anchor is a permanent, once-only reference by design, and
 // the rolling trace keeps running regardless of whether anyone reads it).
+// 2026-09-16: 'H' helper - see s_freq_ema_energy_num_fast's declaration
+// comment (this file, near s_freq_ema_fast_hz) for the full story. Ratio
+// of two EMAs, guarded against a near-zero denominator (sustained
+// near-total envelope silence - very early boot, or a genuinely
+// unmodulated/silent carrier) by falling back to the plain fast EMA rather
+// than dividing by ~0: a energy-weighted read needs SOME transmitted power
+// behind it to mean anything.
+static float energy_weighted_fast_hz(void)
+{
+#if AD9851_ATTACHED
+    if (s_freq_ema_energy_den_fast < MIN_ENERGY_DEN) {
+        return s_freq_ema_fast_hz;
+    }
+    return s_freq_ema_energy_num_fast / s_freq_ema_energy_den_fast;
+#else
+    return 0.0f;
+#endif
+}
+
 void diagnostics_print_held_status(void)
 {
 #if AD9851_ATTACHED
@@ -1342,6 +1621,28 @@ void diagnostics_print_held_status(void)
                       read_at_ms, s_held_confirmed ? "CONFIRMED STUCK" : "deviated, not yet confirmed",
                       s_held_started_ms, (unsigned)elapsed_s, s_freq_anchor_hz, s_freq_ema_fast_hz,
                       s_held_last_dev_hz, (unsigned long)s_held_last_tx_freq);
+    }
+    // 2026-09-16, later same day: energy-weighted companion read - see
+    // s_freq_ema_energy_num_fast's declaration comment for the full story.
+    // CORRECTED same day, first bench test: dev is now measured against
+    // s_freq_energy_anchor_hz (this quantity's OWN boot-settle baseline),
+    // not the plain-EMA anchor above - comparing an energy-weighted mean
+    // against a plain-mean anchor produced a large, static, meaningless
+    // "dev" (+410Hz on the very first bench read) that had nothing to do
+    // with any real event; see s_freq_energy_anchor_hz's declaration
+    // comment for why the two anchors can't be shared. Falls back to
+    // "not yet set" the same way the plain line above does, since the
+    // energy-weighted anchor can seed slightly later than the plain one
+    // (it additionally requires MIN_ENERGY_DEN worth of transmitted power,
+    // not just slow's own boot-settle).
+    if (!s_freq_energy_anchor_inited) {
+        Serial.printf("[dsp] held_freq: t=%ums energy_weighted anchor not yet set "
+                      "(waiting for transmitted energy)\r\n", read_at_ms);
+    } else {
+        Serial.printf("[dsp] held_freq: t=%ums energy_weighted anchor=%.2fHz fast=%.2fHz dev=%+.2fHz "
+                      "(compare THIS against the SDR - see null_bias_investigation.md 2026-09-16)\r\n",
+                      read_at_ms, s_freq_energy_anchor_hz, energy_weighted_fast_hz(),
+                      energy_weighted_fast_hz() - s_freq_energy_anchor_hz);
     }
     print_held_trace();
 #endif
