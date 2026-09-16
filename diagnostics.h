@@ -194,7 +194,57 @@ void diagnostics_print_jump_log(void);
 // slow EMA is still catching up) so the next event isn't missed while
 // this one's being read. Only ever called from Core 1's
 // handle_serial_commands() context - see diagnostics.cpp for format.
+//
+// 2026-09-15: a latched trace no longer strictly needs this keypress to be
+// read - diagnostics_service() now also drains a LATCHED trace on its own,
+// every loop() iteration, printing the identical trace with an
+// "AUTO-CAPTURED" header instead of "TRIGGERED" (see
+// diagnostics_check_slow_trace_auto_dump(), file-local to diagnostics.cpp,
+// for the full rationale: leaving a bench run unattended and letting hard-
+// to-catch hands-off jumps land in the serial log by themselves). This
+// function's own live "still watching" readout is unaffected and remains
+// 'K'-only - the auto-dump never prints that, only a completed capture.
 void diagnostics_print_slow_trace(void);
+
+// 2026-09-15: 'H' serial command - a second, independent detector alongside
+// 'K' above, added after the user pointed out a real gap: they're watching
+// the actual transmitted frequency on an SDR and reporting cases where it
+// jumps and then SITS at the new value for a long time (their own example:
+// "-22Hz, been there a while") - which 'K' can't reliably see, because 'K'
+// only fires on FAST-vs-SLOW divergence and its own re-arm resyncs slow to
+// fast every time it's read. If fast and slow ever drift together slowly
+// enough to never re-open a gap between EACH OTHER, 'K' goes silent even
+// while sitting far from where the run actually started.
+//
+// This instead compares the fast EMA against a PERMANENT anchor - snapped
+// once from fast at the same boot-settle instant 'K's slow EMA gets its own
+// one-time snap, and never touched again - so a genuine sustained
+// departure from where this run settled is visible no matter how gradually
+// it got there. Fires a "CONFIRMED STUCK" print (plus a dump of an always-
+// running rolling trace of the actual tx_freq/fast_hz, coarse - 2
+// samples/sec over the last 60s - specifically so it isn't fooled by an
+// SDR/FFT display's own exponential-average "trail" the way a fine
+// per-tick trace might invite comparison against) once the deviation has
+// been continuous for at least HELD_MIN_DURATION_MS (diagnostics.cpp,
+// currently 15s - well past how long this session's own data shows an
+// ordinary reverting 'K'-style jump actually lasts, so this doesn't just
+// re-detect the same routine cycles 'K' already catches), a periodic
+// "still stuck" heartbeat every HELD_REANNOUNCE_MS while it remains so,
+// and a "RECOVERED" print with total duration once it clears. Auto-prints
+// on its own from diagnostics_service() exactly like 'K's auto-dump (see
+// diagnostics_check_held_freq(), file-local to diagnostics.cpp) - 'H'
+// itself is a manual, on-demand, non-destructive status/trace read (no
+// re-arm needed - the anchor is permanent and the rolling trace always
+// runs regardless of whether anyone reads it).
+//
+// 2026-09-15, later same day: every line this prints (and every auto-fired
+// CONFIRMED STUCK/still-stuck/RECOVERED line) now carries an explicit
+// t=%ums, directly comparable to a 'K' trace's own "at t=%ums" - added
+// after a live case where it mattered whether an 'H' read genuinely showed
+// nothing during a real sustained jump, or was just read too long after
+// the jump to still see it; without a timestamp on the 'H' side there was
+// no way to tell those two apart from the log alone.
+void diagnostics_print_held_status(void);
 
 // Zeros every counter/high-water-mark this module owns and restarts the
 // dsp-tick long-window average from now. Does NOT touch any other

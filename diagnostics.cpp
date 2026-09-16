@@ -368,6 +368,103 @@ static float    s_trend_slow_hz[EMA_TREND_LEN];
 static uint32_t s_trend_write_idx = 0;
 static uint32_t s_trend_fill = 0;
 static uint32_t s_trend_tick_count = 0;
+
+// 2026-09-15: 'H' - a second, independent detector alongside the slow_trace
+// ('K') one above, built after the user pointed out a real gap in that
+// design: they're watching the ACTUAL output on an SDR and reporting cases
+// where it visibly jumps and then SITS at the new frequency for a long
+// time (their own example: "-22Hz, been there a while") - and 'K' can't
+// reliably see this. 'K' only fires on FAST-vs-SLOW divergence, and its
+// own re-arm deliberately resyncs slow to fast every time a trace is read
+// (see print_and_rearm_slow_trace()'s own comment for why - avoiding a
+// re-trigger storm). That means if fast and slow ever drift down TOGETHER
+// slowly enough to never re-open a 5Hz gap between EACH OTHER, 'K' goes
+// completely silent - even while sitting at a value far from where this
+// whole run actually started, for as long as that lasts. This can't be
+// fixed by tuning 'K' - it needs a comparison against something that
+// never gets resynced.
+//
+// s_freq_anchor_hz is that something: a single fixed reference, snapped
+// ONCE from the fast EMA at the exact same instant 'K's own slow EMA gets
+// its one-time boot-settle snap (see FREQ_EMA_BOOT_SETTLE_TICKS above) -
+// i.e. "where this run's signal actually settled once fully warmed up" -
+// and then NEVER touched again for the rest of the boot, unlike slow_hz
+// which resyncs on every 'K' read. Comparing the fast EMA against this
+// permanent anchor, rather than against the self-resyncing slow EMA,
+// answers a genuinely different question: not "did anything just change"
+// (K's job) but "is the output currently sitting somewhere different from
+// where it started, and has it been there a while" - exactly what the
+// user is asking to detect.
+//
+// HELD_TRIGGER_HZ, 2026-09-15 UPDATE (same day, before any bench build of
+// this went out): originally set to 10Hz on the reasoning that a bigger
+// bar than SLOW_JUMP_TRIGGER_HZ (5Hz) would help keep this from re-firing
+// on ordinary K-style jump-then-revert cycles. That reasoning turned out
+// to be solving the wrong half of the problem - the very next real-world
+// report the user sent ("-13 to +8, still sitting at +8") describes a
+// held state at only ~8Hz off nominal, which a 10Hz bar would have missed
+// entirely, defeating the whole point of this detector for exactly the
+// case it was built for. The actual, already-working defense against
+// re-firing on ordinary reverting jumps is HELD_MIN_DURATION_MS (below) -
+// those revert within single-digit seconds regardless of MAGNITUDE (see
+// K_out_1/2/3.txt's bin-level evidence), so a 15s continuous-duration
+// requirement already filters them out at any reasonable magnitude
+// threshold. There was never a good reason for HELD_TRIGGER_HZ to be
+// bigger than SLOW_JUMP_TRIGGER_HZ's own 5Hz - that number is ALREADY the
+// user's own independently-established visual-read perceptual floor (see
+// SLOW_JUMP_TRIGGER_HZ's own declaration comment), so reusing it directly
+// here means "anything the user could actually notice, if it's still
+// there 15 seconds later" - which is exactly what this detector should
+// mean. Changed 10Hz -> 5Hz.
+//
+// Unlike the fine (1.24ms/bin) slow_trace ring, the rolling trace here
+// (HELD_TRACE_LEN samples, HELD_TRACE_SAMPLE_MS apart) runs CONTINUOUSLY
+// at all times (not armed/frozen around a trigger) - a small always-on
+// flight recorder of the actual tx_freq (the literal integer Hz value
+// sent to the AD9851 - see diagnostics_set_tx_info()'s own declaration
+// comment on tx_freq being ground truth) alongside the fast EMA, coarse
+// enough to cover HELD_TRACE_LEN*HELD_TRACE_SAMPLE_MS/1000 seconds of
+// history - long enough to show whatever lead-up happened before a held
+// event is confirmed, and (per the user's own report of seeing an actual
+// multi-second SDR "trail" on some but not most jumps) coarse enough not
+// to mistake normal FFT/waterfall exponential-average smoothing on their
+// display for a real multi-second DSP-side transition - this trace is of
+// the real tx_freq value itself, nothing exponentially averaged on top of
+// it.
+#define HELD_TRIGGER_HZ 5.0f
+#define HELD_MIN_DURATION_MS 15000.0f
+#define HELD_TRACE_SAMPLE_MS 500.0f       // 2 samples/sec
+#define HELD_TRACE_LEN 120                // 120 * 500ms = 60s of rolling history
+#define HELD_REANNOUNCE_MS 30000.0f       // heartbeat cadence while still held
+static const uint32_t HELD_TRACE_SAMPLE_TICKS =
+    (uint32_t)(HELD_TRACE_SAMPLE_MS * 1000.0f / (float)SSB_SAMPLE_PERIOD_US);
+
+static float    s_freq_anchor_hz = 0.0f;
+static bool     s_freq_anchor_inited = false;
+
+static uint32_t s_held_tx_freq[HELD_TRACE_LEN];
+static float    s_held_fast_hz[HELD_TRACE_LEN];
+static uint32_t s_held_trace_write_idx = 0;
+static uint32_t s_held_trace_fill = 0;
+static uint32_t s_held_trace_tick_count = 0;
+
+static volatile bool     s_held_active = false;      // |fast-anchor| currently over threshold
+static volatile bool     s_held_confirmed = false;    // active for >= HELD_MIN_DURATION_MS
+static volatile uint32_t s_held_started_ms = 0;
+static volatile uint32_t s_held_last_reannounce_ms = 0;
+static volatile float    s_held_last_dev_hz = 0.0f;
+static volatile uint32_t s_held_last_tx_freq = 0;
+
+// Set by the hot path (diagnostics_set_tx_info(), below), cleared by
+// diagnostics_check_held_freq() (Core 1, called from diagnostics_service() -
+// same unconditional/mute-exempt pattern as diagnostics_check_slow_trace_
+// auto_dump() and canary_check_background()). "pending" flags rather than
+// printing directly from the hot path, same reasoning as every other
+// diagnostic in this file: no Serial calls on the real-time task.
+static volatile bool s_held_pending_confirm = false;
+static volatile bool s_held_pending_reannounce = false;
+static volatile bool s_held_pending_recovery = false;
+static volatile uint32_t s_held_pending_recovery_duration_ms = 0;
 #endif
 
 static volatile uint32_t s_dbg_max_busy_us = 0;
@@ -715,6 +812,67 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_
         }
     }
 
+    // 2026-09-15: 'H' held-frequency detector - see its statics' own
+    // declaration comment (above, near s_freq_anchor_hz) for the full
+    // motivation. Anchor snaps once, at the exact same instant slow_hz
+    // gets its own one-time boot-settle snap just above - by that point
+    // fast_hz has had ~10 of its own time constants to converge from
+    // whatever the raw boot seed was (see FREQ_EMA_BOOT_SETTLE_TICKS),
+    // same reasoning slow_hz's own snap already relies on.
+    if (!s_freq_anchor_inited && s_freq_ema_slow_inited) {
+        s_freq_anchor_hz = s_freq_ema_fast_hz;
+        s_freq_anchor_inited = true;
+    }
+
+    // Always-on rolling flight recorder of the real tx_freq/fast_hz -
+    // independent of held-state, so history is already available the
+    // instant a held event is confirmed (see this block's declaration
+    // comment on why this is continuous, not armed-on-trigger like
+    // slow_trace's fine bins).
+    s_held_trace_tick_count++;
+    if (s_held_trace_tick_count >= HELD_TRACE_SAMPLE_TICKS) {
+        s_held_trace_tick_count = 0;
+        s_held_tx_freq[s_held_trace_write_idx] = tx_freq;
+        s_held_fast_hz[s_held_trace_write_idx] = s_freq_ema_fast_hz;
+        s_held_trace_write_idx = (s_held_trace_write_idx + 1) % HELD_TRACE_LEN;
+        if (s_held_trace_fill < HELD_TRACE_LEN) s_held_trace_fill++;
+    }
+
+    if (s_freq_anchor_inited) {
+        float adev = s_freq_ema_fast_hz - s_freq_anchor_hz;
+        if (adev < 0.0f) adev = -adev;
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+        if (adev > HELD_TRIGGER_HZ) {
+            if (!s_held_active) {
+                s_held_active = true;
+                s_held_started_ms = now_ms;
+                s_held_confirmed = false;
+            }
+            s_held_last_dev_hz = s_freq_ema_fast_hz - s_freq_anchor_hz;
+            s_held_last_tx_freq = tx_freq;
+
+            if (!s_held_confirmed && (now_ms - s_held_started_ms) >= (uint32_t)HELD_MIN_DURATION_MS) {
+                s_held_confirmed = true;
+                s_held_last_reannounce_ms = now_ms;
+                s_held_pending_confirm = true;
+            } else if (s_held_confirmed
+                       && (now_ms - s_held_last_reannounce_ms) >= (uint32_t)HELD_REANNOUNCE_MS) {
+                s_held_last_reannounce_ms = now_ms;
+                s_held_pending_reannounce = true;
+            }
+        } else {
+            if (s_held_active) {
+                if (s_held_confirmed) {
+                    s_held_pending_recovery_duration_ms = now_ms - s_held_started_ms;
+                    s_held_pending_recovery = true;
+                }
+                s_held_active = false;
+                s_held_confirmed = false;
+            }
+        }
+    }
+
     // See s_dbg_max_freq_dev_step_hz's own declaration comment. tx_freq is
     // this tick's ground-truth Hz value (carrier_output.h's own doc
     // comment) - comparing it against last tick's value catches any
@@ -833,7 +991,11 @@ void diagnostics_print_jump_log(void)
     uint32_t start = (s_jump_log_count < JUMP_LOG_LEN) ? 0 : s_jump_log_write_idx;
     for (uint32_t k = 0; k < n; k++) {
         jump_log_entry_t *e = &s_jump_log[(start + k) % JUMP_LOG_LEN];
-        Serial.printf("[dsp]   jump[%u]: t=%ums %u->%uHz (step=%uHz) env=%.3f/%.3f%s%s delay=%+.2f "
+        // env=.../... precision bumped %.3f->%.6e alongside the K trace's
+        // env_min fix just above (same reasoning: these values live well
+        // below 3 decimal places' resolution and were printing as an
+        // uninformative flat 0.000/0.001 regardless of true null depth).
+        Serial.printf("[dsp]   jump[%u]: t=%ums %u->%uHz (step=%uHz) env=%.6e/%.6e%s%s delay=%+.2f "
                       "busy_us=%u src=%s\r\n",
                       (unsigned)k, e->at_ms, e->from_hz, e->to_hz, e->step_hz, e->envelope, e->envelope_min,
                       e->near_null_blended ? " NEAR_NULL" : "",
@@ -856,42 +1018,32 @@ void diagnostics_print_jump_log(void)
 #endif
 }
 
-// 2026-09-12, yet later still: 'K' serial command - see the slow-mean-
-// trigger struct/statics' own declaration comment (above, near
-// jump_log_entry_t) for the full motivation and design. Prints either a
-// live "still watching" readout (nothing has crossed SLOW_JUMP_TRIGGER_HZ
-// yet) or the full latched pre/post trace (it has), then re-arms for the
-// next event - see the header comment for why re-arming also resyncs the
-// slow EMA to the fast one.
-void diagnostics_print_slow_trace(void)
-{
+// 2026-09-15: shared body for "a latched slow_trace is ready - print it in
+// full and re-arm", factored out of diagnostics_print_slow_trace() below so
+// the exact same print+rearm logic can be driven from two different places:
+// the 'K' keypress (manual, unchanged) and diagnostics_service() (automatic,
+// new - see diagnostics_check_slow_trace_auto_dump() just below this
+// function). Added after the user asked to "leave it running" unattended and
+// have the big hands-off jumps (their own examples: -50Hz, +20Hz, apparently
+// instantaneous) land in the log on their own, rather than needing to notice
+// one had fired and type 'K' before it got read. Nothing about the capture
+// logic itself changes - a trigger still safely LATCHES and holds
+// indefinitely until read (see s_slow_trace_state's own declaration
+// comment), so no data was ever at risk of being lost waiting for a
+// keypress; this purely removes the keypress from the loop. label
+// distinguishes "TRIGGERED" (found via 'K') from "AUTO-CAPTURED" (found by
+// diagnostics_service() on its own) in the printed header line, so a saved
+// serial log makes plain which path produced each dump - useful since a
+// human watching live can still hit 'K' at basically the same moment the
+// auto-dump would have fired anyway; whichever gets there first prints it
+// once (this function always re-arms before returning), the other then just
+// sees SLOW_TRACE_WATCHING and has nothing to do.
 #if AD9851_ATTACHED
-    if (s_slow_trace_state != SLOW_TRACE_LATCHED) {
-        // Two distinct holds, reported separately so it's never ambiguous
-        // which one (if either) is currently blocking a trigger:
-        // boot-settle (slow not snapped from fast yet at all - only ever
-        // nonzero once, right after boot) and the short residual warmup
-        // after slow IS initialized (also re-armed after every trigger is
-        // read). See FREQ_EMA_BOOT_SETTLE_TICKS/FREQ_EMA_WARMUP_TICKS's
-        // declaration comments for why both exist.
-        if (!s_freq_ema_slow_inited) {
-            float settle_ms_left = (float)s_freq_ema_boot_settle_ticks_left * (float)SSB_SAMPLE_PERIOD_US / 1000.0f;
-            Serial.printf("[dsp] slow_trace: still watching - slow EMA not yet initialized "
-                          "(boot_settle_left=%.0fms, fast_ema=%.2fHz so far) pre_bins_filled=%u/%u\r\n",
-                          settle_ms_left, s_freq_ema_fast_hz, s_slow_pre_fill, (unsigned)SLOW_TRACE_PRE_BINS);
-            return;
-        }
-        float warmup_ms_left = (float)s_freq_ema_warmup_ticks_left * (float)SSB_SAMPLE_PERIOD_US / 1000.0f;
-        Serial.printf("[dsp] slow_trace: still watching - fast_ema=%.2fHz slow_ema=%.2fHz "
-                      "delta=%.2fHz (fires at +/-%.1fHz, warmup_left=%.0fms) pre_bins_filled=%u/%u\r\n",
-                      s_freq_ema_fast_hz, s_freq_ema_slow_hz,
-                      s_freq_ema_fast_hz - s_freq_ema_slow_hz, (float)SLOW_JUMP_TRIGGER_HZ, warmup_ms_left,
-                      s_slow_pre_fill, (unsigned)SLOW_TRACE_PRE_BINS);
-        return;
-    }
-
-    Serial.printf("[dsp] slow_trace: TRIGGERED at t=%ums before=%.2fHz after=%.2fHz delta=%+.2fHz "
+static void print_and_rearm_slow_trace(const char *label)
+{
+    Serial.printf("[dsp] slow_trace: %s at t=%ums before=%.2fHz after=%.2fHz delta=%+.2fHz "
                   "delay=%+.2f - %u pre-bin(s) + %u post-bin(s), %.2fms/bin\r\n",
+                  label,
                   s_slow_trigger_at_ms, s_slow_trigger_before_hz, s_slow_trigger_after_hz,
                   s_slow_trigger_delta_hz, s_slow_trigger_relative_delay,
                   s_slow_pre_fill, s_slow_post_fill,
@@ -919,13 +1071,27 @@ void diagnostics_print_slow_trace(void)
     for (uint32_t k = 0; k < s_slow_pre_fill; k++) {
         slow_trace_bin_t *b = &s_slow_pre_ring[(start + k) % SLOW_TRACE_PRE_BINS];
         bool is_last_pre = (k == s_slow_pre_fill - 1);
-        Serial.printf("[dsp]   slow_trace[%+4d]: freq=%.1fHz env_min=%.3f%s\r\n",
+        // 2026-09-15, later still: env_min's print precision bumped from
+        // %.3f to %.6e here and in the post-bin loop just below. The user
+        // directly observed (scope on the envelope waveform, not this log)
+        // that the null's actual depth visibly varies over time, and
+        // suspected it correlates with which cycles trigger 'K' - but
+        // every env_min this whole session has printed as a flat "0.001"
+        // regardless of how deep the null actually was, because the real
+        // values live well below 3 decimal places' resolution (this
+        // signal's nulls are typically several orders of magnitude below
+        // 1.0). That's not "the null is always exactly 0.001" - it's this
+        // printf silently discarding the one piece of data that would
+        // confirm or refute the user's own hypothesis. Scientific notation
+        // instead of a fixed decimal count so this stays informative
+        // whether the true minimum is ~1e-3 or ~1e-6.
+        Serial.printf("[dsp]   slow_trace[%+4d]: freq=%.1fHz env_min=%.6e%s\r\n",
                       (int)(first_label + (int32_t)k), b->freq_mean_hz, b->env_min,
                       is_last_pre ? " <-- TRIGGER (delta first exceeded threshold here)" : "");
     }
     for (uint32_t k = 0; k < s_slow_post_fill; k++) {
         slow_trace_bin_t *b = &s_slow_post_bins[k];
-        Serial.printf("[dsp]   slow_trace[%+4d]: freq=%.1fHz env_min=%.3f\r\n",
+        Serial.printf("[dsp]   slow_trace[%+4d]: freq=%.1fHz env_min=%.6e\r\n",
                       (int)(k + 1), b->freq_mean_hz, b->env_min);
     }
 
@@ -972,6 +1138,212 @@ void diagnostics_print_slow_trace(void)
     s_trend_write_idx = 0;
     s_trend_fill = 0;
     s_trend_tick_count = 0;
+}
+#endif // AD9851_ATTACHED
+
+// 2026-09-12, yet later still: 'K' serial command - see the slow-mean-
+// trigger struct/statics' own declaration comment (above, near
+// jump_log_entry_t) for the full motivation and design. Prints either a
+// live "still watching" readout (nothing has crossed SLOW_JUMP_TRIGGER_HZ
+// yet) or the full latched pre/post trace (it has), then re-arms for the
+// next event - see the header comment for why re-arming also resyncs the
+// slow EMA to the fast one.
+//
+// 2026-09-15: since diagnostics_check_slow_trace_auto_dump() (below) now
+// drains a LATCHED trace on its own every loop() iteration, this manual
+// path will usually already find SLOW_TRACE_WATCHING by the time a human
+// gets to it - that's fine and expected, not a bug (see
+// print_and_rearm_slow_trace()'s own comment on the two paths racing
+// harmlessly). 'K' remains useful on its own for the live "still watching"
+// fast/slow/delta readout, which the auto-dump deliberately never prints
+// (see diagnostics_check_slow_trace_auto_dump()'s comment for why).
+void diagnostics_print_slow_trace(void)
+{
+#if AD9851_ATTACHED
+    if (s_slow_trace_state != SLOW_TRACE_LATCHED) {
+        // Two distinct holds, reported separately so it's never ambiguous
+        // which one (if either) is currently blocking a trigger:
+        // boot-settle (slow not snapped from fast yet at all - only ever
+        // nonzero once, right after boot) and the short residual warmup
+        // after slow IS initialized (also re-armed after every trigger is
+        // read). See FREQ_EMA_BOOT_SETTLE_TICKS/FREQ_EMA_WARMUP_TICKS's
+        // declaration comments for why both exist.
+        if (!s_freq_ema_slow_inited) {
+            float settle_ms_left = (float)s_freq_ema_boot_settle_ticks_left * (float)SSB_SAMPLE_PERIOD_US / 1000.0f;
+            Serial.printf("[dsp] slow_trace: still watching - slow EMA not yet initialized "
+                          "(boot_settle_left=%.0fms, fast_ema=%.2fHz so far) pre_bins_filled=%u/%u\r\n",
+                          settle_ms_left, s_freq_ema_fast_hz, s_slow_pre_fill, (unsigned)SLOW_TRACE_PRE_BINS);
+            return;
+        }
+        float warmup_ms_left = (float)s_freq_ema_warmup_ticks_left * (float)SSB_SAMPLE_PERIOD_US / 1000.0f;
+        Serial.printf("[dsp] slow_trace: still watching - fast_ema=%.2fHz slow_ema=%.2fHz "
+                      "delta=%.2fHz (fires at +/-%.1fHz, warmup_left=%.0fms) pre_bins_filled=%u/%u\r\n",
+                      s_freq_ema_fast_hz, s_freq_ema_slow_hz,
+                      s_freq_ema_fast_hz - s_freq_ema_slow_hz, (float)SLOW_JUMP_TRIGGER_HZ, warmup_ms_left,
+                      s_slow_pre_fill, (unsigned)SLOW_TRACE_PRE_BINS);
+        return;
+    }
+
+    print_and_rearm_slow_trace("TRIGGERED");
+#endif
+}
+
+// 2026-09-15: automatic sibling to the 'K' command above - added directly in
+// response to the user's request ("Can you automatically dump the K tables
+// when a jump is triggered and captured. I can then just leave it running
+// and see what we get over time") after they reported several apparently-
+// instantaneous hands-off jumps (their own examples: -50Hz, +20Hz) that
+// they weren't at the keyboard to catch with 'K' before something else
+// might eventually have overwritten the context (in practice nothing does -
+// see s_slow_trace_state's own comment, a LATCHED trace already holds
+// indefinitely - but the user still had to notice and act in time, which a
+// hands-off bench run defeats entirely). Called from diagnostics_service()
+// (Core 1, once per loop() iteration - see that function) so a captured
+// trace prints itself within one loop() cycle (worst case ~10ms, the
+// delay(10) at the end of loop() - see diagnostics_record_core1_loop_timings()'s
+// own comment on that delay) of the post-window actually filling, with no
+// keypress needed at all. Deliberately mirrors canary_check_background()'s
+// existing pattern just below in diagnostics_service(): an unconditional,
+// mute-EXEMPT, checked-every-call function that costs nothing (one enum
+// comparison) until the rare tick where there's actually something to do -
+// a real jump landing in the log matters more than whether 'v' happens to
+// be muted, and 'K' itself has always ignored the mute flag too.
+//
+// Deliberately does NOT print anything when s_slow_trace_state is WATCHING
+// or CAPTURING_POST - only ever fires on the LATCHED transition, exactly
+// once per event (this function's own call to print_and_rearm_slow_trace()
+// immediately re-arms back to WATCHING, so the next call this same
+// millisecond sees nothing left to do). This is why it can safely run every
+// single loop() iteration without flooding Serial the way printing the
+// "still watching" live readout unconditionally would - that live readout
+// remains 'K'-only, on purpose, for exactly this reason.
+static void diagnostics_check_slow_trace_auto_dump(void)
+{
+#if AD9851_ATTACHED
+    if (s_slow_trace_state == SLOW_TRACE_LATCHED) {
+        print_and_rearm_slow_trace("AUTO-CAPTURED");
+    }
+#endif
+}
+
+#if AD9851_ATTACHED
+// 2026-09-15: dumps the always-on rolling tx_freq/fast_hz trace - see
+// s_held_tx_freq's own declaration comment for why this ring is
+// continuous rather than armed-on-trigger. Shared by the auto "just
+// confirmed held" print, the manual 'H' command, and (for symmetry) could
+// be called from a recovery print too, though recovery deliberately keeps
+// its own print short (the trace at that point is dominated by the now-
+// finished held episode, not fresh information) - see
+// diagnostics_check_held_freq() below.
+static void print_held_trace(void)
+{
+    uint32_t start = (s_held_trace_fill < HELD_TRACE_LEN) ? 0 : s_held_trace_write_idx;
+    int32_t first_label = -(int32_t)s_held_trace_fill;
+    for (uint32_t k = 0; k < s_held_trace_fill; k++) {
+        uint32_t idx = (start + k) % HELD_TRACE_LEN;
+        Serial.printf("[dsp]   held_trace[%+5d]: tx_freq=%luHz fast=%.2fHz\r\n",
+                      (int)(first_label + (int32_t)k),
+                      (unsigned long)s_held_tx_freq[idx], s_held_fast_hz[idx]);
+    }
+}
+#endif
+
+// 2026-09-15: Core 1 side of the 'H' held-frequency detector - called
+// unconditionally from diagnostics_service() every loop() iteration, same
+// mute-exempt "cheap until there's actually something to do" pattern as
+// diagnostics_check_slow_trace_auto_dump()/canary_check_background() just
+// above/below it. Three independent one-shot flags, set by the hot path
+// (diagnostics_set_tx_info()) and cleared here - a confirm print (fires
+// once, HELD_MIN_DURATION_MS after the deviation first crossed
+// HELD_TRIGGER_HZ), a periodic reannounce heartbeat (every
+// HELD_REANNOUNCE_MS while still confirmed-held, so a very long episode
+// doesn't go silent and leave it ambiguous whether it's still stuck or
+// quietly recovered unnoticed), and a recovery print (fires once, the
+// instant |fast-anchor| drops back under threshold after having been
+// confirmed) reporting the total duration. See s_freq_anchor_hz's own
+// declaration comment for the full motivation and why this is a
+// genuinely different question from 'K's own fast-vs-slow trigger.
+static void diagnostics_check_held_freq(void)
+{
+#if AD9851_ATTACHED
+    if (s_held_pending_confirm) {
+        s_held_pending_confirm = false;
+        uint32_t confirmed_at_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        // 2026-09-15, later same day: timestamps added throughout this
+        // function and diagnostics_print_held_status() below, in direct
+        // response to the user's "shame the H output is not timestamped"
+        // observation - without an absolute t= to compare against, a K
+        // trace's own t= (see print_and_rearm_slow_trace()'s "at t=%ums")
+        // and an 'H' read couldn't be lined up precisely, which mattered a
+        // lot for judging whether a suspected measurement gap was a real
+        // blind spot or just an unmeasured delay between eyeballing the
+        // SDR and typing the command. started_at is when the deviation
+        // FIRST crossed HELD_TRIGGER_HZ (comparable to a K trigger's own
+        // "at t="); confirmed_at is when this message actually printed
+        // (started_at + HELD_MIN_DURATION_MS, modulo scheduling jitter).
+        Serial.printf("[dsp] held_freq: CONFIRMED STUCK - fast_ema has been %+.2fHz from this run's "
+                      "anchor (%.2fHz) for >=%.0fs (started_at t=%ums, confirmed_at t=%ums). "
+                      "tx_freq=%luHz fast=%.2fHz\r\n",
+                      s_held_last_dev_hz, s_freq_anchor_hz, (double)(HELD_MIN_DURATION_MS / 1000.0f),
+                      s_held_started_ms, confirmed_at_ms,
+                      (unsigned long)s_held_last_tx_freq, s_freq_anchor_hz + s_held_last_dev_hz);
+        print_held_trace();
+    }
+    if (s_held_pending_reannounce) {
+        s_held_pending_reannounce = false;
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        uint32_t held_s = (now_ms - s_held_started_ms) / 1000;
+        Serial.printf("[dsp] held_freq: still stuck, %us so far (t=%ums) - dev=%+.2fHz from "
+                      "anchor=%.2fHz tx_freq=%luHz\r\n",
+                      (unsigned)held_s, now_ms, s_held_last_dev_hz, s_freq_anchor_hz,
+                      (unsigned long)s_held_last_tx_freq);
+    }
+    if (s_held_pending_recovery) {
+        s_held_pending_recovery = false;
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        Serial.printf("[dsp] held_freq: RECOVERED at t=%ums - was stuck %.1fs total (anchor=%.2fHz)\r\n",
+                      now_ms, (double)((float)s_held_pending_recovery_duration_ms / 1000.0f),
+                      s_freq_anchor_hz);
+    }
+#endif
+}
+
+// 2026-09-15: 'H' serial command - on-demand status/trace read, mirroring
+// 'K's own "still watching" vs. latched-content split. Purely a read -
+// unlike 'K' it doesn't re-arm or reset anything (there is nothing to
+// re-arm: the anchor is a permanent, once-only reference by design, and
+// the rolling trace keeps running regardless of whether anyone reads it).
+void diagnostics_print_held_status(void)
+{
+#if AD9851_ATTACHED
+    // 2026-09-15, later same day: t= added to both branches below - see the
+    // long comment in diagnostics_check_held_freq() above for why. This is
+    // the timestamp of THIS read (when the 'H' command was actually
+    // processed), directly comparable to a K trace's own "at t=%ums" so a
+    // manual 'H' can be lined up against nearby K events precisely instead
+    // of relying on how quickly the two happened to print relative to each
+    // other in the serial stream.
+    uint32_t read_at_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    if (!s_freq_anchor_inited) {
+        Serial.printf("[dsp] held_freq: t=%ums anchor not yet set (waiting for boot-settle)\r\n",
+                      read_at_ms);
+        return;
+    }
+    if (!s_held_active) {
+        Serial.printf("[dsp] held_freq: t=%ums not currently held - anchor=%.2fHz fast=%.2fHz "
+                      "dev=%+.2fHz (fires if |dev|>%.1fHz for >=%.0fs)\r\n",
+                      read_at_ms, s_freq_anchor_hz, s_freq_ema_fast_hz,
+                      s_freq_ema_fast_hz - s_freq_anchor_hz,
+                      (double)HELD_TRIGGER_HZ, (double)(HELD_MIN_DURATION_MS / 1000.0f));
+    } else {
+        uint32_t elapsed_s = (read_at_ms - s_held_started_ms) / 1000;
+        Serial.printf("[dsp] held_freq: t=%ums currently %s (started_at t=%ums, %us so far) - "
+                      "anchor=%.2fHz fast=%.2fHz dev=%+.2fHz tx_freq=%luHz\r\n",
+                      read_at_ms, s_held_confirmed ? "CONFIRMED STUCK" : "deviated, not yet confirmed",
+                      s_held_started_ms, (unsigned)elapsed_s, s_freq_anchor_hz, s_freq_ema_fast_hz,
+                      s_held_last_dev_hz, (unsigned long)s_held_last_tx_freq);
+    }
+    print_held_trace();
 #endif
 }
 
@@ -1782,6 +2154,20 @@ void diagnostics_service(void)
     // - unlike null_bias/the old canary design, there's no ongoing
     // steady-state Serial traffic for this to add back.
     canary_check_background();
+
+    // 2026-09-15: same "unconditional, mute-exempt, checked every call"
+    // shape as canary_check_background() just above, for the same reason -
+    // see diagnostics_check_slow_trace_auto_dump()'s own declaration
+    // comment for the full motivation (the user's request to leave a
+    // capture running hands-off and have hard-to-catch jumps like their
+    // observed -50Hz/+20Hz ones show up in the log on their own).
+    diagnostics_check_slow_trace_auto_dump();
+
+    // 2026-09-15: same pattern again, for the 'H' held-frequency detector -
+    // see diagnostics_check_held_freq()'s own declaration comment (a
+    // second, independent detector alongside 'K', built after the user
+    // pointed out 'K' can't see a jump that sticks around for a long time).
+    diagnostics_check_held_freq();
 #endif
 }
 

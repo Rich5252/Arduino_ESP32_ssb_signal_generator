@@ -474,6 +474,36 @@ void handle_serial_commands(void)
                           "if still watching, or the full before/after trace if "
                           "triggered, then re-arms for the next one:\r\n");
             diagnostics_print_slow_trace();
+        } else if (c == 'H') {
+            // 2026-09-15: held-frequency detector (diagnostics.h/.cpp) - a
+            // second, independent tool alongside 'K', added after the user
+            // pointed out 'K' can't reliably see a jump that STICKS around
+            // for a long time (their own example: watching the SDR show
+            // "-22Hz, been there a while" while 'K' stayed quiet). 'K'
+            // only fires on fast-vs-slow divergence and resyncs slow to
+            // fast every time it's read - so if fast and slow ever drift
+            // together slowly enough to never re-diverge from EACH OTHER,
+            // 'K' goes silent even while genuinely sitting far from where
+            // this run started. This instead compares against a permanent,
+            // never-resynced anchor snapped once at boot-settle, so a
+            // sustained departure from "where this run actually settled"
+            // is visible no matter how gradually it got there - and
+            // auto-prints on its own (CONFIRMED STUCK / periodic still-
+            // stuck heartbeat / RECOVERED) from diagnostics_service(),
+            // same auto-dump pattern as 'K'. This key is a manual, on-
+            // demand, non-destructive status+trace read - see
+            // diagnostics_print_held_status()'s own declaration comment
+            // (diagnostics.h) for the full design.
+            serial_reply("-> held-freq detector: fires when the fast EMA has been more "
+                          "than a fixed threshold away from this run's PERMANENT boot-"
+                          "settle anchor (unlike 'K's slow EMA, this anchor is never "
+                          "resynced) for a sustained duration - built to catch a jump "
+                          "that STICKS, which 'K' can miss if fast and slow drift "
+                          "together slowly enough to never re-diverge from each other. "
+                          "Auto-prints CONFIRMED STUCK / still-stuck heartbeats / "
+                          "RECOVERED on its own; this key is just an on-demand status + "
+                          "rolling tx_freq trace (2 samples/sec, last 60s) read:\r\n");
+            diagnostics_print_held_status();
 #endif
         } else if (c == 'u') {
             envelope_output_raise_pwm_offset();
