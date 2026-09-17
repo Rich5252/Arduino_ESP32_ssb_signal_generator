@@ -102,8 +102,89 @@ const char* test_signals_next_tone_ratio(void);
 // needs a long, logged dwell (or better, the full time series), not a
 // quick point-read a second or two after 'r', or you'll be comparing
 // noise to noise rather than seeing what 'Q' actually does.
+//
+// 2026-09-17 update: a SEPARATE investigation (the whole-second warble
+// hunt, see null_bias_investigation.md) independently proved that this
+// same exact-phase-accumulator tone generation forces the ENTIRE
+// downstream ssb_dsp_process_sample() output (freq_dev, envelope,
+// everything) to be exactly, bit-for-bit periodic at exactly 1.000s
+// (16000 samples) for ANY two-tone frequency pair - confirmed both by an
+// independent from-scratch Python/float32 simulation of the real
+// algorithm and by real-hardware 'F' captures (two independent captures
+// agreeing to 40us, then a single continuous 2.0s capture splitting into
+// two zero-diff halves). This is the SAME underlying cause described
+// above (exact phase-accumulator tone generation -> exact recurrence),
+// just observed at a coarser (whole-second) timescale instead of the
+// finer (per-null) timescale this dither was originally built for. A
+// follow-up simulation (sim_dither_test.py, scratchpad-only, not
+// committed to this repo) confirmed the EXISTING dither parameters below
+// - completely unchanged, no retuning needed - already destroy this
+// whole-second exact repetition: cycle-to-cycle max freq_dev difference
+// jumps from 0.0Hz (undithered) to ~14677Hz (dithered), with roughly
+// 1732/16000 samples changing by more than 50Hz between consecutive
+// 1-second cycles.
+//
+// 2026-09-17, same day, real-hardware test: enabling 'Q' was tried on
+// the bench and produced a SUBJECTIVELY NOISIER result, not a cleaner
+// one - the opposite of what the periodicity-breaking simulation above
+// would suggest. Working theory (not yet confirmed): dither only
+// decorrelates WHEN/how often a given near-null glitch recurs - it does
+// nothing to reduce the glitches' own magnitude (still the same
+// ~5000-9000Hz single-sample freq_dev spikes documented elsewhere in
+// null_bias_investigation.md). Before, those spikes landed at the same
+// point every 1.000s cycle, so they were heard as one discrete, coherent
+// periodic buzz; with dither on, the same total spike energy is spread
+// essentially at random across the whole run, which likely reads to the
+// ear as broadband "noisier" content rather than as an improvement, even
+// though the coherent periodic tone is indeed gone. If that theory holds,
+// dither (whether applied here to tone2's frequency, or - per the
+// 2026-09-17 "should the fast trig itself be randomized" discussion - to
+// the fast_atan2/fast_sqrt computation) is very unlikely to be the right
+// fix for the underlying problem, because it only redistributes the
+// error rather than reducing it. The existing freq_dev slew-rate limiter
+// (ssb_dsp_set_freq_dev_slew_limit_hz(), '{'/'}', off by default) directly
+// caps the SIZE of each sample-to-sample freq_dev jump instead, and its
+// own doc comment already notes its starting value is "comfortably below
+// a null event's ~8000Hz/sample, so it actually engages only where
+// intended" - i.e. it was apparently built with exactly this glitch
+// class in mind. See null_bias_investigation.md's 2026-09-17 entry for
+// the open question of whether the slew limiter (not dither) is the
+// right next thing to test. NOT resolved as of this writing - treat the
+// dither mechanism described above as informative about how the test
+// tones behave, not as a recommended fix.
 bool test_signals_get_twotone_dither_enabled(void);
 void test_signals_set_twotone_dither_enabled(bool enable);
+
+// Legacy two-tone phase generator toggle ('O', 2026-09-17) - lets the OLD
+// accumulate-and-subtract phase generator (`phase += two_pi*f/Fs; if
+// (phase > two_pi) phase -= two_pi;`) be switched back in for direct A/B
+// comparison against the exact-recompute-from-sample-index generator that
+// replaced it earlier the same day (see generate_twotone_sample()'s own
+// 2026-09-17 comment, and null_bias_investigation.md's matching entry, for
+// the full story: the old accumulator never resets its own float32
+// rounding error, giving both tones a small but real, steadily GROWING
+// frequency error - confirmed by simulation at roughly +/-2e-4Hz over an
+// 8M-tick/500s run - which the exact recompute eliminates entirely).
+//
+// Added not because the old scheme is considered better (it isn't - the
+// new one is strictly more correct), but because the user specifically
+// wants to be able to revert to the "pure but jumping" tone behavior on
+// demand as a sanity-check reference point, without a separate reflash,
+// given how much investigation was already anchored to that older
+// behavior. Off by default (matches the exact-recompute code that shipped
+// today) so plain 't'/'T'/'R'/'Q' behavior is completely unchanged unless
+// 'O' is explicitly pressed.
+//
+// When ON: tone1 always uses the old accumulator; tone2 uses it too
+// whenever dither ('Q') is off (dither's own tone2 path already used the
+// accumulator both before and after the NCO fix - see
+// generate_twotone_sample() - so 'O' has no effect on tone2 while 'Q' is
+// on). Toggling 'O' mid-run can cause one small, one-time phase
+// discontinuity in whichever tone(s) switch generators, on the same
+// tick the switch happens - same accepted-as-negligible convention as
+// 'Q's own on/off transition and a 'T' band change already carry.
+bool test_signals_get_twotone_legacy_phase_enabled(void);
+void test_signals_set_twotone_legacy_phase_enabled(bool enable);
 
 // Envelope step test ('p') - slow square wave direct to the envelope
 // output, carrier held fixed, bypassing ssb_dsp_process_sample()

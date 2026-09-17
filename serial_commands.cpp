@@ -395,6 +395,29 @@ void handle_serial_commands(void)
                           dither_now_on ? "ON" : "off", (double)TWOTONE_DITHER_MAX_HZ,
                           (double)(1000.0f / TWOTONE_DITHER_UPDATE_HZ),
                           was_twotone_q ? "" : ", two-tone mode enabled");
+        } else if (c == 'O') {
+            // Legacy two-tone phase generator toggle - see test_signals.h's
+            // doc comment for the full rationale. Added 2026-09-17 so the
+            // user can revert to the pre-NCO-fix "pure but jumping" tone
+            // behavior on demand for a direct A/B, without a separate
+            // reflash. Off by default (today's exact-recompute generator
+            // stays the normal behavior); has no effect on tone2 while 'Q'
+            // dither is on, since dither's own tone2 path already used the
+            // old accumulator both before and after the NCO fix. Same
+            // switches-into-two-tone-mode convention as 'T'/'R'/'Q'.
+            bool was_twotone_o = (src == AUDIO_SRC_TWOTONE);
+            bool legacy_now_on = !test_signals_get_twotone_legacy_phase_enabled();
+            test_signals_set_twotone_legacy_phase_enabled(legacy_now_on);
+            if (!was_twotone_o) {
+                dsp_state_set_audio_source(AUDIO_SRC_TWOTONE);
+            }
+            serial_reply("-> two-tone legacy (pre-NCO-fix) phase generator %s%s%s\r\n",
+                          legacy_now_on ? "ON - reverted to the old accumulate-and-subtract "
+                                          "phase generator (tone1 always, tone2 unless 'Q' is on)"
+                                        : "off - back to the exact recompute-from-sample-index generator",
+                          test_signals_get_twotone_dither_enabled() ? " ('Q' dither is ON, so tone2 is "
+                                          "unaffected by this toggle either way)" : "",
+                          was_twotone_o ? "" : ", two-tone mode enabled");
 #if AD9851_ATTACHED
         } else if (c == ']') {
             relative_delay_increase();

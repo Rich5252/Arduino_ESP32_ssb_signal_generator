@@ -178,6 +178,14 @@ static uint32_t s_dither_countdown = 0;    // samples remaining until the next t
 
 bool test_signals_get_twotone_dither_enabled(void) { return s_twotone_dither_enable; }
 
+// ---- 2026-09-17: legacy two-tone phase generator toggle ('O') - see
+// test_signals.h's doc comment for the full rationale. dsp_task-private,
+// same reasoning as s_dither_current_hz et al. above. ----
+static volatile bool s_twotone_legacy_phase_enable = false;
+
+bool test_signals_get_twotone_legacy_phase_enabled(void) { return s_twotone_legacy_phase_enable; }
+void test_signals_set_twotone_legacy_phase_enabled(bool enable) { s_twotone_legacy_phase_enable = enable; }
+
 void test_signals_set_twotone_dither_enabled(bool enable)
 {
     s_twotone_dither_enable = enable;
@@ -252,10 +260,24 @@ float IRAM_ATTR generate_twotone_sample(void)
     // the very next tick too, which can likewise show a small phase step -
     // negligible next to the much bigger, already-audible frequency change
     // a band switch is anyway.
+    //
+    // 2026-09-17, later same day: 'O' lets s_twotone_legacy_phase_enable
+    // force tone1 (and tone2 whenever dither is off) back onto the OLD
+    // accumulate-and-subtract path below, for direct A/B against this
+    // exact-recompute scheme - see test_signals.h's doc comment. Kept as a
+    // separate bool check rather than removing/branching the index-advance
+    // itself, so s_tone_sample_index keeps ticking over even in legacy
+    // mode and the exact-recompute path picks back up cleanly (no stale
+    // index) the instant 'O' is toggled back off.
     s_tone_sample_index++;
     if (s_tone_sample_index >= (uint32_t)SAMPLE_RATE_HZ) s_tone_sample_index = 0;
-    s_tone1_phase = fmodf((float)s_tone_sample_index * s_tone1_hz / (float)SAMPLE_RATE_HZ, 1.0f) * two_pi;
-    if (s_twotone_dither_enable) {
+    if (s_twotone_legacy_phase_enable) {
+        s_tone1_phase += two_pi * s_tone1_hz / (float)SAMPLE_RATE_HZ;
+        if (s_tone1_phase > two_pi) s_tone1_phase -= two_pi;
+    } else {
+        s_tone1_phase = fmodf((float)s_tone_sample_index * s_tone1_hz / (float)SAMPLE_RATE_HZ, 1.0f) * two_pi;
+    }
+    if (s_twotone_dither_enable || s_twotone_legacy_phase_enable) {
         s_tone2_phase += two_pi * tone2_hz / (float)SAMPLE_RATE_HZ;
         if (s_tone2_phase > two_pi) s_tone2_phase -= two_pi;
     } else {

@@ -1002,6 +1002,10 @@ void setup()
                   "tone2 only) - an UNTESTED experiment to break the exact sample-grid recurrence behind "
                   "null_bias2's coherent bias (see null_bias_investigation.md).\r\n",
                   test_signals_get_twotone_dither_enabled() ? "ON" : "off", (double)TWOTONE_DITHER_MAX_HZ);
+    Serial.printf("Send 'O' to toggle the legacy (pre-NCO-fix) two-tone phase generator (currently %s) - "
+                  "reverts to the old accumulate-and-subtract phase update for a direct A/B against the "
+                  "2026-09-17 exact-recompute fix; no effect on tone2 while 'Q' dither is on.\r\n",
+                  test_signals_get_twotone_legacy_phase_enabled() ? "ON" : "off");
     Serial.printf("Send 'e' to toggle EQ (currently %s), 'c' to toggle compressor (currently %s), "
                   "'+'/'-' for master gain (currently %+.2fdB, %.1fdB/step), "
                   "'.'/',' for fine master gain (%.1fdB/step).\r\n",
