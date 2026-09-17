@@ -139,7 +139,7 @@
 // - mic-source audio silently reads as 0.0f (matching the existing
 // AMTEST/FMTEST/ENVSTEP "unused sample" convention) when disabled, rather
 // than calling into a driver that was never started.
-#define ADC_CAPTURE_ENABLED 1
+#define ADC_CAPTURE_ENABLED 0
 
 // ---- Timing debug pin: toggled high at the start of dsp_task's real work
 // and low at the end, so a scope on this pin directly measures the actual

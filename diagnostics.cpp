@@ -326,6 +326,25 @@ static float    s_freq_ema_slow_hz = 0.0f;
 static float    s_freq_ema_energy_num_fast = 0.0f;
 static float    s_freq_ema_energy_den_fast = 0.0f;
 
+// 2026-09-16, later still: second, correctly-paired sibling of the pair
+// above - same fast-EMA structure, but weighted by raw_envelope_current
+// (this tick's own envelope, straight out of ssb_dsp_process_sample(),
+// before envelope_floor/gdeq/ampeq/predistort/the PWM mapping reshape it)
+// against raw_freq_dev_current (this tick's own pre-delay freq_dev_hz),
+// instead of envelope_at_freq_time/delayed_freq_dev_hz. Built after the
+// same-instant cross-check against ssb_dsp.c's own validated
+// env2_dphi_sum/env2_sum (log_20260916_212424.txt) showed THAT
+// raw-envelope-paired accumulator staying stable within a few Hz while the
+// pair above swung 80+Hz on an unchanging bench setup - see
+// diagnostics_set_tx_info()'s raw_freq_dev_current/raw_envelope_current
+// declaration comment (diagnostics.h) for the full reasoning and the two
+// known simplifications (pre-delay, post-clamp) this inherits. If this one
+// ALSO holds steady where the shaped-envelope pair swings, that's the
+// decisive confirmation the shaped envelope (not the physical signal) was
+// the whole session's source of the "computed vs measured" puzzle.
+static float    s_freq_ema_rawenergy_num_fast = 0.0f;
+static float    s_freq_ema_rawenergy_den_fast = 0.0f;
+
 // 2026-09-16, later same day: shared with energy_weighted_fast_hz() below -
 // promoted out of that function so diagnostics_set_tx_info()'s anchor-seed
 // block (near s_freq_anchor_hz) can use the exact same guard when seeding
@@ -357,6 +376,15 @@ static float energy_weighted_fast_hz(void);
 // the only way "dev" is comparable to a real SDR-observed deviation.
 static float    s_freq_energy_anchor_hz = 0.0f;
 static bool     s_freq_energy_anchor_inited = false;
+
+// 2026-09-16, later still: same reasoning, own anchor, for the raw-envelope-
+// paired sibling EMA (s_freq_ema_rawenergy_num_fast/den_fast above) - kept
+// fully separate from s_freq_energy_anchor_hz since the two EMAs weight by
+// different envelope signals and have no reason to converge to the same
+// baseline even if both are working correctly.
+static float    s_freq_rawenergy_anchor_hz = 0.0f;
+static bool     s_freq_rawenergy_anchor_inited = false;
+static float rawenergy_weighted_fast_hz(void);
 
 static bool     s_freq_ema_fast_inited = false;   // fast EMA seeded from the first-ever raw sample
 static bool     s_freq_ema_slow_inited = false;   // slow EMA snapped from fast after the boot settle
@@ -817,6 +845,7 @@ void IRAM_ATTR diagnostics_set_envelope_freqdev(float envelope, float freq_dev_h
 void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_envelope,
                                         float envelope_at_freq_time, float envelope_at_freq_time_min,
                                         float raw_freq_dev_near, float raw_freq_dev_far,
+                                        float raw_freq_dev_current, float raw_envelope_current,
                                         uint32_t tx_freq)
 {
 #if AD9851_ATTACHED
@@ -844,6 +873,10 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_
         float env_at_freq = envelope_at_freq_time;
         float env2 = env_at_freq * env_at_freq;
 
+        // 2026-09-16, later still: raw-envelope-paired companion - see
+        // s_freq_ema_rawenergy_num_fast's declaration comment above.
+        float raw_env2 = raw_envelope_current * raw_envelope_current;
+
         if (!s_freq_ema_fast_inited) {
             // Fast EMA seeds from the first-ever raw sample, same as
             // before - but its own short tau converges it to the true
@@ -859,10 +892,14 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_
             // the plain fast EMA (short tau washes out a bad seed fast).
             s_freq_ema_energy_num_fast = env2 * dev;
             s_freq_ema_energy_den_fast = env2;
+            s_freq_ema_rawenergy_num_fast = raw_env2 * raw_freq_dev_current;
+            s_freq_ema_rawenergy_den_fast = raw_env2;
         } else {
             s_freq_ema_fast_hz += FREQ_EMA_FAST_ALPHA * (dev - s_freq_ema_fast_hz);
             s_freq_ema_energy_num_fast += FREQ_EMA_FAST_ALPHA * (env2 * dev - s_freq_ema_energy_num_fast);
             s_freq_ema_energy_den_fast += FREQ_EMA_FAST_ALPHA * (env2 - s_freq_ema_energy_den_fast);
+            s_freq_ema_rawenergy_num_fast += FREQ_EMA_FAST_ALPHA * (raw_env2 * raw_freq_dev_current - s_freq_ema_rawenergy_num_fast);
+            s_freq_ema_rawenergy_den_fast += FREQ_EMA_FAST_ALPHA * (raw_env2 - s_freq_ema_rawenergy_den_fast);
         }
 
         if (!s_freq_ema_slow_inited) {
@@ -980,6 +1017,14 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_
         && s_freq_ema_energy_den_fast >= MIN_ENERGY_DEN) {
         s_freq_energy_anchor_hz = s_freq_ema_energy_num_fast / s_freq_ema_energy_den_fast;
         s_freq_energy_anchor_inited = true;
+    }
+
+    // 2026-09-16, later still: same seeding, same instant, for the raw-
+    // envelope-paired sibling anchor - see its declaration comment.
+    if (!s_freq_rawenergy_anchor_inited && s_freq_ema_slow_inited
+        && s_freq_ema_rawenergy_den_fast >= MIN_ENERGY_DEN) {
+        s_freq_rawenergy_anchor_hz = s_freq_ema_rawenergy_num_fast / s_freq_ema_rawenergy_den_fast;
+        s_freq_rawenergy_anchor_inited = true;
     }
 
     // Always-on rolling flight recorder of the real tx_freq/fast_hz -
@@ -1547,6 +1592,60 @@ static void diagnostics_check_held_freq(void)
                       s_energy_held_last_dev_hz, s_freq_energy_anchor_hz,
                       (double)(HELD_MIN_DURATION_MS / 1000.0f),
                       s_energy_held_started_ms, confirmed_at_ms);
+
+        // 2026-09-16, later still: direct, same-instant comparison against
+        // ssb_dsp.c's OWN env2-weighted lifetime accumulator
+        // (ssb_dsp_get_null_bias_stats(), pre-dating this session, already
+        // confirmed accurate to a few Hz against the SDR across 6/6 tone
+        // pairs - see null_bias_investigation.md's "Confirmed measurement
+        // table"). That accumulator pairs env2 with dphi at the exact same
+        // raw tick, straight out of ssb_dsp_process_sample() - the raw
+        // sqrtf(I*I+Q*Q) envelope, never touched by ampeq/gdeq/predistort/
+        // the PWM offset-scale mapping. This session's own fast energy-
+        // weighted EMA above instead weights by envelope_at_freq_time - the
+        // POST-shaping envelope captured downstream in
+        // diagnostics_set_tx_info(), chosen earlier this session for being
+        // correctly TIME-matched to dev across the relative_delay ring, but
+        // never checked against whether shaping (ampeq/gdeq are both IIR,
+        // predistort is a LUT) also changes the envelope's VALUE right at a
+        // null the way a plain index-delay wouldn't. Printing both at the
+        // identical instant is the direct test: the validated accumulator
+        // is a lifetime average (needs a long-run reading to mean much on
+        // its own), but if this fast EMA's own claimed dev is real, the
+        // lifetime one should at least be trending the same direction and
+        // nowhere near a stable few-Hz reading; if the lifetime one stays
+        // small/stable while this one claims tens of Hz, that's the
+        // opposite envelope signal turning out to matter after all.
+        {
+            ssb_dsp_null_bias_stats_t nb_stats;
+            ssb_dsp_get_null_bias_stats(dsp_state_get_ssb(), &nb_stats);
+            float weighted_mean_hz = (nb_stats.env2_sum > 0.0f)
+                ? (nb_stats.env2_dphi_sum / nb_stats.env2_sum) * SAMPLE_RATE_HZ / 6.28318530718f
+                : 0.0f;
+            float expected_center_hz = 0.5f * (test_signals_get_twotone_f1_hz() + test_signals_get_twotone_f2_hz());
+            Serial.printf("[dsp]   cross-check: ssb_dsp.c's own raw env2-weighted lifetime average = "
+                          "%.2fHz (bias from expected_center=%.2fHz: %+.2fHz, %lu samples since last 'r') "
+                          "- validated-accurate reference, see null_bias_investigation.md\r\n",
+                          weighted_mean_hz, expected_center_hz, weighted_mean_hz - expected_center_hz,
+                          (unsigned long)nb_stats.dphi_sample_count);
+        }
+
+        // 2026-09-16, later still: THIRD number at the same instant - the
+        // new raw-envelope-paired fast EMA (s_freq_ema_rawenergy_num_fast/
+        // den_fast, same 50ms tau as the shaped-envelope one above, just a
+        // different envelope). Unlike the lifetime accumulator just
+        // printed, this one updates live and should be directly comparable
+        // in RESPONSIVENESS to the (suspect) shaped-envelope fast EMA - the
+        // decisive three-way read: if this stays close to its own anchor
+        // while the shaped one above claims tens of Hz, the shaped
+        // envelope is confirmed as the whole session's culprit; if this
+        // ALSO swings by a similar amount, the pairing wasn't the (whole)
+        // story and pre-delay vs. post-delay or something else needs a
+        // look next.
+        Serial.printf("[dsp]   cross-check2: raw-envelope-paired fast EMA (same tau, correct same-tick "
+                      "pairing) = %.2fHz, dev from its own anchor (%.2fHz): %+.2fHz\r\n",
+                      rawenergy_weighted_fast_hz(), s_freq_rawenergy_anchor_hz,
+                      rawenergy_weighted_fast_hz() - s_freq_rawenergy_anchor_hz);
         print_held_trace();
     }
     if (s_energy_held_pending_reannounce) {
@@ -1587,6 +1686,23 @@ static float energy_weighted_fast_hz(void)
         return s_freq_ema_fast_hz;
     }
     return s_freq_ema_energy_num_fast / s_freq_ema_energy_den_fast;
+#else
+    return 0.0f;
+#endif
+}
+
+// 2026-09-16, later still: raw-envelope-paired sibling of
+// energy_weighted_fast_hz() just above - see s_freq_ema_rawenergy_num_fast's
+// declaration comment for what makes it different (raw, pre-shaping,
+// pre-delay envelope/dev instead of the shaped, post-delay pair). Same
+// near-zero-denominator fallback, same reasoning.
+static float rawenergy_weighted_fast_hz(void)
+{
+#if AD9851_ATTACHED
+    if (s_freq_ema_rawenergy_den_fast < MIN_ENERGY_DEN) {
+        return s_freq_ema_fast_hz;
+    }
+    return s_freq_ema_rawenergy_num_fast / s_freq_ema_rawenergy_den_fast;
 #else
     return 0.0f;
 #endif

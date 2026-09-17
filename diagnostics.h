@@ -144,9 +144,37 @@ void IRAM_ATTR diagnostics_set_envelope_freqdev(float envelope, float freq_dev_h
 // a fast-changing part of the waveform, not evidence of any discrete
 // event at all)? Logged and printed alongside the rest of the jump-log
 // entry, not used for any near_null classification of their own.
+// raw_freq_dev_current/raw_envelope_current (2026-09-16, later still): this
+// tick's own freq_dev_hz/envelope EXACTLY as ssb_dsp_process_sample() (or
+// the isolation-test modes) produced them - before envelope_floor/gdeq/
+// ampeq/predistort/the PWM offset-scale mapping reshape `envelope`, and
+// before relative_delay_apply() re-times either one. Added specifically to
+// build a second, correctly-paired energy-weighted fast EMA alongside the
+// existing one (see s_freq_ema_energy_num_fast's declaration comment,
+// diagnostics.cpp): a same-instant cross-check against ssb_dsp.c's own
+// already-validated env2_dphi_sum/env2_sum accumulator
+// (log_20260916_212424.txt) showed that accumulator - which pairs envelope
+// with dphi at the exact same raw tick - stays stable within a few Hz while
+// the existing fast EMA (which pairs delayed_freq_dev_hz with the SHAPED
+// envelope_at_freq_time) swings by 80+Hz between consecutive readings on an
+// unchanging bench setup. These two raw values let a second fast EMA use
+// the same raw-tick pairing ssb_dsp.c's own validated accumulator does,
+// without waiting on that accumulator's own lifetime-averaged (slow-to-
+// respond) convergence. Two known simplifications, not yet resolved:
+// (1) this pairing is deliberately PRE-delay (matching ssb_dsp.c's own
+// choice) rather than routed through relative_delay's ring the way the
+// existing envelope_at_freq_time-based EMA is - correct at delay=0,
+// an approximation otherwise, though relative_delay's typical values (a
+// few samples) are small next to a full null-crossing width; (2)
+// raw_freq_dev_current is this function's OUTPUT freq_dev_hz - already
+// past ssb_dsp_process_sample()'s own slew-limit/clamp/LSB-sign-flip,
+// unlike the true pre-clamp dphi ssb_dsp.c's own accumulator uses - a
+// difference that should only matter on the rare tick where that clamp
+// actually engages.
 void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_envelope,
                                         float envelope_at_freq_time, float envelope_at_freq_time_min,
                                         float raw_freq_dev_near, float raw_freq_dev_far,
+                                        float raw_freq_dev_current, float raw_envelope_current,
                                         uint32_t tx_freq);
 
 // 2026-09-12: second half of the per-event jump log - call once per

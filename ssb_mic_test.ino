@@ -582,6 +582,16 @@ static void IRAM_ATTR dsp_task(void* arg)
         }
         int64_t t_dsp_done_us = esp_timer_get_time();
 
+        // 2026-09-16, later still: raw, pre-shaping, pre-delay snapshot of
+        // this tick's own freq_dev_hz/envelope, straight out of the block
+        // above - see diagnostics_set_tx_info()'s raw_freq_dev_current/
+        // raw_envelope_current declaration comment (diagnostics.h) for why.
+        // Captured here, before envelope_floor/gdeq/ampeq/predistort touch
+        // `envelope` even once, same reasoning envelope_floor_apply()'s own
+        // comment just below already gives for needing the raw value.
+        float raw_freq_dev_current = freq_dev_hz;
+        float raw_envelope_current = envelope;
+
         // Envelope-null floor - see envelope_floor.h (envelope-only clamp;
         // an earlier freq_dev_hz-freezing version was removed after
         // real-hardware testing showed it caused a hard phase
@@ -699,6 +709,7 @@ static void IRAM_ATTR dsp_task(void* arg)
         // entries for the full mechanism this was found from.
         diagnostics_set_tx_info(delayed_freq_dev_hz, delayed_envelope, envelope_at_freq_time,
                                  envelope_at_freq_time_min, raw_freq_dev_near, raw_freq_dev_far,
+                                 raw_freq_dev_current, raw_envelope_current,
                                  tx_freq);
 #endif
 
