@@ -19,6 +19,19 @@
 static float s_tone1_phase = 0.0f;
 static float s_tone2_phase = 0.0f;
 
+// 2026-09-17: exact, wrapping sample index used by generate_twotone_sample()
+// to recompute phase FRESH every tick for tone1 (and tone2 whenever dither
+// is off) instead of accumulating it - see that function's own comment for
+// the full story (null_bias_investigation.md's 2026-09-17 entries: a user
+// challenge that a fully-locked, ADC-free, LTI chain should reproduce every
+// two-tone cycle bit-for-bit identically, which the old accumulate-based
+// phase generator did NOT do). Wraps at SAMPLE_RATE_HZ (one second) rather
+// than growing unboundedly, which (a) keeps it always exactly representable
+// as a float32 integer (exact up to 2^24, vastly more headroom than the
+// 16000 this ever reaches) and (b) for ANY integer-Hz tone, one full second
+// is exactly f whole cycles, so wrapping here introduces no discontinuity.
+static uint32_t s_tone_sample_index = 0;
+
 // Runtime-adjustable pair (see test_signals.h) - starts at the
 // config.h defaults so behavior is unchanged until 'T' is sent. volatile
 // for the same reason relative_delay.cpp's s_relative_delay_samples is:
@@ -53,6 +66,23 @@ static const twotone_band_t TWOTONE_BAND_PRESETS[] = {
     { "2500/2700 (mid-high)",   2500.0f, 2700.0f },
     { "3500/3700 (high)",       3500.0f, 3700.0f },
     { "700/1900 (wide, legacy default)", TWOTONE_F1_HZ, TWOTONE_F2_HZ },
+    // 2026-09-17 TEMPORARY TEST ENTRY - null_bias_investigation.md's
+    // "warble733-1717.wav" entry: 733/1717 was meant to be a "broken
+    // alignment" control against the ~1.000s ToneWarble/WarbleTone cycle
+    // (a pair that does NOT complete a whole number of two-tone cycles
+    // per second, unlike every OTHER preset here, which all share a 100Hz
+    // GCD). It turned out to be a bad choice - 733 and 1717 are coprime
+    // (gcd=1), so THIS pair's own true fundamental period is exactly
+    // 1.000s, even more tied to "1 second" than the presets it was meant
+    // to contrast with. Every integer-Hz pair is mathematically
+    // guaranteed to repeat a whole number of times per second (gcd of two
+    // integers is always an integer), so no integer-Hz pair can ever
+    // actually break this alignment - only a NON-integer-Hz pair can.
+    // This entry uses 700.37/1700.61 specifically to have no clean
+    // whole-second (or simple fractional-second) repeat point at all
+    // within any practical few-second recording. Remove this entry once
+    // that test's result is known - it has no other reason to exist.
+    { "700.37/1700.61 (TEMP non-integer-Hz control)", 700.37f, 1700.61f },
 };
 #define TWOTONE_BAND_COUNT (sizeof(TWOTONE_BAND_PRESETS) / sizeof(TWOTONE_BAND_PRESETS[0]))
 // Starts on the last (wide legacy) entry so the first 'T' press after boot
@@ -195,10 +225,42 @@ float IRAM_ATTR generate_twotone_sample(void)
         tone2_hz += s_dither_current_hz;
     }
 
-    s_tone1_phase += two_pi * s_tone1_hz / (float)SAMPLE_RATE_HZ;
-    s_tone2_phase += two_pi * tone2_hz / (float)SAMPLE_RATE_HZ;
-    if (s_tone1_phase > two_pi) s_tone1_phase -= two_pi;
-    if (s_tone2_phase > two_pi) s_tone2_phase -= two_pi;
+    // 2026-09-17: tone1 (and tone2 whenever dither is off) now computed
+    // EXACTLY from the wrapping sample index above, not accumulated via
+    // repeated float addition. The old `phase += increment; if (phase >
+    // two_pi) phase -= two_pi;` pattern never resets its own rounding
+    // error - the subtract-based wrap carries it forward every cycle
+    // instead of clearing it - and simulation confirmed this gives both
+    // tones a small but genuine, steadily GROWING frequency error
+    // (measured ~+/-2e-4Hz over an 8M-tick/500s run, not bounded noise),
+    // enough to slowly precess the true beat/null pattern away from the
+    // ideal locked one - a real, if partial, candidate explanation for
+    // this project's long-standing ~153.6s mystery (see
+    // null_bias_investigation.md). Recomputing fresh from s_tone_sample_index
+    // each tick carries NO accumulated error at all, by construction - not
+    // "slower drift", zero drift, confirmed by simulation to hold exactly
+    // (0.0 deviation) across every 1-second boundary of an 8M-tick test run.
+    //
+    // This only works for a CONSTANT frequency over the wrap window -
+    // tone2 under dither is NOT constant (its instantaneous frequency is
+    // deliberately modulated every tick), so dither keeps the original
+    // accumulator instead; toggling 'Q' can therefore cause one small,
+    // one-time phase discontinuity in tone2 exactly at that transition -
+    // accepted deliberately, same as test_signals_set_twotone_dither_enabled()'s
+    // own existing abrupt reset of s_dither_current_hz to 0 already does.
+    // Band changes ('T') recompute phase fresh from the new frequency on
+    // the very next tick too, which can likewise show a small phase step -
+    // negligible next to the much bigger, already-audible frequency change
+    // a band switch is anyway.
+    s_tone_sample_index++;
+    if (s_tone_sample_index >= (uint32_t)SAMPLE_RATE_HZ) s_tone_sample_index = 0;
+    s_tone1_phase = fmodf((float)s_tone_sample_index * s_tone1_hz / (float)SAMPLE_RATE_HZ, 1.0f) * two_pi;
+    if (s_twotone_dither_enable) {
+        s_tone2_phase += two_pi * tone2_hz / (float)SAMPLE_RATE_HZ;
+        if (s_tone2_phase > two_pi) s_tone2_phase -= two_pi;
+    } else {
+        s_tone2_phase = fmodf((float)s_tone_sample_index * tone2_hz / (float)SAMPLE_RATE_HZ, 1.0f) * two_pi;
+    }
     return sample;
 }
 

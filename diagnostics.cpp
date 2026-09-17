@@ -360,6 +360,19 @@ static const float MIN_ENERGY_DEN = 1.0e-6f;
 // numerator/denominator ratio.
 static float energy_weighted_fast_hz(void);
 
+// Forward declaration, same reasoning as energy_weighted_fast_hz() just
+// above - the real definition (with its full design comment) lives near
+// diag_room_for()/diagnostics_freqenv_capture_arm() below, but
+// diagnostics_set_tx_info() (well above that point in this file) needs to
+// call it every tick. See diagnostics_freqenv_capture_arm()'s declaration
+// comment in diagnostics.h for the 'F' full-rate freq/env capture feature
+// this is part of. AD9851-only (like the rest of that feature - and like
+// diagnostics_set_tx_info()'s own real body, which this is called from) -
+// guarded here too so there's no dangling reference to it when not built.
+#if AD9851_ATTACHED
+static inline void IRAM_ATTR freqenv_capture_tick(float raw_freq_dev_current, float raw_envelope_current);
+#endif
+
 // 2026-09-16, later same day: found on first bench test (see this date's
 // null_bias_investigation.md entry, "energy_weighted dev compared against
 // the wrong anchor") that the energy-weighted line's dev=+410Hz etc. was
@@ -854,6 +867,12 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_
     (void)delayed_envelope;   // stored nowhere - NOT time-matched to delayed_freq_dev_hz once delay
                               // is nonzero (see relative_delay.h) - envelope_at_freq_time below is
                               // the correct pairing, and is what the energy-weighted EMA now uses.
+
+    // 2026-09-17: 'F' full-rate freq/env capture - see
+    // diagnostics_freqenv_capture_arm()'s declaration comment (diagnostics.h)
+    // for the full design. No-op unless armed; a plain length check when not
+    // armed, so this costs essentially nothing on the hot path otherwise.
+    freqenv_capture_tick(raw_freq_dev_current, raw_envelope_current);
 
     // 2026-09-12, yet later still: slow-mean trigger - see its declaration
     // comment (this file, just above the struct/statics it uses) for the
@@ -1915,6 +1934,184 @@ static bool diag_room_for(uint32_t min_bytes)
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// 2026-09-17: 'F' full-rate freq/env capture - see
+// diagnostics_freqenv_capture_arm()'s own declaration comment (diagnostics.h)
+// for the full motivation and design. AD9851-only, like the jump
+// log/slow-trace/held-freq features just above - all of it (statics,
+// buffers, both helper functions, and this function's own real body) is
+// wrapped below the same way s_dbg_delayed_freq_dev/s_dbg_tx_freq etc. are
+// near the top of this file, so none of it exists (or costs any RAM) on a
+// build without the AD9851 attached.
+#if AD9851_ATTACHED
+// 2026-09-17, later still: bumped 16000 -> 32000 (1.0s -> 2.0s, ~125KB ->
+// ~250KB) after the user reported the actual build output for this board:
+// "leaving 299220 bytes for local variables. Maximum is 327680 bytes" -
+// i.e. this ESP32-S3 Super Mini has ~292KB free at link time against a
+// 320KB chip, comfortably more than the original 1s buffer needed. Picked
+// 2.0s rather than something closer to that whole ceiling: this pool is
+// shared with every task's stack and every other library's own heap use
+// at runtime (FreeRTOS task stacks, USB-CDC buffers, etc.), none of which
+// show up in a link-time static-usage report, so leaving a real margin
+// below 292KB is deliberate, not just cautious for its own sake. If 2.0s
+// still turns out to be too much once other runtime consumers are
+// accounted for, diagnostics_freqenv_capture_arm()'s existing malloc-
+// failure path (below) already handles that gracefully - a real
+// allocation failure just prints why and declines to arm, it doesn't
+// crash - so this can be dialed back from real evidence rather than
+// guessed conservatively small up front. 2.0s also directly serves the
+// still-open goal from the previous two entries: enough continuous
+// samples to catch 2-4 repetitions of a hypothetical ~0.485s-0.97s slip
+// period in one un-interrupted window, instead of inferring it indirectly.
+static const uint32_t FREQENV_CAPTURE_LEN = 32000;   // ~2.0s at 16kHz - a whole-
+    // number multiple of the 1.0s SAMPLE_RATE_HZ/NCO-fix-wrap boundary (see the
+    // original 16000 comment this replaced), so the captured window still
+    // lines up cleanly with everything else measured today.
+
+typedef enum {
+    FREQENV_CAPTURE_IDLE = 0,     // no buffer allocated, nothing to do
+    FREQENV_CAPTURE_ARMED,        // buffer allocated, filling on every dsp_task tick
+    FREQENV_CAPTURE_READY,        // buffer full, waiting for diagnostics_service() to start the dump
+    FREQENV_CAPTURE_DUMPING,      // dump in progress, chunked across diagnostics_service() calls
+} freqenv_capture_state_t;
+
+static volatile freqenv_capture_state_t s_freqenv_state = FREQENV_CAPTURE_IDLE;
+static float *s_freqenv_freq_dev = NULL;     // lazily malloc'd, FREQENV_CAPTURE_LEN entries
+static float *s_freqenv_envelope = NULL;     // lazily malloc'd, FREQENV_CAPTURE_LEN entries
+static volatile uint32_t s_freqenv_write_idx = 0;   // written from dsp_task (Core 0) only
+static uint32_t s_freqenv_dump_idx = 0;             // read/written from Core 1 only
+
+// 2026-09-17, later still: the user's own external logger chokes on the
+// CSV dump being interleaved with this file's other periodic/background
+// Serial output (the 45ms status line, the 1000ms [timing]/[adc]/[dsp]
+// block, canary_check_background(), the slow_trace/held_freq auto-dumps -
+// exactly the ~192 stray non-CSV lines seen mixed into the first real
+// capture, log_20260917_153446.txt). Used by diagnostics_service() to
+// suppress every one of those for as long as a capture is ARMED/READY/
+// DUMPING - i.e. for the capture's whole lifecycle, not just while the
+// CSV itself is printing, since the status line/timing block would
+// otherwise still interleave during the ~2s ARMED collection window too.
+// diagnostics_freqenv_capture_service() itself is deliberately exempt
+// from its own gate (it's the one thing still supposed to run) - see
+// that call site in diagnostics_service() below.
+static inline bool freqenv_capture_in_progress(void)
+{
+    return s_freqenv_state != FREQENV_CAPTURE_IDLE;
+}
+#endif // AD9851_ATTACHED
+
+// 'F' serial command handler - see diagnostics.h. Declared unconditionally
+// (matching diagnostics_print_jump_log() etc.) but a no-op without
+// AD9851_ATTACHED, same as the feature it arms.
+void diagnostics_freqenv_capture_arm(void)
+{
+#if AD9851_ATTACHED
+    if (s_freqenv_state != FREQENV_CAPTURE_IDLE) {
+        Serial.printf("-> freqenv capture: already %s - wait for it to finish, or for the "
+                      "current dump to complete, before arming another\r\n",
+                      s_freqenv_state == FREQENV_CAPTURE_ARMED ? "capturing" :
+                      s_freqenv_state == FREQENV_CAPTURE_READY ? "ready to dump (starts automatically)" :
+                      "dumping");
+        return;
+    }
+
+    if (s_freqenv_freq_dev == NULL) {
+        s_freqenv_freq_dev = (float *)malloc(FREQENV_CAPTURE_LEN * sizeof(float));
+    }
+    if (s_freqenv_envelope == NULL) {
+        s_freqenv_envelope = (float *)malloc(FREQENV_CAPTURE_LEN * sizeof(float));
+    }
+    if (s_freqenv_freq_dev == NULL || s_freqenv_envelope == NULL) {
+        // Free whichever half DID succeed - don't leave a lone half-pair
+        // sitting allocated with nothing able to use it.
+        if (s_freqenv_freq_dev) { free(s_freqenv_freq_dev); s_freqenv_freq_dev = NULL; }
+        if (s_freqenv_envelope) { free(s_freqenv_envelope); s_freqenv_envelope = NULL; }
+        Serial.printf("-> freqenv capture: malloc FAILED (need %u bytes total) - not enough "
+                      "free heap right now, capture NOT armed\r\n",
+                      (unsigned)(FREQENV_CAPTURE_LEN * sizeof(float) * 2));
+        return;
+    }
+
+    s_freqenv_write_idx = 0;
+    s_freqenv_dump_idx = 0;
+    s_freqenv_state = FREQENV_CAPTURE_ARMED;
+    Serial.printf("-> freqenv capture: ARMED - capturing raw_freq_dev_current/"
+                  "raw_envelope_current every dsp_task tick, %u samples (~2.0s at 16kHz), "
+                  "dump starts automatically once full\r\n", (unsigned)FREQENV_CAPTURE_LEN);
+#endif // AD9851_ATTACHED
+}
+
+#if AD9851_ATTACHED
+// Called inline from diagnostics_set_tx_info() (Core 0, dsp_task, IRAM_ATTR,
+// every tick) - a plain array write with no locking, same pattern this file
+// already uses for other dsp_task-touched statics (e.g. s_dbg_tx_freq). The
+// only cross-core read is the ARMED->READY state transition, and Core 1
+// only ever acts on READY - by which point this function has already
+// stopped writing (see the >= length check below) - so there's no genuine
+// race despite no explicit synchronization.
+static inline void IRAM_ATTR freqenv_capture_tick(float raw_freq_dev_current, float raw_envelope_current)
+{
+    if (s_freqenv_state != FREQENV_CAPTURE_ARMED) return;
+    uint32_t idx = s_freqenv_write_idx;
+    if (idx >= FREQENV_CAPTURE_LEN) return;   // shouldn't happen - see the flip to READY below
+    s_freqenv_freq_dev[idx] = raw_freq_dev_current;
+    s_freqenv_envelope[idx] = raw_envelope_current;
+    idx++;
+    s_freqenv_write_idx = idx;
+    if (idx >= FREQENV_CAPTURE_LEN) {
+        s_freqenv_state = FREQENV_CAPTURE_READY;
+    }
+}
+
+// Called once per diagnostics_service() call (Core 1) - see that
+// function's own call site, deliberately OUTSIDE the mute gate and
+// unconditional, same reasoning as canary_check_background()/
+// diagnostics_check_slow_trace_auto_dump(): this is an explicit one-shot
+// user-requested action ('F'), not ongoing steady-state traffic, so
+// there's no "noisy while muted" concern. Dumps a bounded number of lines
+// per call rather than the whole buffer at once, respecting diag_room_for()
+// exactly like every other print in this file, so a slow/backlogged host
+// can't be blocked on - the dump just takes longer wall-clock, spread
+// across however many diagnostics_service() calls it needs.
+static void diagnostics_freqenv_capture_service(void)
+{
+    if (s_freqenv_state == FREQENV_CAPTURE_READY) {
+        s_freqenv_dump_idx = 0;
+        s_freqenv_state = FREQENV_CAPTURE_DUMPING;
+        Serial.printf("-> freqenv capture: buffer full, dumping %u samples as CSV "
+                      "(idx,raw_freq_dev_hz,raw_envelope) - spread across the next few "
+                      "seconds of diagnostics_service() calls\r\n", (unsigned)FREQENV_CAPTURE_LEN);
+        return;   // let the header above go out on its own before the CSV body starts
+    }
+
+    if (s_freqenv_state != FREQENV_CAPTURE_DUMPING) return;
+
+    // ~40 lines/call - conservative relative to each line's ~24-byte worst
+    // case, chosen the same way print_status_line()'s own 130-byte guard
+    // was: never ask a single call to queue more than a small, comfortably
+    // bounded chunk.
+    const uint32_t LINES_PER_CALL = 40;
+    uint32_t end = s_freqenv_dump_idx + LINES_PER_CALL;
+    if (end > FREQENV_CAPTURE_LEN) end = FREQENV_CAPTURE_LEN;
+
+    while (s_freqenv_dump_idx < end) {
+        if (!diag_room_for(32)) break;   // resume next diagnostics_service() call
+        Serial.printf("%u,%.2f,%.4f\r\n", (unsigned)s_freqenv_dump_idx,
+                      s_freqenv_freq_dev[s_freqenv_dump_idx], s_freqenv_envelope[s_freqenv_dump_idx]);
+        s_freqenv_dump_idx++;
+    }
+
+    if (s_freqenv_dump_idx >= FREQENV_CAPTURE_LEN) {
+        free(s_freqenv_freq_dev);
+        free(s_freqenv_envelope);
+        s_freqenv_freq_dev = NULL;
+        s_freqenv_envelope = NULL;
+        s_freqenv_state = FREQENV_CAPTURE_IDLE;
+        Serial.printf("-> freqenv capture: dump complete, buffer freed - 'F' to arm another\r\n");
+    }
+}
+#endif // AD9851_ATTACHED
+
 static void print_status_line(void)
 {
     if (!diag_room_for(130)) {
@@ -2525,6 +2722,22 @@ static void print_timing_and_adc_block(uint32_t now)
 
 void diagnostics_service(void)
 {
+#if AD9851_ATTACHED
+    // 2026-09-17, later still: while a freqenv ('F') capture is in
+    // progress (ARMED, READY, or DUMPING), skip everything else this
+    // function would normally do and run ONLY the freqenv service - see
+    // freqenv_capture_in_progress()'s own comment just above for why
+    // (the user's external logger can't handle the CSV dump being
+    // interleaved with the status line/timing block/canary/auto-dump
+    // traffic below). This is a hard early-return, not a per-block mute
+    // check, so it also covers the ~2s ARMED collection window before any
+    // CSV has even started printing, not just the DUMPING phase itself.
+    if (freqenv_capture_in_progress()) {
+        diagnostics_freqenv_capture_service();
+        return;
+    }
+#endif
+
     static uint32_t last_print_ms = 0;
     uint32_t now = millis();
     if (!s_diag_muted && now - last_print_ms >= 45) {
@@ -2532,6 +2745,20 @@ void diagnostics_service(void)
         print_status_line();
     }
 
+    // 2026-09-17: REVERTED back to 1000 - the temporary 1700ms causal test
+    // (see null_bias_investigation.md's matching entry) came back negative:
+    // 'v' on/off still made no audible difference to the ToneWarble/
+    // WarbleTone recordings' ~1.000s cycle even with this gate retuned, the
+    // same result as the original mute-toggle test on the unmodified
+    // 1000ms build. Combined with the earlier finding that this whole
+    // module (including the fast/slow EMA detector) only ever WATCHES
+    // tx_freq and never writes back into the live freq_dev_hz/tx_freq
+    // computation, diagnostics_service() is conclusively cleared as the
+    // source of that symptom - by two independent tests, not just
+    // argument. The mechanism remains unidentified; see that entry for the
+    // current best leads (the 700/1700 interference-periodicity math, and
+    // today's NCO-fix wrap boundary, itself checked and cleared by direct
+    // float32 simulation).
     static uint32_t last_timing_print_ms = 0;
     if (!s_diag_muted && now - last_timing_print_ms >= 1000) {
         last_timing_print_ms = now;
@@ -2585,6 +2812,17 @@ void diagnostics_service(void)
     // second, independent detector alongside 'K', built after the user
     // pointed out 'K' can't see a jump that sticks around for a long time).
     diagnostics_check_held_freq();
+
+    // 2026-09-17: the 'F' full-rate freq/env capture USED to be serviced
+    // from here too, alongside canary/slow-trace/held-freq above - moved
+    // to a hard early-return at the very top of this function instead
+    // (see freqenv_capture_in_progress()'s comment), so it no longer needs
+    // a call site down here: whenever a capture is ARMED/READY/DUMPING,
+    // this whole rest of the function (including everything above this
+    // point) is skipped already, so a second call here would either never
+    // run (capture in progress -> already returned) or always be a no-op
+    // (capture idle -> nothing to service) - removed rather than left as
+    // dead code either way.
 #endif
 }
 

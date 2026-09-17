@@ -504,6 +504,32 @@ void handle_serial_commands(void)
                           "RECOVERED on its own; this key is just an on-demand status + "
                           "rolling tx_freq trace (2 samples/sec, last 60s) read:\r\n");
             diagnostics_print_held_status();
+        } else if (c == 'F') {
+            // 2026-09-17: full-rate freq/env capture - a third, independent
+            // tool alongside 'J'/'K'/'H' above, added after the same-turn
+            // 'J' capture the user ran came back as a single point-in-time
+            // snapshot (one AUTO-CAPTURED slow_trace event plus one manual
+            // 'J' dump, both isolated instants) that couldn't test whether
+            // the ~0.485s/~1.000s warble's underlying near-null events
+            // actually recur at a specific interval - answering that needs
+            // many precisely-timestamped samples in a row, not one snapshot.
+            // This instead captures raw_freq_dev_current/raw_envelope_current
+            // on EVERY dsp_task tick (~16kHz) for about two seconds, then dumps
+            // the whole thing as CSV - direct per-tick ground truth instead
+            // of an SDR-audio proxy. See diagnostics_freqenv_capture_arm()'s
+            // own declaration comment (diagnostics.h) for the full design,
+            // including why the buffer is lazily malloc'd/freed rather than
+            // a permanent static array (this board is assumed to have no
+            // PSRAM). 2026-09-17, later same day: bumped from ~1.0s/~125KB to
+            // ~2.0s/~250KB after the user reported this board's actual build
+            // output ("leaving 299220 bytes for local variables, maximum
+            // 327680") - see FREQENV_CAPTURE_LEN's own comment (diagnostics.cpp)
+            // for the full reasoning on why 2.0s and not more.
+            serial_reply("-> freqenv capture: arming a full-rate (every dsp_task tick, ~16kHz) "
+                          "capture of raw_freq_dev_current/raw_envelope_current for ~2.0s. Dumps "
+                          "automatically as CSV (idx,raw_freq_dev_hz,raw_envelope) once full - "
+                          "watch for the ARMED confirmation, then wait for the dump:\r\n");
+            diagnostics_freqenv_capture_arm();
 #endif
         } else if (c == 'u') {
             envelope_output_raise_pwm_offset();

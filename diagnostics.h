@@ -274,6 +274,51 @@ void diagnostics_print_slow_trace(void);
 // no way to tell those two apart from the log alone.
 void diagnostics_print_held_status(void);
 
+// 2026-09-17: 'F' serial command - full-rate (every dsp_task tick, ~16kHz)
+// capture of raw_freq_dev_current/raw_envelope_current for about one
+// second, dumped to Serial as CSV afterward. Added directly in response
+// to the user's own question ("would it be worth doing a dump of all
+// freq/env values every sample for a second or so to check they are the
+// same values you expect") after the same-turn 'J' jump-log capture
+// turned out to be a single point-in-time snapshot (one AUTO-CAPTURED
+// slow_trace event + one manual 'J' dump, both isolated instants) -
+// unable to test whether the ~0.485s/~1.000s warble's underlying
+// near-null events actually recur at a specific interval, which needs
+// many precisely-timestamped samples in a row to check, not one snapshot
+// (see null_bias_investigation.md's 2026-09-17 "log correction" entry).
+// This instead captures the ACTUAL per-tick freq_dev/envelope stream
+// ground truth, so that recurrence (or its absence) can be measured
+// directly instead of inferred from an SDR-audio proxy.
+//
+// Lazily malloc's a ~250KB buffer (2 floats/sample x 32000 samples, ~2.0s
+// at 16kHz - bumped from an original 1.0s/~125KB after the user reported
+// this board's actual build output, "leaving 299220 bytes for local
+// variables, maximum 327680" - ~292KB free at link time against a 320KB
+// chip, comfortably more than the original size needed, though this pool
+// is also shared with every task's stack and other libraries' own heap
+// use at runtime, so 2.0s deliberately leaves real margin rather than
+// spending the whole reported figure) only once armed, and frees it again
+// once the dump completes - deliberately NOT a permanent static array
+// like this file's other trace buffers (HELD_TRACE_LEN/FREQ_STEP_TRACE_LEN,
+// both well under 1KB), since this board (ESP32-S3 Super Mini, config.h)
+// is assumed to have no PSRAM and a standing quarter-megabyte tax on
+// internal SRAM for a diagnostic used only occasionally, on demand, would
+// be a bad trade. If armed while already armed/ready/dumping, or if the
+// malloc fails (not enough free heap right now - the graceful fallback
+// this sizing choice is allowed to lean on, see the FREQENV_CAPTURE_LEN
+// comment in diagnostics.cpp), prints a short status/error line and does nothing
+// destructive - never double-allocates or leaks a half-succeeded pair.
+//
+// The actual per-tick capture write lives inline in
+// diagnostics_set_tx_info() just above (same AD9851-only hot-path hook
+// every other per-tick feature in this file uses), and the dump itself is
+// chunked across diagnostics_service() calls (see
+// diagnostics_freqenv_capture_service(), file-local to diagnostics.cpp) -
+// same diag_room_for() TX-buffer-safety pattern as every other print in
+// this file, so a slow/backlogged host just makes the dump take longer
+// wall-clock rather than blocking dsp_task or being lost.
+void diagnostics_freqenv_capture_arm(void);
+
 // Zeros every counter/high-water-mark this module owns and restarts the
 // dsp-tick long-window average from now. Does NOT touch any other
 // module's diagnostics - the 'r' serial handler calls
