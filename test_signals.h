@@ -155,36 +155,74 @@ const char* test_signals_next_tone_ratio(void);
 bool test_signals_get_twotone_dither_enabled(void);
 void test_signals_set_twotone_dither_enabled(bool enable);
 
-// Legacy two-tone phase generator toggle ('O', 2026-09-17) - lets the OLD
-// accumulate-and-subtract phase generator (`phase += two_pi*f/Fs; if
-// (phase > two_pi) phase -= two_pi;`) be switched back in for direct A/B
-// comparison against the exact-recompute-from-sample-index generator that
-// replaced it earlier the same day (see generate_twotone_sample()'s own
-// 2026-09-17 comment, and null_bias_investigation.md's matching entry, for
-// the full story: the old accumulator never resets its own float32
-// rounding error, giving both tones a small but real, steadily GROWING
-// frequency error - confirmed by simulation at roughly +/-2e-4Hz over an
-// 8M-tick/500s run - which the exact recompute eliminates entirely).
+// Two-tone phase generator selector ('O', 2026-09-17; extended to a 3-way
+// cycle 2026-09-18) - cycles which phase-generation scheme drives tone1
+// (always) and tone2 (whenever dither, 'Q', is off) for direct A/B/C
+// comparison on real hardware, without a reflash:
 //
-// Added not because the old scheme is considered better (it isn't - the
-// new one is strictly more correct), but because the user specifically
-// wants to be able to revert to the "pure but jumping" tone behavior on
-// demand as a sanity-check reference point, without a separate reflash,
-// given how much investigation was already anchored to that older
-// behavior. Off by default (matches the exact-recompute code that shipped
-// today) so plain 't'/'T'/'R'/'Q' behavior is completely unchanged unless
-// 'O' is explicitly pressed.
+//   EXACT  - today's default (shipped 2026-09-17): phase recomputed FRESH
+//            every tick from a sample index that wraps at SAMPLE_RATE_HZ
+//            (one second) - see generate_twotone_sample()'s own comment.
+//            Zero accumulated rounding error, but only bit-exact at its
+//            own 16000-sample wrap, NOT at the tone pair's true (finer)
+//            period - see null_bias_investigation.md's 2026-09-18 "Q1"
+//            entry: idx-magnitude-dependent float32 rounding gives this
+//            scheme ~100 subtly different near-null "alignment qualities"
+//            per second, one of which is a fixed, especially severe
+//            knife-edge (measured ~10226Hz worst-case single-tick freq_dev
+//            jump) that repeats identically forever.
+//   LEGACY - the OLD, pre-2026-09-17 accumulate-and-subtract generator
+//            (`phase += two_pi*f/Fs; if (phase > two_pi) phase -= two_pi;`).
+//            Never resets its own float32 rounding error, giving both
+//            tones a small but real, steadily GROWING frequency error
+//            (confirmed by simulation at roughly +/-2e-4Hz over an
+//            8M-tick/500s run) - NOT considered more correct than EXACT,
+//            kept only as a sanity-check reference point given how much
+//            earlier investigation was anchored to this behavior.
+//   MOD160 - 2026-09-18: phase recomputed fresh every tick like EXACT, but
+//            from a sample index that wraps at the tone pair's TRUE
+//            fundamental period (160 samples for the current 700/1700-Hz-
+//            class pairs, from gcd(700,1700,16000)=100) instead of at
+//            16000. This is a genuine numerical fix, not dither: computing
+//            fmodf() from a SMALL index avoids the large-index rounding
+//            error behind EXACT's fixed worst case. Simulation
+//            (sim_mod160_and_targeted_dither.py, see
+//            null_bias_investigation.md's 2026-09-18 "later" entry) shows
+//            this matches the mathematically-perfect near-null floor
+//            (~8001.55Hz max single-tick jump, vs EXACT's ~10226Hz) and
+//            eliminates every simulated jump above 8500/9000Hz across 60
+//            cycles - the strongest candidate simulated so far, motivating
+//            this bench test. CAVEAT: the hardcoded 160-sample modulus is
+//            only correct for tone pairs sharing the current 100Hz GCD
+//            structure - true of every TWOTONE_BAND_PRESETS entry except
+//            the deliberately-non-integer-Hz TEMP control entry
+//            (700.37/1700.61), which has no short true period at all;
+//            selecting MOD160 with that one specific band active will
+//            introduce artificial phase discontinuities every 160 samples
+//            rather than the smooth non-periodic reference that entry
+//            exists to provide.
 //
-// When ON: tone1 always uses the old accumulator; tone2 uses it too
-// whenever dither ('Q') is off (dither's own tone2 path already used the
-// accumulator both before and after the NCO fix - see
-// generate_twotone_sample() - so 'O' has no effect on tone2 while 'Q' is
-// on). Toggling 'O' mid-run can cause one small, one-time phase
-// discontinuity in whichever tone(s) switch generators, on the same
-// tick the switch happens - same accepted-as-negligible convention as
-// 'Q's own on/off transition and a 'T' band change already carry.
-bool test_signals_get_twotone_legacy_phase_enabled(void);
-void test_signals_set_twotone_legacy_phase_enabled(bool enable);
+// Off/EXACT is the default so plain 't'/'T'/'R'/'Q' behavior is unchanged
+// until 'O' is pressed. Each 'O' press advances to the next mode in the
+// EXACT -> LEGACY -> MOD160 -> EXACT... cycle. As before, this is a plain
+// mode-flip with no phase-state reset, so switching modes mid-run can
+// cause one small, one-time phase discontinuity in whichever tone(s)
+// change generator, on the tick the switch happens - same
+// accepted-as-negligible convention as 'Q's own on/off transition and a
+// 'T' band change already carry. While dither ('Q') is on, tone2 always
+// uses the accumulate path regardless of which of these three modes is
+// selected (dither's own tone2 path already used the accumulator both
+// before and after the 2026-09-17 NCO fix), so this selector then only
+// affects tone1.
+typedef enum {
+    TWOTONE_PHASE_GEN_EXACT = 0,
+    TWOTONE_PHASE_GEN_LEGACY = 1,
+    TWOTONE_PHASE_GEN_MOD160 = 2,
+} twotone_phase_gen_t;
+
+twotone_phase_gen_t test_signals_get_twotone_phase_gen(void);
+const char* test_signals_get_twotone_phase_gen_name(void); // current mode's name, no state change - for status/banner lines
+const char* test_signals_next_twotone_phase_gen(void);     // cycles to the next mode, returns its name
 
 // Envelope step test ('p') - slow square wave direct to the envelope
 // output, carrier held fixed, bypassing ssb_dsp_process_sample()

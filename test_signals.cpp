@@ -32,6 +32,17 @@ static float s_tone2_phase = 0.0f;
 // is exactly f whole cycles, so wrapping here introduces no discontinuity.
 static uint32_t s_tone_sample_index = 0;
 
+// 2026-09-18: second wrapping index, used by TWOTONE_PHASE_GEN_MOD160 (see
+// test_signals.h) - wraps at the tone pair's TRUE fundamental period
+// (160 samples for the current 700/1700-Hz-class pairs; see that header's
+// doc comment for the gcd derivation and the one preset it doesn't apply
+// to) rather than at SAMPLE_RATE_HZ. Kept as an independent counter,
+// always advancing regardless of which mode is active - same
+// no-reset-on-switch convention as s_tone_sample_index above - so MOD160
+// picks back up cleanly (no stale phase) the instant it's selected.
+#define TWOTONE_MOD160_PERIOD_SAMPLES 160
+static uint32_t s_tone_sample_index_160 = 0;
+
 // Runtime-adjustable pair (see test_signals.h) - starts at the
 // config.h defaults so behavior is unchanged until 'T' is sent. volatile
 // for the same reason relative_delay.cpp's s_relative_delay_samples is:
@@ -178,13 +189,30 @@ static uint32_t s_dither_countdown = 0;    // samples remaining until the next t
 
 bool test_signals_get_twotone_dither_enabled(void) { return s_twotone_dither_enable; }
 
-// ---- 2026-09-17: legacy two-tone phase generator toggle ('O') - see
-// test_signals.h's doc comment for the full rationale. dsp_task-private,
-// same reasoning as s_dither_current_hz et al. above. ----
-static volatile bool s_twotone_legacy_phase_enable = false;
+// ---- 2026-09-17: two-tone phase generator selector ('O'); extended
+// 2026-09-18 from a plain on/off toggle to a 3-way cycle (EXACT/LEGACY/
+// MOD160) - see test_signals.h's doc comment for the full rationale.
+// dsp_task-private, same reasoning as s_dither_current_hz et al. above. ----
+static volatile twotone_phase_gen_t s_twotone_phase_gen_mode = TWOTONE_PHASE_GEN_EXACT;
 
-bool test_signals_get_twotone_legacy_phase_enabled(void) { return s_twotone_legacy_phase_enable; }
-void test_signals_set_twotone_legacy_phase_enabled(bool enable) { s_twotone_legacy_phase_enable = enable; }
+static const char* TWOTONE_PHASE_GEN_NAMES[] = {
+    "EXACT (recompute mod 16000 - today's default)",
+    "LEGACY (old accumulate-and-subtract)",
+    "MOD160 (recompute mod true 160-sample period)",
+};
+
+twotone_phase_gen_t test_signals_get_twotone_phase_gen(void) { return s_twotone_phase_gen_mode; }
+
+const char* test_signals_get_twotone_phase_gen_name(void)
+{
+    return TWOTONE_PHASE_GEN_NAMES[s_twotone_phase_gen_mode];
+}
+
+const char* test_signals_next_twotone_phase_gen(void)
+{
+    s_twotone_phase_gen_mode = (twotone_phase_gen_t)((s_twotone_phase_gen_mode + 1) % 3);
+    return TWOTONE_PHASE_GEN_NAMES[s_twotone_phase_gen_mode];
+}
 
 void test_signals_set_twotone_dither_enabled(bool enable)
 {
@@ -261,25 +289,36 @@ float IRAM_ATTR generate_twotone_sample(void)
     // negligible next to the much bigger, already-audible frequency change
     // a band switch is anyway.
     //
-    // 2026-09-17, later same day: 'O' lets s_twotone_legacy_phase_enable
-    // force tone1 (and tone2 whenever dither is off) back onto the OLD
-    // accumulate-and-subtract path below, for direct A/B against this
-    // exact-recompute scheme - see test_signals.h's doc comment. Kept as a
-    // separate bool check rather than removing/branching the index-advance
-    // itself, so s_tone_sample_index keeps ticking over even in legacy
-    // mode and the exact-recompute path picks back up cleanly (no stale
-    // index) the instant 'O' is toggled back off.
+    // 2026-09-17, later same day; extended 2026-09-18 to a 3-way cycle:
+    // 'O' selects which scheme drives tone1 (and tone2 whenever dither is
+    // off) via s_twotone_phase_gen_mode - see test_signals.h's doc comment.
+    // Both wrapping indices always advance regardless of the active mode
+    // (same no-reset-on-switch convention as before), so whichever scheme
+    // is selected next picks up cleanly with no stale index.
     s_tone_sample_index++;
     if (s_tone_sample_index >= (uint32_t)SAMPLE_RATE_HZ) s_tone_sample_index = 0;
-    if (s_twotone_legacy_phase_enable) {
-        s_tone1_phase += two_pi * s_tone1_hz / (float)SAMPLE_RATE_HZ;
-        if (s_tone1_phase > two_pi) s_tone1_phase -= two_pi;
-    } else {
-        s_tone1_phase = fmodf((float)s_tone_sample_index * s_tone1_hz / (float)SAMPLE_RATE_HZ, 1.0f) * two_pi;
+    s_tone_sample_index_160++;
+    if (s_tone_sample_index_160 >= TWOTONE_MOD160_PERIOD_SAMPLES) s_tone_sample_index_160 = 0;
+
+    switch (s_twotone_phase_gen_mode) {
+        case TWOTONE_PHASE_GEN_LEGACY:
+            s_tone1_phase += two_pi * s_tone1_hz / (float)SAMPLE_RATE_HZ;
+            if (s_tone1_phase > two_pi) s_tone1_phase -= two_pi;
+            break;
+        case TWOTONE_PHASE_GEN_MOD160:
+            s_tone1_phase = fmodf((float)s_tone_sample_index_160 * s_tone1_hz / (float)SAMPLE_RATE_HZ, 1.0f) * two_pi;
+            break;
+        case TWOTONE_PHASE_GEN_EXACT:
+        default:
+            s_tone1_phase = fmodf((float)s_tone_sample_index * s_tone1_hz / (float)SAMPLE_RATE_HZ, 1.0f) * two_pi;
+            break;
     }
-    if (s_twotone_dither_enable || s_twotone_legacy_phase_enable) {
+
+    if (s_twotone_dither_enable || s_twotone_phase_gen_mode == TWOTONE_PHASE_GEN_LEGACY) {
         s_tone2_phase += two_pi * tone2_hz / (float)SAMPLE_RATE_HZ;
         if (s_tone2_phase > two_pi) s_tone2_phase -= two_pi;
+    } else if (s_twotone_phase_gen_mode == TWOTONE_PHASE_GEN_MOD160) {
+        s_tone2_phase = fmodf((float)s_tone_sample_index_160 * tone2_hz / (float)SAMPLE_RATE_HZ, 1.0f) * two_pi;
     } else {
         s_tone2_phase = fmodf((float)s_tone_sample_index * tone2_hz / (float)SAMPLE_RATE_HZ, 1.0f) * two_pi;
     }
