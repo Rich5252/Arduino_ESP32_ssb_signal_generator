@@ -87,6 +87,36 @@
 // path is active.
 #define AD9851_BITBANG_EDGE_DELAY_ENABLED 0
 
+// 2026-09-17: split OUT of AD9851_BITBANG_EDGE_DELAY_ENABLED above - see the
+// FQ_UD call site's own comment (ad9851_set_frequency()'s bit-bang tail) for
+// which one this gates. Added because the per-bit DATA-settle delays above
+// and this ONE latch-edge delay have never actually been tested
+// independently of each other - they've only ever been bundled under the
+// same flag, so the per-bit delays' own real, measured real-time-budget cost
+// (~13-14us, see the 2026-09-10 entries in moving_forward_notes.md) has
+// always been paid together with whatever this one alone would cost or fix,
+// confounding any attempt to attribute a result to one or the other.
+//
+// Motivated directly by today's decisive `'O'` A/B finding
+// (null_bias_investigation.md): the EXACT (post-NCO-fix) two-tone generator
+// reliably drives single-tick freq_dev jumps past ~8500-9000Hz hundreds of
+// times per cycle, EVERY cycle, at fixed sample positions - squarely in the
+// range this project's own history already ties to AD9851 DATA-bit
+// corruption - while the OLD generator mostly stays well clear of that zone.
+// FQ_UD's own latch edge (the transition that actually transfers the
+// shifted-in word into the AD9851's frequency/phase registers) currently has
+// ZERO settling margin under either flag being 0. Testing THIS one delay in
+// isolation, without the per-bit delays' unrelated cost, is the cheapest
+// direct way to check whether FQ_UD's own margin is part of what makes the
+// EXACT generator measurably noisier than the OLD one via `'O'`.
+//
+// Starts at 1 (enabled) rather than this file's usual "off by default"
+// convention, specifically because the user asked to try it now - flip back
+// to 0 to return to the exact behavior every capture so far in this
+// investigation was taken under (FQ_UD's own latch edge with no margin at
+// all), independent of whatever AD9851_BITBANG_EDGE_DELAY_ENABLED is set to.
+#define AD9851_FQUD_EDGE_DELAY_ENABLED 1
+
 struct ad9851_s {
 #if AD9851_USE_BITBANG
     int pin_data;                  // DATA/D7 - bit-banged directly, no SPI peripheral involved
@@ -575,7 +605,7 @@ void IRAM_ATTR ad9851_set_frequency(ad9851_handle_t handle, uint32_t freq_hz)
     // End shift: ESP32 GPIO LOW -> AD9851 side HIGH, the required
     // LOW-to-HIGH latch transition, back at FQ_UD's normal idle level.
     fast_gpio_clr(handle->pin_fqud);
-#if AD9851_BITBANG_EDGE_DELAY_ENABLED
+#if AD9851_BITBANG_EDGE_DELAY_ENABLED || AD9851_FQUD_EDGE_DELAY_ENABLED
     // 2026-09-10: this IS the actual latch edge (see the comment above),
     // and it's the same slow pull-up-charged direction as the per-bit
     // edges above - give it the same margin before returning, cheap
@@ -584,6 +614,12 @@ void IRAM_ATTR ad9851_set_frequency(ad9851_handle_t handle, uint32_t freq_hz)
     //
     // 2026-09-11: disabled along with the other two call sites - see
     // AD9851_BITBANG_EDGE_DELAY_ENABLED's comment near the top of this file.
+    //
+    // 2026-09-17: given its OWN independent flag (AD9851_FQUD_EDGE_DELAY_ENABLED,
+    // see that flag's comment) so it can be tested without also paying the
+    // per-bit DATA-settle delays' separate real-time cost - either flag alone
+    // is enough to enable this one call site; AD9851_BITBANG_EDGE_DELAY_ENABLED
+    // on its own still also re-enables the two per-bit sites above unchanged.
     ad9851_edge_delay(handle->half_period_cycles);
 #endif
 #else
