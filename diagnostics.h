@@ -329,6 +329,38 @@ void diagnostics_reset(void);
 bool diagnostics_get_muted(void);
 void diagnostics_toggle_muted(void);
 
+// 2026-09-18: SEPARATE mute for the three "auto dump" background watchers -
+// canary_check_background(), diagnostics_check_slow_trace_auto_dump()
+// ('K's automatic side), and diagnostics_check_held_freq() ('H's automatic
+// side) - deliberately NOT folded into diagnostics_toggle_muted()/'v'
+// above. Those three were built specifically to be mute-EXEMPT (see each
+// one's own declaration comment in diagnostics.cpp): they exist to catch
+// rare, hands-off events (a corrupted canary, a big jump, a stuck
+// frequency) during an unattended capture, and silently disabling that
+// safety net as a side effect of muting the routine 1Hz/45ms status noise
+// would be an easy way to lose exactly the event you were trying to catch.
+// This toggle is the deliberate, explicit opt-in for "I know what these
+// are for and I still want them quiet right now" - added on request to let
+// the user silence ALL auto-printed diagnostic output (both categories)
+// during normal, uneventful operation.
+//
+// Caveat worth knowing before using this: for the three watchers this
+// covers, detection and the print happen in the same gated call (unlike
+// the periodic block, which keeps counting while just skipping the print).
+// While this is on, none of the three even CHECK for their trigger
+// condition, so a canary mismatch's "first seen at t=...ms" timestamp (if
+// one fires while muted) will read as whenever this is next turned off and
+// the check resumes, not the true onset - the underlying corrupted/latched
+// state itself isn't lost (these conditions are all designed to persist
+// until read, not to self-heal), just the exact onset time. Same
+// unmute-and-it-appears behavior for slow_trace/held_freq: a LATCHED
+// slow_trace or a confirmed-stuck held_freq episode simply waits, un-
+// rearmed/unprinted, until this is turned back off. Manual on-demand reads
+// ('K', 'H', diagnostics_print_now()/'D') are untouched by this flag either
+// way, same as they already ignore diagnostics_get_muted().
+bool diagnostics_get_autodump_muted(void);
+void diagnostics_toggle_autodump_muted(void);
+
 // Call once per loop() iteration. Internally throttles: prints the
 // envelope/freq_dev/dac_code status line at ~45ms intervals and the full
 // [timing]/[adc]/[dsp] block at ~1000ms intervals, both gated on the mute

@@ -2341,6 +2341,14 @@ Per the user's request to bench-test MOD160 first: extended `'O'` from a plain b
 
 **Caveat worth remembering while testing**: the 160-sample modulus is only correct for tone pairs sharing the current 100Hz GCD structure - true of every real `'T'` band preset except the deliberately non-integer-Hz TEMP control entry (700.37/1700.61Hz), which MOD160 would corrupt with artificial phase discontinuities if selected together. Not yet bench-tested - implementation only, no hardware result yet. Full details in `null_bias_investigation.md`.
 
+## 2026-09-18, later still: added 'M' - a separate mute for the three auto-dump watchers, distinct from 'v'
+
+User asked for a mute covering all diagnostic auto-dumps. `'v'` already mutes the periodic status/[timing]/[adc]/[dsp]/null_bias block, but three separate watchers - canary mismatch detection, the `'K'` slow_trace jump-detector's automatic side, and the `'H'` held-frequency detector's automatic side - were deliberately built mute-EXEMPT from `'v'` so they'd keep catching rare events during unattended captures. Rather than fold these into `'v'` (which would silently weaken that existing safety property for anyone using `'v'` for its original purpose), added a new, separate toggle: `'M'`.
+
+New `s_diag_autodump_muted` flag (independent of `'v'`'s own flag), same getter/toggle-with-always-printed-confirmation pattern as `'v'`. `diagnostics_service()`'s three previously-unconditional calls (canary/slow_trace-auto/held_freq-auto) now wrapped in one `if (!muted)` gate. Boot banner and serial handler updated. Braces/parens/`#if`/`#endif` verified balanced after the edit.
+
+**Caveat to know before using it**: unlike `'v'`, these three do detection AND printing in the same gated call, so while `'M'` is on they don't even check their trigger condition - a canary's "first seen at" timestamp (if one fires while muted) will read as whenever `'M'` is turned back off, not the true onset, though the underlying latched/corrupted state itself isn't lost. A slow_trace/held_freq event similarly just waits, unprinted, until unmuted, then prints immediately - nothing is silently discarded, but reporting is delayed for as long as `'M'` stays on. Manual on-demand reads (`'K'`/`'H'`/`'D'`) are unaffected either way. Not yet bench-tested. Full reasoning in `null_bias_investigation.md`.
+
 ## Open items carried from earlier sessions, still unresolved
 
 - `MAX_FREQ_DEV_HZ` currently `20000.0f` (config.h:405) - a widened

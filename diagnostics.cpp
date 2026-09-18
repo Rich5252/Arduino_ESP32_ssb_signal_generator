@@ -1882,6 +1882,29 @@ void diagnostics_toggle_muted(void)
                   s_diag_muted ? "MUTED (command confirmations only)" : "resumed");
 }
 
+// 2026-09-18: separate mute for the three auto-dump watchers - see this
+// flag's own doc comment in diagnostics.h (diagnostics_get_autodump_muted()/
+// diagnostics_toggle_autodump_muted()) for the full rationale and the
+// "detection pauses too, not just the print" caveat. Independent of
+// s_diag_muted above by design - either can be on/off in any combination.
+static volatile bool s_diag_autodump_muted = false;
+
+bool diagnostics_get_autodump_muted(void)
+{
+    return s_diag_autodump_muted;
+}
+
+void diagnostics_toggle_autodump_muted(void)
+{
+    s_diag_autodump_muted = !s_diag_autodump_muted;
+    // Same "always print the confirmation regardless of new state" reasoning
+    // as diagnostics_toggle_muted() above.
+    Serial.printf("-> auto-dump diagnostics (canary/slow_trace-auto/held_freq-auto) %s%s\r\n",
+                  s_diag_autodump_muted ? "MUTED" : "resumed",
+                  s_diag_autodump_muted ? " - note: detection itself pauses too while muted, "
+                                          "not just the print; see diagnostics.h" : "");
+}
+
 void diagnostics_init(void)
 {
     s_dsp_tick_start_us = esp_timer_get_time();
@@ -2797,21 +2820,31 @@ void diagnostics_service(void)
     // to a mismatch, so it costs nothing during normal (healthy) operation
     // - unlike null_bias/the old canary design, there's no ongoing
     // steady-state Serial traffic for this to add back.
-    canary_check_background();
+    //
+    // 2026-09-18: all three calls below are now gated on s_diag_autodump_muted
+    // instead - a SEPARATE flag from s_diag_muted, toggled by 'M', added on
+    // request to let these be silenced too. Still independent of 'v': muting
+    // 'v' alone leaves these three running exactly as before (the whole
+    // point of them being mute-exempt from 'v' in the first place - see
+    // diagnostics.h's doc comment on diagnostics_toggle_autodump_muted()
+    // for the detection-also-pauses caveat this introduces).
+    if (!s_diag_autodump_muted) {
+        canary_check_background();
 
-    // 2026-09-15: same "unconditional, mute-exempt, checked every call"
-    // shape as canary_check_background() just above, for the same reason -
-    // see diagnostics_check_slow_trace_auto_dump()'s own declaration
-    // comment for the full motivation (the user's request to leave a
-    // capture running hands-off and have hard-to-catch jumps like their
-    // observed -50Hz/+20Hz ones show up in the log on their own).
-    diagnostics_check_slow_trace_auto_dump();
+        // 2026-09-15: same "unconditional, mute-exempt, checked every call"
+        // shape as canary_check_background() just above, for the same reason -
+        // see diagnostics_check_slow_trace_auto_dump()'s own declaration
+        // comment for the full motivation (the user's request to leave a
+        // capture running hands-off and have hard-to-catch jumps like their
+        // observed -50Hz/+20Hz ones show up in the log on their own).
+        diagnostics_check_slow_trace_auto_dump();
 
-    // 2026-09-15: same pattern again, for the 'H' held-frequency detector -
-    // see diagnostics_check_held_freq()'s own declaration comment (a
-    // second, independent detector alongside 'K', built after the user
-    // pointed out 'K' can't see a jump that sticks around for a long time).
-    diagnostics_check_held_freq();
+        // 2026-09-15: same pattern again, for the 'H' held-frequency detector -
+        // see diagnostics_check_held_freq()'s own declaration comment (a
+        // second, independent detector alongside 'K', built after the user
+        // pointed out 'K' can't see a jump that sticks around for a long time).
+        diagnostics_check_held_freq();
+    }
 
     // 2026-09-17: the 'F' full-rate freq/env capture USED to be serviced
     // from here too, alongside canary/slow-trace/held-freq above - moved

@@ -759,6 +759,15 @@ void handle_serial_commands(void)
             serial_reply("-> null_bias threshold=%.2f (see '[dsp] null_bias' diagnostic line)\r\n", thr);
         } else if (c == 'v') {
             diagnostics_toggle_muted();
+        } else if (c == 'M') {
+            // Separate mute for the three auto-dump watchers (canary,
+            // slow_trace's automatic side, held_freq's automatic side) -
+            // added 2026-09-18 on request, distinct from 'v' on purpose.
+            // See diagnostics_toggle_autodump_muted()'s doc comment
+            // (diagnostics.h) for why these were deliberately mute-exempt
+            // from 'v' up to now, and the caveat that detection itself
+            // pauses too while this is on, not just the print.
+            diagnostics_toggle_autodump_muted();
         } else if (c == 'V') {
             // On-demand snapshot - see diagnostics_print_now()'s own
             // comment for why this exists (the periodic 1Hz block is
