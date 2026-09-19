@@ -57,10 +57,31 @@ void carrier_output_init(void)
     ad9851_set_frequency(s_ad9851, s_carrier_hz);
 }
 
+// 2026-09-19: the float-to-int32 cast here is exactly what panicked when
+// called from the ISR during this fix's bench validation (Coprocessor
+// exception, EXCCAUSE 0x4) - see carrier_output.h's comment on the two
+// functions below, added to let ISR context reach an already-integer value
+// instead of doing this arithmetic itself. This function's own behavior is
+// unchanged - still used directly whenever AD9851_ISR_WRITE_ENABLED is off
+// (config.h), and always by every non-ISR caller.
+uint32_t IRAM_ATTR carrier_output_compute_tx_freq(float delayed_freq_dev_hz)
+{
+    return s_carrier_hz + (int32_t)delayed_freq_dev_hz;
+}
+
+// Pure integer register write underneath (ad9851_set_frequency() is
+// integer/uint64_t multiply+shift only, no float anywhere - confirmed by
+// reading AD9851.c directly) - safe to call from an ISR, unlike
+// carrier_output_set_freq_dev() below.
+void IRAM_ATTR carrier_output_set_freq_dev_raw(uint32_t tx_freq)
+{
+    ad9851_set_frequency(s_ad9851, tx_freq);
+}
+
 uint32_t IRAM_ATTR carrier_output_set_freq_dev(float delayed_freq_dev_hz)
 {
-    uint32_t tx_freq = s_carrier_hz + (int32_t)delayed_freq_dev_hz;
-    ad9851_set_frequency(s_ad9851, tx_freq);
+    uint32_t tx_freq = carrier_output_compute_tx_freq(delayed_freq_dev_hz);
+    carrier_output_set_freq_dev_raw(tx_freq);
     return tx_freq;
 }
 

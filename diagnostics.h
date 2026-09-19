@@ -188,6 +188,23 @@ void IRAM_ATTR diagnostics_set_tx_info(float delayed_freq_dev_hz, float delayed_
 // entry. AD9851-only, same as the rest of this feature.
 void IRAM_ATTR diagnostics_record_jump_busy_us(uint32_t busy_us);
 
+// 2026-09-19: fold-back of the write-time-jitter fix's staging-race
+// diagnostic (config.h's AD9851_ISR_WRITE_ENABLED comment; ssb_mic_test.ino's
+// s_stage_seq/s_stale_commit_count) - call once per dsp_task full tick with
+// the CURRENT cumulative count (not a delta - this just overwrites the
+// printed value each call, same "latest snapshot" convention as the
+// wakeup-jitter high-water marks). Deliberately NOT reset by
+// diagnostics_reset()/'r' - this is a since-boot "has this ever happened at
+// all" signal, not a per-capture performance metric, so a reset can't make
+// it stale-looking while dsp_task's own real, un-reset counter keeps
+// climbing underneath it. Printed in the periodic [timing] block - see
+// print_timing_and_adc_block(). IRAM_ATTR: called once per full tick from
+// dsp_task, which is itself IRAM_ATTR - every function it calls needs to be
+// too, same reasoning as dsp_task's own declaration comment
+// (ssb_mic_test.ino), even though this one's own body is just a volatile
+// store with no real-time sensitivity of its own.
+void IRAM_ATTR diagnostics_record_isr_stale_commits(uint32_t stale_commit_count);
+
 // 'J' serial command - dumps the aggregate near-null/total jump counts
 // plus each of the last JUMP_LOG_LEN qualifying events (oldest to newest)
 // to Serial. Only ever called from Core 1's handle_serial_commands()

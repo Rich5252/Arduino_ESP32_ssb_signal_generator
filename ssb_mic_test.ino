@@ -135,7 +135,59 @@
 // visible regardless of the IDE's Core Debug Level setting. ssb_dsp.c has
 // its own separate TAG for its internal ESP_LOG calls.)
 
+// See config.h's AD9851_ISR_WRITE_ENABLED comment for why this guard
+// exists and can't live in config.h itself (ENVELOPE_INTERP_FACTOR isn't
+// known there - envelope_interp.h is included after config.h).
+#if AD9851_ATTACHED && AD9851_ISR_WRITE_ENABLED && ENVELOPE_INTERP_FACTOR != 1
+#error "AD9851_ISR_WRITE_ENABLED (config.h) requires ENVELOPE_INTERP_FACTOR==1 (envelope_interp.h) - see config.h's comment on this flag for why."
+#endif
+
 static TaskHandle_t s_dsp_task;
+
+#if AD9851_ATTACHED && TX_WRITE_RESYNC_ENABLED
+// 2026-09-19: write-time-jitter fix, folded in from minimal_fs_test_step5_
+// resync/step6_isr_write after real-hardware bench confirmation - see
+// config.h's TX_WRITE_RESYNC_ENABLED/AD9851_ISR_WRITE_ENABLED comment and
+// null_bias_investigation.md/moving_forward_notes.md's 2026-09-19 entries
+// for the full story. This tick's already-delay-line-adjusted
+// envelope/freq_dev result is buffered here instead of written
+// immediately - it gets written as the very FIRST action of the NEXT
+// tick, in dsp_task's main loop, before that tick's own DSP work starts.
+//
+// volatile: with AD9851_ISR_WRITE_ENABLED, s_pending_tx_freq is read from
+// the gptimer ISR on Core 1 while dsp_task (Core 0) writes it - a genuine
+// cross-core shared variable. Aligned 32-bit reads/writes are atomic on
+// this target (same reasoning already established elsewhere in this
+// project, e.g. AD9851.c's own busy_us high-water-mark fields), so no lock
+// is needed, but volatile IS needed to stop either side caching a stale
+// value in a register across the ISR/task boundary. s_pending_freq_dev_hz/
+// s_pending_envelope are only ever touched from dsp_task (never from the
+// ISR) but kept volatile too for consistency with the one field that
+// genuinely needs it.
+static volatile float s_pending_freq_dev_hz = 0.0f;   // only used when !AD9851_ISR_WRITE_ENABLED (task-side write)
+static volatile float s_pending_envelope = 0.0f;
+static volatile uint32_t s_pending_tx_freq = 0;        // already-integer - see carrier_output_compute_tx_freq()
+static volatile bool s_pending_valid = false;          // guards the very first tick (nothing buffered yet)
+
+#if AD9851_ISR_WRITE_ENABLED
+// Staging-race diagnostic - directly modeled on the second of the two
+// suspected mechanisms in the SDM ISR-commit postmortem
+// (group_delay_fit_notes.md, 2026-09-08 "REVERTED" entry): if dsp_task is
+// ever still working when the NEXT alarm fires, the ISR would commit a
+// value staged MORE than one tick ago - stale by more than the clean,
+// constant one-tick offset this design assumes. s_stage_seq increments
+// every time dsp_task finishes staging a fresh value (below);
+// s_isr_last_seen_seq (ISR-context-only - single reader/writer, no lock
+// needed) is what the ISR last saw. A match on the ISR's next firing means
+// dsp_task hasn't staged anything new since the last commit. Measured, not
+// just hoped against - see diagnostics.cpp's print_timing_and_adc_block()
+// for where this gets reported ("[timing]   AD9851 ISR write:
+// stale_commits=...").
+static volatile uint32_t s_stage_seq = 0;
+static uint32_t s_isr_last_seen_seq = 0;
+static volatile uint32_t s_stale_commit_count = 0;
+#endif
+#endif
 
 static bool IRAM_ATTR on_timer_alarm(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
@@ -157,6 +209,52 @@ static bool IRAM_ATTR on_timer_alarm(gptimer_handle_t timer, const gptimer_alarm
     // over almost as soon as they start.
     GPIO_FAST_CLR(TIMING_DEBUG_GPIO_ISR);
 #endif
+
+#if AD9851_ATTACHED && AD9851_ISR_WRITE_ENABLED
+    // 2026-09-19: write-time-jitter fix, folded in from minimal_fs_test_
+    // step6_isr_write after real-hardware bench confirmation - see
+    // config.h's AD9851_ISR_WRITE_ENABLED comment and
+    // null_bias_investigation.md/moving_forward_notes.md's 2026-09-19
+    // entries for the full story. Writes LAST tick's already-computed,
+    // already-delay-line-adjusted frequency here, as close to this ISR's
+    // own falling edge above (the true, hardware-clocked Fs reference -
+    // confirmed rock-solid on a scope, unlike everything downstream of it)
+    // as this system can get - removes the cross-core ISR-to-task
+    // hand-off latency that dsp_task's own write used to add on top of its
+    // own DSP execution time.
+    //
+    // Uses carrier_output_set_freq_dev_raw() (pure integer register pokes
+    // via ad9851_set_frequency() - confirmed by reading AD9851.c directly:
+    // no float, no ESP-IDF driver call, no FreeRTOS API, no allocation, no
+    // locks) on the ALREADY-CONVERTED s_pending_tx_freq - NEVER the
+    // float-taking carrier_output_set_freq_dev(). This distinction is
+    // load-bearing, not stylistic: this exact fix's own bench validation
+    // panicked (Guru Meditation Error, Coprocessor exception, EXCCAUSE
+    // 0x4) the first time it called the float-taking function directly
+    // from an ISR - see carrier_output.h's comment on these two functions.
+    //
+    // Envelope/PWM is deliberately NOT written here at all - it stays
+    // task-side (dsp_task's own resync block, below), per the SDM
+    // ISR-commit precedent right below this comment: a stage-in-task/
+    // commit-from-ISR split was already tried for the SDM envelope-output
+    // leg and measured WORSE, not better, on real hardware. AD9851's
+    // bit-bang transport is a fundamentally different, safer case (no
+    // driver call, no flash-residency ambiguity) than LEDC/SDM, which is
+    // why only this leg moved into the ISR.
+    if (s_pending_valid) {
+        if (s_stage_seq == s_isr_last_seen_seq) {
+            // Staging-race: dsp_task hasn't staged a fresh value since our
+            // last commit - this write is about to reuse a value more
+            // than one tick old. Still commit it (skipping would leave
+            // the AD9851 holding an even-more-stale frequency) but count
+            // it - see s_stale_commit_count's own declaration comment.
+            s_stale_commit_count++;
+        }
+        s_isr_last_seen_seq = s_stage_seq;
+        carrier_output_set_freq_dev_raw(s_pending_tx_freq);
+    }
+#endif
+
     // 2026-09-08: a direct-from-ISR SDM commit briefly lived here
     // (envelope_output_commit_sdm_from_isr()), trying to remove dsp_task's
     // own cross-core wake/scheduling latency from the SDM write's timing.
@@ -527,6 +625,30 @@ static void IRAM_ATTR dsp_task(void* arg)
         diagnostics_record_tick_start(t_start_us);
 #endif
 
+#if AD9851_ATTACHED && TX_WRITE_RESYNC_ENABLED
+        // Re-sync write, FIRST thing this tick, before any of this tick's
+        // own variable-duration DSP work below - see config.h's
+        // TX_WRITE_RESYNC_ENABLED comment. Writes out LAST tick's already-
+        // computed, already-delay-line-adjusted result, using THIS tick's
+        // t_start_us as envelope_interp's own ramp timing reference (this
+        // write is happening now, at this tick's start - see envelope_
+        // interp.h's v4.1 note for why that timestamp matters).
+        //
+        // Envelope/PWM is always written here, task-side, regardless of
+        // AD9851_ISR_WRITE_ENABLED - see on_timer_alarm()'s own comment for
+        // why that leg deliberately never moves into the ISR. The AD9851
+        // write only happens here when AD9851_ISR_WRITE_ENABLED is OFF -
+        // when it's on, the ISR already committed this same buffered
+        // frequency (via s_pending_tx_freq) just before waking this task,
+        // so there's nothing left for dsp_task to do for that leg.
+        if (s_pending_valid) {
+            envelope_interp_on_full_tick(s_pending_envelope, t_start_us);
+#if !AD9851_ISR_WRITE_ENABLED
+            (void)carrier_output_set_freq_dev(s_pending_freq_dev_hz);
+#endif
+        }
+#endif
+
         // Read once and reuse for both branches below (generation and
         // isolation-test dispatch) - the original .ino re-read the
         // volatile audio-source selector separately at each of the two
@@ -688,10 +810,29 @@ static void IRAM_ATTR dsp_task(void* arg)
         // note for why a timestamp taken at THIS call site instead
         // (after the full pipeline above has already run) would make the
         // ramp's timing wrong, not just imprecise.
+        //
+        // 2026-09-19: under TX_WRITE_RESYNC_ENABLED, this tick's result is
+        // NOT written now - it's buffered below and written at the START
+        // of the NEXT tick instead (see the resync block near the top of
+        // this loop). The unconditional call below only runs in the
+        // original, non-resync (legacy) behavior.
+#if AD9851_ATTACHED && TX_WRITE_RESYNC_ENABLED
+        // (nothing here - buffering happens below, after diagnostics)
+#else
         envelope_interp_on_full_tick(delayed_envelope, t_start_us);
+#endif
 
 #if AD9851_ATTACHED
+        // tx_freq is computed here purely for diagnostics either way - see
+        // the comment below diagnostics_set_tx_info() for what it means
+        // under resync (it's this tick's own freshly-computed, not-yet-
+        // transmitted intended value in that case, not literally what's on
+        // the AD9851 right now).
+#if TX_WRITE_RESYNC_ENABLED
+        uint32_t tx_freq = carrier_output_compute_tx_freq(delayed_freq_dev_hz);
+#else
         uint32_t tx_freq = carrier_output_set_freq_dev(delayed_freq_dev_hz);
+#endif
 
         // Unlike the envelope/freq_dev diagnostics below (which are the
         // PRE-delay values from ssb_dsp_process_sample and have always
@@ -709,10 +850,46 @@ static void IRAM_ATTR dsp_task(void* arg)
         // real, coherent contamination) - see the jump log
         // (diagnostics.h/.cpp) and null_bias_investigation.md's 2026-09-12
         // entries for the full mechanism this was found from.
+        //
+        // 2026-09-19 ADDITION: under TX_WRITE_RESYNC_ENABLED, tx_freq/
+        // delayed_freq_dev_hz/delayed_envelope here are a self-consistent
+        // TUPLE (tx_freq is exactly carrier_output_compute_tx_freq() of
+        // this same delayed_freq_dev_hz) but describe a write that won't
+        // physically reach the AD9851/PWM until the START of the NEXT
+        // tick - a uniform one-tick queueing delay, not new jitter. This
+        // diagnostic's own logic (jump_log, near-null correlation) only
+        // ever looks at deltas and cross-alignment BETWEEN freq_dev and
+        // envelope from one consistent tuple to the next, never at
+        // absolute wall-clock truth, so a constant shared shift across
+        // every sample here doesn't change anything it computes.
         diagnostics_set_tx_info(delayed_freq_dev_hz, delayed_envelope, envelope_at_freq_time,
                                  envelope_at_freq_time_min, raw_freq_dev_near, raw_freq_dev_far,
                                  raw_freq_dev_current, raw_envelope_current,
                                  tx_freq);
+#endif
+
+#if AD9851_ATTACHED && TX_WRITE_RESYNC_ENABLED
+        // Buffer this tick's result for the resync write at the top of the
+        // NEXT tick - see config.h's TX_WRITE_RESYNC_ENABLED comment and
+        // the resync block near the top of this loop. Always staged
+        // (regardless of AD9851_ISR_WRITE_ENABLED) so s_stage_seq advances
+        // every tick - the ISR's staging-race check needs that to tell a
+        // fresh value apart from one it already committed.
+        s_pending_envelope = delayed_envelope;
+        s_pending_freq_dev_hz = delayed_freq_dev_hz;   // only read back when !AD9851_ISR_WRITE_ENABLED
+#if AD9851_ISR_WRITE_ENABLED
+        // Float->int conversion done HERE, in task context (safe - FPU use
+        // is normal here). The ISR only ever reads this already-integer
+        // result via s_pending_tx_freq, never delayed_freq_dev_hz itself -
+        // see carrier_output.h's comment on carrier_output_compute_tx_freq()
+        // for why that split exists.
+        s_pending_tx_freq = tx_freq;   // == carrier_output_compute_tx_freq(delayed_freq_dev_hz), computed above
+#endif
+        s_pending_valid = true;
+#if AD9851_ISR_WRITE_ENABLED
+        s_stage_seq++;   // see s_stage_seq's own declaration comment
+        diagnostics_record_isr_stale_commits(s_stale_commit_count);
+#endif
 #endif
 
         // Non-blocking, always succeeds - overwrites whatever was there.
@@ -950,6 +1127,19 @@ void setup()
     // live, not-yet-followed-up lead worth revisiting too - which pin,
     // and what "messy" actually looked like (irregular width vs period vs
     // missing edges), could point straight at the mechanism.
+    //
+    // 2026-09-19 ADDENDUM: a THIRD, narrower Core0/Core1 attempt in this
+    // same seam succeeded where the two above and the SDM ISR-commit
+    // attempt (envelope_interp.cpp/group_delay_fit_notes.md, 2026-09-08)
+    // all failed or reverted - see config.h's AD9851_ISR_WRITE_ENABLED
+    // comment and on_timer_alarm() above. The difference: this one moves
+    // only the AD9851's own already-IRAM_ATTR, driver-call-free, integer-
+    // only register write into the ISR, nothing else (not a whole task,
+    // not the timer init itself, not the LEDC/SDM envelope path) - bench-
+    // confirmed clean (stale_commits=0, no Serial/Core-1 disruption,
+    // eliminated the long-standing ~7.7Hz two-tone comb). Kept as a
+    // compile-time-only flag for the same reason this section's earlier
+    // failures argue for caution in this exact seam.
     xTaskCreatePinnedToCore(dsp_task, "ssb_dsp_task", 4096, NULL,
                              configMAX_PRIORITIES - 2, &s_dsp_task, 0);
 
@@ -978,6 +1168,28 @@ void setup()
              AD9851_ATTACHED ? "attached" : "not attached (stubbed)",
              MCP4725_I2C_ADDR,
              PWM_COMPARISON_ENABLED ? "on" : "off");
+#if AD9851_ATTACHED
+    // 2026-09-19: write-time-jitter fix fold-back - see config.h's
+    // TX_WRITE_RESYNC_ENABLED/AD9851_ISR_WRITE_ENABLED comment and
+    // null_bias_investigation.md/moving_forward_notes.md's 2026-09-19
+    // entries. Both compile-time only (no runtime toggle) - printed here so
+    // it's obvious from the boot banner which write-timing behavior a given
+    // flash is running, without needing to check config.h.
+    Serial.printf("Write timing: TX_WRITE_RESYNC_ENABLED=%d AD9851_ISR_WRITE_ENABLED=%d - %s\r\n",
+                  TX_WRITE_RESYNC_ENABLED, AD9851_ISR_WRITE_ENABLED,
+#if AD9851_ISR_WRITE_ENABLED
+                  "AD9851 written directly from the gptimer ISR (Core 1); envelope/PWM stays "
+                  "task-side, resynced to the top of each tick. If Serial or anything else on "
+                  "Core 1 seems wrong, set AD9851_ISR_WRITE_ENABLED to 0 in config.h and reflash "
+                  "for a guaranteed, code-level revert."
+#elif TX_WRITE_RESYNC_ENABLED
+                  "envelope+frequency both buffered and written at the start of the next tick "
+                  "(task-side only, no ISR involvement)."
+#else
+                  "legacy behavior - both written immediately at the end of each tick's own DSP work."
+#endif
+                  );
+#endif
     Serial.println("Send 't' for two-tone test signal, 's' for single-tone test signal, 'm' for live mic input, 'p' for envelope step test, 'y' for FM isolation test, 'h' for AM isolation test, 'f' to cycle the ADC LPF off/Butterworth/Chebyshev, 'r' to reset diagnostics, 'v' to mute periodic diagnostics, 'M' to mute the auto-dump watchers (canary/slow_trace-auto/held_freq-auto - separate from 'v', see diagnostics.h), 'V' to print one on-demand [timing]/[adc]/[dsp] snapshot right now (works even while muted, doesn't reset counters), 'n' to cycle the null_bias diagnostic's envelope threshold (see '[dsp] null_bias' line).");
 #if CHIRP_BIDIRECTIONAL
     float chirp_banner_total_sec = 2.0f * CHIRP_SWEEP_SEC;

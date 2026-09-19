@@ -29,6 +29,72 @@
 // filled in. Until then this runs mic->DSP->DAC standalone. ----
 #define AD9851_ATTACHED 1
 
+// ---- 2026-09-19: fold-back of the write-time-jitter fix - see
+// null_bias_investigation.md/moving_forward_notes.md's 2026-09-19 entries
+// for the full story. Short version: the long-standing ~7.7Hz two-tone
+// comb was traced to the Hilbert/DSP chain's own execution time jittering
+// (mode-dependently) at ~7.7Hz, which turns into RF-domain phase/frequency
+// noise because the AD9851/envelope writes happen at the END of each tick,
+// right after that jittery work finishes - the WALL-CLOCK MOMENT those
+// writes occur (and therefore when the AD9851's frequency actually
+// changes) jitters by the same amount relative to the one rock-solid
+// periodic reference in this system, the gptimer alarm. Bench-confirmed on
+// minimal_fs_test_step5_resync/step6_isr_write to eliminate the comb (no
+// sign of it in EXACT/LEGACY/MOD160 alike) with no measured downside.
+//
+// Two independent compile-time flags, both default ON now that the fix is
+// confirmed - see ssb_mic_test.ino's dsp_task()/on_timer_alarm() for where
+// each is actually used:
+//
+// TX_WRITE_RESYNC_ENABLED - buffer this tick's already-delay-line-adjusted
+// envelope+freq_dev result and write BOTH at the START of the next tick
+// instead of the end of this one, re-syncing the write's wall-clock timing
+// to the gptimer alarm edge rather than to the variable-duration DSP
+// work's own completion time. Adds exactly one sample period
+// (SSB_SAMPLE_PERIOD_US) of common output latency - envelope and frequency
+// are delayed together so relative_delay_apply()'s existing calibration
+// between them is unaffected, only their shared latency increases.
+//
+// AD9851_ISR_WRITE_ENABLED - goes a step further for the AD9851 leg only:
+// write it directly from the gptimer alarm ISR (on_timer_alarm(), Core 1)
+// instead of from dsp_task, removing the cross-core ISR-to-task hand-off
+// latency entirely - this is what actually closed the gap on the bench
+// (resync alone only helped ~10dB under LEGACY, ~1dB under MOD160; adding
+// this fixed all three modes). Deliberately does NOT extend to
+// envelope/PWM - see ssb_mic_test.ino's on_timer_alarm() for the
+// project-history reasons (three prior Core0/Core1 ISR failures, one of
+// them - the SDM stage/commit-from-ISR attempt - directly on point and
+// REVERTED after real hardware measured WORSE, not better). Compile-time
+// only, deliberately not a runtime toggle - if anything on Core 1
+// misbehaves, Serial itself dying outright is the historical canary (see
+// the two "TRIED, REVERTED" Core0/Core1 entries in dsp_task()'s own
+// comment), and a runtime toggle sent over Serial might not even be
+// reachable at that point. Set to 0 and reflash for a guaranteed,
+// code-level revert - with it at 0, behavior is identical to
+// TX_WRITE_RESYNC_ENABLED alone (task-side resync for both signals).
+//
+// Requires ENVELOPE_INTERP_FACTOR==1 (envelope_interp.h) - enforced by a
+// #error guard in ssb_mic_test.ino, since that macro isn't visible yet
+// here. With FACTOR==1 every gptimer alarm IS a true full-tick boundary,
+// so the ISR can commit on every firing unconditionally; with FACTOR>1 the
+// ISR fires faster than the true per-sample rate and can't tell, by
+// itself, which firing is a genuine full-tick boundary (that's resolved in
+// SOFTWARE, in dsp_task, specifically to tolerate coalesced wakeups - see
+// dsp_task's own fast_tick_count/last_full_group comment) - writing the
+// AD9851 on every ISR firing at that faster rate would both write stale
+// values most of the time and risk the write not finishing before the
+// next alarm. FACTOR is 1 in this config right now, so this doesn't bite
+// today, but re-check this guard before ever raising it.
+#define TX_WRITE_RESYNC_ENABLED     1
+#define AD9851_ISR_WRITE_ENABLED    1
+
+#if AD9851_ISR_WRITE_ENABLED && !AD9851_ATTACHED
+#error "AD9851_ISR_WRITE_ENABLED requires AD9851_ATTACHED - there's no AD9851 to write to otherwise."
+#endif
+#if AD9851_ISR_WRITE_ENABLED && !TX_WRITE_RESYNC_ENABLED
+#error "AD9851_ISR_WRITE_ENABLED requires TX_WRITE_RESYNC_ENABLED - the ISR write reads a buffer that's only ever staged/valid under the resync scheme, and writing AD9851 from the ISR without also resyncing envelope/PWM would reintroduce the two writes' calibrated relative timing being lost."
+#endif
+
 // ---- Two-tone test mode: bypass the mic ADC with a synthesized signal.
 // Zero-hardware smoke test of the DSP chain. ----
 #define TWOTONE_TEST_MODE   1  // testing default - two-tone on at boot
@@ -139,7 +205,7 @@
 // - mic-source audio silently reads as 0.0f (matching the existing
 // AMTEST/FMTEST/ENVSTEP "unused sample" convention) when disabled, rather
 // than calling into a driver that was never started.
-#define ADC_CAPTURE_ENABLED 0
+#define ADC_CAPTURE_ENABLED 1
 
 // ---- Timing debug pin: toggled high at the start of dsp_task's real work
 // and low at the end, so a scope on this pin directly measures the actual
@@ -197,7 +263,7 @@
 // without it (high-water marks/overrun_count all stay at their initial
 // values). See moving_forward_notes.md/null_bias_investigation.md for the
 // full investigation.
-#define DIAG_HOTPATH_RECORDING_ENABLED 0
+#define DIAG_HOTPATH_RECORDING_ENABLED 1
 
 // 2026-09-02: GPIO_FAST_SET/CLR - IRAM-safe register-level GPIO set/clear
 // that works across the FULL GPIO0-48 range on the S3. GPIO.out_w1ts/w1tc

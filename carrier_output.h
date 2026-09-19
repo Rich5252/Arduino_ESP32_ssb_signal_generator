@@ -40,6 +40,27 @@ void carrier_output_init(void);
 // the upstream DSP/delay-line reasoning. Call once per dsp_task tick.
 uint32_t IRAM_ATTR carrier_output_set_freq_dev(float delayed_freq_dev_hz);
 
+// 2026-09-19: split OUT of carrier_output_set_freq_dev() above, folded in
+// from minimal_fs_test_step6_isr_write after real-hardware bench
+// confirmation - see config.h's AD9851_ISR_WRITE_ENABLED comment and
+// null_bias_investigation.md/moving_forward_notes.md's 2026-09-19 entries
+// for the full write-time-jitter story. carrier_output_set_freq_dev() does
+// `s_carrier_hz + (int32_t)delayed_freq_dev_hz` - a float-to-int cast,
+// which uses Xtensa's floating-point coprocessor. Calling it directly from
+// an ISR panics with a Coprocessor exception (confirmed on real hardware,
+// EXCCAUSE 0x4, during this fix's own bench validation) - this project's
+// history had already named this exact failure mode ("v2's ISR crash", see
+// group_delay_fit_notes.md) before step6 first repeated it. The fix: do
+// the float arithmetic in TASK context (safe - FPU use is normal there)
+// via carrier_output_compute_tx_freq(), and pass the ALREADY-INTEGER
+// result to carrier_output_set_freq_dev_raw() - pure register writes
+// underneath, no float, no coprocessor - which IS safe to call from an
+// ISR (dsp_task's own on_timer_alarm() now does exactly this when
+// AD9851_ISR_WRITE_ENABLED). carrier_output_set_freq_dev() above is
+// unchanged and still does both steps together, for every other caller.
+uint32_t IRAM_ATTR carrier_output_compute_tx_freq(float delayed_freq_dev_hz);
+void IRAM_ATTR carrier_output_set_freq_dev_raw(uint32_t tx_freq);
+
 bool carrier_output_get_rf_enabled(void);
 void carrier_output_set_rf_enabled(bool enable);
 

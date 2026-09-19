@@ -647,6 +647,14 @@ static const uint32_t k_sample_period_us = SSB_SAMPLE_PERIOD_US;
 static volatile uint32_t s_dbg_max_tick_gap_us = 0;      // worst observed inter-tick gap
 static volatile uint32_t s_dbg_late_tick_count = 0;      // ticks where the gap exceeded 1.5x nominal
 
+// 2026-09-19: latest snapshot of ssb_mic_test.ino's own s_stale_commit_count
+// (AD9851_ISR_WRITE_ENABLED's staging-race counter) - see
+// diagnostics_record_isr_stale_commits()/diagnostics.h for why this is a
+// plain overwrite, not reset by diagnostics_reset(). Zero-initialized here
+// so the [timing] line reads a sane 0 even before AD9851_ISR_WRITE_ENABLED
+// is compiled in (config.h's own #error guards keep it in sync otherwise).
+static volatile uint32_t s_dbg_isr_stale_commit_count = 0;
+
 // "Is that long [core1]/[timing]/[adc]/[dsp] print block sent in one go?"
 // - yes, from the CPU's side: print_timing_and_adc_block() below is ~10
 // back-to-back Serial.printf() calls with no yield in between, so it's one
@@ -1233,6 +1241,18 @@ void IRAM_ATTR diagnostics_record_jump_busy_us(uint32_t busy_us)
 #else
     (void)busy_us;
 #endif
+}
+
+// 2026-09-19: see diagnostics.h's own comment - plain latest-value
+// overwrite, not an accumulator (ssb_mic_test.ino's s_stale_commit_count is
+// the real, monotonic, un-reset counter; this is just its most recent
+// value for the periodic print). IRAM_ATTR because it's called once per
+// full tick from dsp_task (itself IRAM_ATTR) - matches every other
+// function dsp_task calls, even though this one's own body is just a
+// single volatile store.
+void IRAM_ATTR diagnostics_record_isr_stale_commits(uint32_t stale_commit_count)
+{
+    s_dbg_isr_stale_commit_count = stale_commit_count;
 }
 
 void diagnostics_print_jump_log(void)
@@ -2554,6 +2574,19 @@ static void print_timing_and_adc_block(uint32_t now)
         Serial.printf("[timing]   wakeup jitter: max_gap_us=%u (nominal=%u) late_ticks_total=%u\r\n",
                       s_dbg_max_tick_gap_us, k_sample_period_us, s_dbg_late_tick_count);
     }
+#if AD9851_ATTACHED && AD9851_ISR_WRITE_ENABLED
+    // 2026-09-19: write-time-jitter fix fold-back - see config.h's
+    // AD9851_ISR_WRITE_ENABLED comment and diagnostics_record_isr_stale_
+    // commits()'s own comment for what this counts. Nonzero and climbing
+    // would mean dsp_task is occasionally falling more than one tick behind
+    // the ISR - a real, hardware-measured answer to the SDM-postmortem's
+    // staging-race mechanism, not a guess. Zero throughout this project's
+    // own bench validation of this fix (minimal_fs_test_step6_isr_write).
+    if (diag_room_for(90)) {
+        Serial.printf("[timing]   AD9851 ISR write: stale_commits=%u (since boot)\r\n",
+                      s_dbg_isr_stale_commit_count);
+    }
+#endif
     // Worst single print_timing_and_adc_block() call since last reset -
     // see s_dbg_max_diag_block_us's own comment (near its declaration)
     // for the real hardware measurement (5041us) that motivated this
