@@ -523,7 +523,9 @@ static void IRAM_ATTR dsp_task(void* arg)
         digitalWrite(TIMING_DEBUG_GPIO, HIGH);
 #endif
         int64_t t_start_us = esp_timer_get_time();
+#if DIAG_HOTPATH_RECORDING_ENABLED
         diagnostics_record_tick_start(t_start_us);
+#endif
 
         // Read once and reuse for both branches below (generation and
         // isolation-test dispatch) - the original .ino re-read the
@@ -730,11 +732,13 @@ static void IRAM_ATTR dsp_task(void* arg)
         // permanently rather than only turning it on when chasing a
         // specific problem.
         int64_t t_write_done_us = esp_timer_get_time();
+        uint32_t busy_us  = (uint32_t)(t_write_done_us - t_start_us);
+#if DIAG_HOTPATH_RECORDING_ENABLED
         uint32_t adc_us   = (uint32_t)(t_adc_done_us   - t_start_us);
         uint32_t dsp_us   = (uint32_t)(t_dsp_done_us   - t_adc_done_us);
         uint32_t write_us = (uint32_t)(t_write_done_us - t_dsp_done_us);
-        uint32_t busy_us  = (uint32_t)(t_write_done_us - t_start_us);
         diagnostics_record_phase_timings(adc_us, dsp_us, write_us, busy_us);
+#endif
 
         // 2026-09-12: finalizes this tick's per-event jump-log entry (if
         // diagnostics_set_tx_info() above flagged one) now that busy_us is

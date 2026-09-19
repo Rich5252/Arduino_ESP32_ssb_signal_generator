@@ -177,6 +177,28 @@
 // two back-to-back register writes take - negligible, sub-100ns).
 #define TIMING_DEBUG_GPIO_ISR  5   // toggled every gptimer alarm ISR fire (on_timer_alarm(), Core 1)
 
+// 2026-09-18: 7.7Hz two-tone comb hunt. Real hardware now shows a genuine
+// ~7.69Hz component on BOTH TIMING_DEBUG_GPIO (pin4) and TIMING_DEBUG_GPIO_ISR
+// (pin5) - confirmed by the user with a 256k-point FFT at 48kHz Fs on each
+// pin in turn - i.e. dsp_task's own real-time cadence is what's carrying it,
+// not something external. diagnostics_record_tick_start()/
+// diagnostics_record_phase_timings() (diagnostics.cpp - the two always-on,
+// every-tick hot-path calls feeding the [timing] block's high-water marks)
+// are a documented prior suspect for exactly this kind of thing:
+// diagnostics.h's own history notes a confirmed case of extra per-tick
+// Core-1 instrumentation regressing pin5's period, fixed at the time by
+// reverting it without ever pinning down why. Separately, `'v'`/`'M'`
+// (2026-09-18, earlier) already ruled out the PRINT/auto-dump side of Core 1
+// diagnostics as a cause - but those toggles never touched these two
+// unconditional per-tick calls, so this is a genuinely untested layer.
+// Set to 0, rebuild/reflash, and rescope pin4/pin5 for the ~7.7Hz component:
+// if it changes or disappears, this recording layer is implicated. Leave at
+// 1 for normal use - the periodic [timing] block has nothing to print
+// without it (high-water marks/overrun_count all stay at their initial
+// values). See moving_forward_notes.md/null_bias_investigation.md for the
+// full investigation.
+#define DIAG_HOTPATH_RECORDING_ENABLED 0
+
 // 2026-09-02: GPIO_FAST_SET/CLR - IRAM-safe register-level GPIO set/clear
 // that works across the FULL GPIO0-48 range on the S3. GPIO.out_w1ts/w1tc
 // (used directly at every raw-register toggle site below and in
