@@ -269,7 +269,7 @@ SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM },
     // envelope_interp_curve
 
 // Preset 4 - Diagnostic / raw ADC
-{ "AM-ButwGd", AUDIO_SRC_AMTEST, 2.96f, 0.08f, 0.84f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
+{ "ReSync Micr", AUDIO_SRC_MIC, 2.68f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV, true, false, 33.3f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, false, false, ENV_GDEQ_VARIANT_DEFAULT},
 
 // Preset 5 -
 { "V4 Microphone tunedD7", AUDIO_SRC_MIC, 2.03f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV, true, true, 19.3f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, true, true, ENV_GDEQ_VARIANT_CANDIDATE_B },
