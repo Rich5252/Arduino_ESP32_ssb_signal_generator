@@ -30,6 +30,10 @@ static void env_gdeq_coefficients_for_variant(env_gdeq_variant_t variant, float 
             *out_a1 = ENV_GDEQ_A1_CANDIDATE_B;
             *out_a2 = ENV_GDEQ_A2_CANDIDATE_B;
             break;
+        case ENV_GDEQ_VARIANT_A_CANDIDATE:
+            *out_a1 = ENV_GDEQ_A1_A_CANDIDATE;
+            *out_a2 = ENV_GDEQ_A2_A_CANDIDATE;
+            break;
         case ENV_GDEQ_VARIANT_DEFAULT:
         default:
             *out_a1 = ENV_GDEQ_A1;
@@ -82,6 +86,8 @@ bool envelope_gdeq_variant_available(env_gdeq_variant_t variant)
             return ENV_GDEQ_HAS_AA_CANDIDATE ? true : false;
         case ENV_GDEQ_VARIANT_CANDIDATE_B:
             return ENV_GDEQ_HAS_CANDIDATE_B ? true : false;
+        case ENV_GDEQ_VARIANT_A_CANDIDATE:
+            return ENV_GDEQ_HAS_A_CANDIDATE ? true : false;
         case ENV_GDEQ_VARIANT_DEFAULT:
         default:
             return true;
@@ -109,6 +115,12 @@ const char *envelope_gdeq_variant_name(env_gdeq_variant_t variant)
             // shorter 'w'/boot-banner replies, where a long status clause
             // isn't wanted anyway).
             return "candidate B (a1=a2=+0.09)";
+        case ENV_GDEQ_VARIANT_A_CANDIDATE:
+            // Shelf1-only fit, 2026-09-20 - see envelope_gdeq.h's matching
+            // header entry. Status/caveat text lives in the 'G' handler's
+            // caveat string (serial_commands.cpp), same reasoning as
+            // candidate B's own comment just above.
+            return "A_CANDIDATE, shelf1-only (a1=-0.110103, a2=0.286600)";
         case ENV_GDEQ_VARIANT_DEFAULT:
         default:
             return "default (a1=0.026173, a2=0.236810)";

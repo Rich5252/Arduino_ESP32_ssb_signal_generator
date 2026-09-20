@@ -322,6 +322,95 @@
  * via 'g', off by default so existing tuning isn't disturbed until
  * deliberately opted into.
  *
+ * ---- 2026-09-20: FOURTH coefficient set, "A_CANDIDATE" - shelf1-ONLY
+ * (no shelf2), requested after a new-PSU-era bench finding that shelf2
+ * ('A') makes real IMDs worse ---- User rebuilt the 5V rail properly (was
+ * previously running off a rail this project's own notes had flagged as
+ * marginal - see moving_forward_notes.md's PSU-rework entries) and asked
+ * for gdeq to be refit for the resulting "a only, no A" chain, since
+ * every existing candidate above (default, AA_CANDIDATE, CANDIDATE_B) was
+ * fit against curves that either had no shelf at all or had BOTH shelves
+ * on. Source data: `HiRes_aD_TF_New_5V_psu.txt` (real TFA sweep, shelf1 +
+ * predistort, gdeq OFF, new PSU) - same extraction pipeline as every
+ * other entry in this file (trim f<35Hz placeholder/noise points,
+ * Savitzky-Golay derivative at a 700Hz-span window, same convergence
+ * discipline as the very first fits in this file). Bare (gdeq off)
+ * result: 68.9us p-p / 68.2us mean over 100-8000Hz, 17.0us p-p / -7.55us/
+ * kHz local slope over 2800-4500Hz - a notably FLATTER, gentler curve
+ * than either the analog-alone curve (71.2us p-p, similar magnitude but a
+ * different shape) or the analog+shelf1+shelf2 curve the AA_CANDIDATE/
+ * CANDIDATE_B sets were fit against (156.5us p-p) - shelf2's own
+ * contribution is clearly the dominant source of dispersion in those
+ * curves, not shelf1's.
+ *
+ * IMPORTANT finding before any new fit: checked all THREE existing
+ * coefficient sets against this new shelf1-only curve first (same "does
+ * an existing set already work" check this project always runs before
+ * fitting a new one). Result - ALL THREE make full-band p-p WORSE than
+ * leaving gdeq off entirely: DEFAULT 68.9us->84.7us, AA_CANDIDATE
+ * 68.9us->101.0us, CANDIDATE_B 68.9us->82.0us. Two of the three
+ * (DEFAULT, CANDIDATE_B) do flatten the local 2800-4500Hz slope close to
+ * zero (2.38us/kHz and 0.53us/kHz respectively, vs. bare's -7.55us/kHz) -
+ * but only by overcorrecting past flat, and only at that full-band p-p
+ * cost. None of the three sets is a free win here - this is a genuinely
+ * different curve shape from anything previously fit in this file, not
+ * just a rescaled version of one.
+ *
+ * Fit method: same two-cascaded-ssb_allpass1_t structure as every set
+ * above. A plain symmetric (a1=a2) search found almost no headroom
+ * (a=-0.0217, p-p=66.6us, essentially bare) - this curve's shape doesn't
+ * suit a symmetric pair. A full-band-optimal ASYMMETRIC search found
+ * a1=-0.3136, a2=+0.2255 (44.1us p-p, a real ~1.6x improvement) but at
+ * the cost of making the local 2800-4500Hz slope WORSE (-12.6us/kHz vs.
+ * bare's -7.55us/kHz) - the same full-band-vs-local-slope tension seen in
+ * the AA_CANDIDATE/CANDIDATE_B fits above, but this time a genuine
+ * 2-parameter (asymmetric) Pareto sweep across several full-band p-p
+ * budgets [69,75,85,100,130]us found something the CANDIDATE_B-era
+ * symmetric sweep never got to check on THAT curve: asymmetric freedom
+ * here lets local slope improve at essentially ZERO full-band cost,
+ * something the earlier a+A/candidate-B symmetric-only exploration never
+ * found for the shelf1+shelf2 curve (see the 2026-09-06 entry above - it
+ * traded one axis for the other, it never found a free lunch). A final
+ * budget-constrained optimization (17x17-grid multi-start + Nelder-Mead,
+ * penalizing any full-band p-p above bare's own 68.92us) converged on:
+ *
+ *   a1 = -0.110103, a2 = +0.286600
+ *
+ * giving full-band p-p = 68.92us (matching bare's 68.92us almost exactly -
+ * i.e. NO full-band dispersion cost at all) while cutting the local
+ * 2800-4500Hz slope from -7.55us/kHz to -3.39us/kHz (roughly halved, NOT
+ * fully flattened the way DEFAULT/CANDIDATE_B manage on this curve - they
+ * flatten further but only by paying full-band p-p this candidate
+ * doesn't pay). Mean added delay ~125.16us (2.003 samples @ 16000Hz),
+ * closely matching every other set's own ~2-sample addition, so the
+ * existing '['/']' bench-optimum starting points remain a reasonable
+ * first guess for re-tuning, not a fresh blind search. See
+ * `gdeq_aD_shelf1only_analysis.png` (delivered alongside this change) for
+ * the comparison chart - note the DEFAULT/AA_CANDIDATE/CANDIDATE_B curves
+ * on that chart are LTI-model PREDICTIONS (bare + each set's own exactly-
+ * known analytic allpass contribution), not new bench sweeps of those
+ * specific combinations; only the bare curve and the new A_CANDIDATE fit
+ * itself come from a fit against real measured data.
+ *
+ * Selected via the existing `'G'` cycle (envelope_gdeq_set_variant(),
+ * ENV_GDEQ_VARIANT_A_CANDIDATE below) - default -> a+A candidate ->
+ * candidate B -> A_CANDIDATE -> default -> ..., same modulo-cycle/skip-
+ * unfitted-variant discipline as every entry before it.
+ *
+ * **NOT YET VALIDATED ON REAL HARDWARE AT ALL** - unlike every other set
+ * in this file at the point it was first added, this one hasn't even had
+ * a bench group-delay re-measurement with gdeq actually switched on yet
+ * (compare AA_CANDIDATE/CANDIDATE_B, both later confirmed by a same-day
+ * or next-day real TFA sweep with the candidate active). Needs, in order:
+ * (1) a TFA re-sweep with this variant selected to confirm the model
+ * prediction above the way every other set in this file was confirmed;
+ * (2) a same-session two-tone IMD comparison against the current best-
+ * known shelf1-only tuning, since this project's own repeated finding
+ * (see the 2026-09-05/09-06 entries above) is that neither full-band p-p
+ * nor local slope has reliably predicted real IMD outcome on its own.
+ * Treat with at least as much caution as CANDIDATE_B's own introduction
+ * above, more so until it has been on the bench at all.
+ *
  * ---- UPDATE, 2026-09-07: the asymmetry above is NOT currently
  * reproducible ---- Re-ran AMTEST ('h'): "AM test now seems well behaved
  * and symmetric IMDs go up and down with modulation level in a sensible
@@ -417,11 +506,17 @@
 // cycle. ENV_GDEQ_VARIANT_DEFAULT is deliberately value 0 - see
 // envelope_interp_curve_t's own comment in envelope_interp.h for why that
 // matters for struct zero-fill.
+// ENV_GDEQ_VARIANT_A_CANDIDATE = 3 added 2026-09-20 (shelf1-only fit, see
+// header comment's matching entry) - appended after the existing three
+// rather than renumbering them, so old PersistentSettings/preset fields
+// (env_gdeq_variant) that already hold 0/1/2 keep meaning what they always
+// meant.
 typedef enum {
     ENV_GDEQ_VARIANT_DEFAULT = 0,
     ENV_GDEQ_VARIANT_AA_CANDIDATE = 1,
     ENV_GDEQ_VARIANT_CANDIDATE_B = 2,
-    ENV_GDEQ_VARIANT_COUNT = 3
+    ENV_GDEQ_VARIANT_A_CANDIDATE = 3,
+    ENV_GDEQ_VARIANT_COUNT = 4
 } env_gdeq_variant_t;
 
 // Selected at compile time by SAMPLE_RATE_HZ AND ENV_FILTER_VARIANT
@@ -448,6 +543,11 @@ typedef enum {
 // CANDIDATE) so a future filter/Fs fit could have one set without the
 // other without misrepresenting which sets it actually has.
 #define ENV_GDEQ_HAS_CANDIDATE_B 0
+// Same convention, for the 2026-09-20 "A_CANDIDATE" (shelf1-only) set -
+// see this file's header comment and ENV_GDEQ_A1_A_CANDIDATE/
+// ENV_GDEQ_A2_A_CANDIDATE below. Independent flag, same reasoning as
+// ENV_GDEQ_HAS_CANDIDATE_B's own comment above.
+#define ENV_GDEQ_HAS_A_CANDIDATE 0
 
 #if SAMPLE_RATE_HZ == 16000
   #if ENV_FILTER_VARIANT == ENV_FILTER_BC337
@@ -532,6 +632,36 @@ typedef enum {
     #define ENV_GDEQ_A2_CANDIDATE_B  0.09f
     #undef  ENV_GDEQ_HAS_CANDIDATE_B
     #define ENV_GDEQ_HAS_CANDIDATE_B 1
+
+    // ---- "A_CANDIDATE" (2026-09-20 shelf1-only fit - see this file's
+    // header comment above in full) ---- Fit against the REAL measured
+    // bare (analog+shelf1-only, gdeq off, post-PSU-rework) curve from
+    // HiRes_aD_TF_New_5V_psu.txt (68.9us p-p / 68.2us mean over
+    // 100-8000Hz) - none of the three sets above were fit against this
+    // curve shape (DEFAULT is analog-alone; AA_CANDIDATE/CANDIDATE_B are
+    // analog+shelf1+shelf2), and all three were confirmed to WORSEN
+    // full-band p-p when checked against it (84.7us/101.0us/82.0us
+    // respectively). Symmetric (a1=a2) search found almost no headroom;
+    // full-band-optimal asymmetric search found a1=-0.3136/a2=+0.2255
+    // (44.1us p-p) but worsened local 2800-4500Hz slope to -12.6us/kHz.
+    // Budget-constrained asymmetric search (17x17-grid multi-start +
+    // Nelder-Mead, penalizing full-band p-p above bare's own 68.92us)
+    // found this point instead: full-band p-p 68.92us (matches bare
+    // exactly - zero full-band cost), local 2800-4500Hz slope -3.39us/kHz
+    // (vs. bare's -7.55us/kHz - roughly halved, not fully flattened the
+    // way DEFAULT/CANDIDATE_B manage on this curve at their own full-band
+    // cost). Mean added delay ~125.16us (2.003 samples @ 16000Hz). See
+    // group_delay_fit_notes.md's matching 2026-09-20 entry and
+    // `gdeq_aD_shelf1only_analysis.png` for the full derivation and
+    // chart. Available at runtime via `'G'` (envelope_gdeq_set_variant())
+    // ONLY for this filter/Fs - same restriction as the other two
+    // candidates, for the same reason (never fit anywhere else).
+    // **NOT YET VALIDATED ON REAL HARDWARE AT ALL** - no bench re-sweep
+    // with gdeq switched on, no two-tone IMD check - see header comment.
+    #define ENV_GDEQ_A1_A_CANDIDATE  -0.110103f
+    #define ENV_GDEQ_A2_A_CANDIDATE   0.286600f
+    #undef  ENV_GDEQ_HAS_A_CANDIDATE
+    #define ENV_GDEQ_HAS_A_CANDIDATE 1
   #else
     #error "ENV_GDEQ_A1/A2 have only been fitted for ENV_FILTER_BC337 or ENV_FILTER_PNP_BC327_ATTN at SAMPLE_RATE_HZ=16000 - see group_delay_fit_notes.md for the fitting method to add another"
   #endif
@@ -566,6 +696,15 @@ typedef enum {
 #ifndef ENV_GDEQ_A1_CANDIDATE_B
   #define ENV_GDEQ_A1_CANDIDATE_B ENV_GDEQ_A1
   #define ENV_GDEQ_A2_CANDIDATE_B ENV_GDEQ_A2
+#endif
+
+// Same reasoning as the two fallback blocks immediately above, for the
+// 2026-09-20 A_CANDIDATE (shelf1-only) set - never actually selected at
+// runtime where ENV_GDEQ_HAS_A_CANDIDATE is 0
+// (envelope_gdeq_variant_available() gates it).
+#ifndef ENV_GDEQ_A1_A_CANDIDATE
+  #define ENV_GDEQ_A1_A_CANDIDATE ENV_GDEQ_A1
+  #define ENV_GDEQ_A2_A_CANDIDATE ENV_GDEQ_A2
 #endif
 
 // Zeroes both all-pass sections' state and initializes their coefficients
@@ -606,8 +745,9 @@ env_gdeq_variant_t envelope_gdeq_get_variant(void);
 
 // True if `variant` was actually fitted for the active filter/Fs
 // (ENV_FILTER_VARIANT + SAMPLE_RATE_HZ, config.h) - ENV_GDEQ_VARIANT_DEFAULT
-// is always true; ENV_GDEQ_VARIANT_AA_CANDIDATE/_CANDIDATE_B follow
-// ENV_GDEQ_HAS_AA_CANDIDATE/ENV_GDEQ_HAS_CANDIDATE_B above. Used by the
+// is always true; ENV_GDEQ_VARIANT_AA_CANDIDATE/_CANDIDATE_B/_A_CANDIDATE
+// follow ENV_GDEQ_HAS_AA_CANDIDATE/ENV_GDEQ_HAS_CANDIDATE_B/ENV_GDEQ_HAS_
+// A_CANDIDATE above. Used by the
 // 'G' serial handler to skip over unfitted variants when cycling, rather
 // than landing on a coefficient pair that was never fit for this build -
 // same "never silently run with an unfit pair" discipline

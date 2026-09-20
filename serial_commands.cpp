@@ -678,6 +678,18 @@ void handle_serial_commands(void)
                              "the default pair need '['/']'/';'/apostrophe tuned within a 2.00-2.10 "
                              "sample compromise window (IMD orders trade off inside it). See "
                              "group_delay_fit_notes.md.";
+                } else if (next_variant == ENV_GDEQ_VARIANT_A_CANDIDATE) {
+                    // 2026-09-20: shelf1-only fit (new PSU, 'A' left off) -
+                    // see envelope_gdeq.h's matching header entry for the
+                    // full derivation. NOT YET bench-tested with gdeq
+                    // actually switched on - keep this caveat honest until
+                    // that happens, same discipline as candidate B's own
+                    // introduction above.
+                    caveat = " - 2026-09-20 fit (HiRes_aD_TF_New_5V_psu.txt, shelf1-only, new PSU): "
+                             "matches bare full-band p-p exactly (no dispersion cost) while roughly "
+                             "halving the local 2800-4500Hz slope. MODEL PREDICTION ONLY - not yet "
+                             "bench-tested with gdeq on, no IMD check yet. Re-tune '['/']' from "
+                             "scratch. See envelope_gdeq.h / group_delay_fit_notes.md.";
                 } else {
                     caveat = " - re-tune '['/']' back toward the default's own bench optimum "
                              "(2 samples, g+a+A config).";
@@ -1080,7 +1092,7 @@ void handle_serial_commands(void)
             // this function's header comment's env_gdeq_variant note.
             static const char *k_gdeq_variant_enum_name[ENV_GDEQ_VARIANT_COUNT] = {
                 "ENV_GDEQ_VARIANT_DEFAULT", "ENV_GDEQ_VARIANT_AA_CANDIDATE",
-                "ENV_GDEQ_VARIANT_CANDIDATE_B"
+                "ENV_GDEQ_VARIANT_CANDIDATE_B", "ENV_GDEQ_VARIANT_A_CANDIDATE"
             };
             serial_reply("-> settings line (paste into settingsPresets[] in settings.h, then rename \"Live\"):\r\n");
             serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s, %s, %s, %s, %s },\r\n",
