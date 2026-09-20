@@ -5,42 +5,30 @@
 #include "envelope_predistort.h"
 
 // Desired linear envelope [0,1] -> commanded PWM duty [0,1], 65 points
-// (64 equal bins). REVISION 6 - see envelope_predistort.h for the full
-// derivation and how this compares to REVISION 5. Built the same way as
-// REVISIONS 4-5 (direct duty sweep 1-1023 via 'd'/'>'/'<'/'N'/'B', dBm
-// read at every count including a tight 3-reading repeatability check at
-// duty=1023, isotonic-regression-smoothed then PCHIP-inverted). This
-// sweep's floor and ceiling both moved versus REVISION 5 from two
-// confirmed, stacked causes: 10dB less RX attenuation (30dB pad vs.
-// REVISION 5's 40dB), plus a deliberate RSET/PWM gate-drive redesign
-// (MOSFET gate now 0.94V at duty=0 up to 3.38V at duty=1023, engineered
-// to not compromise BJT bias or filter/group-delay stability) that
-// genuinely spreads real output across more of the duty range - see
-// envelope_predistort.h for the attenuation-corrected duty-matched
-// comparison that separates the two effects. LUT[0]=0.0010 (duty=1), same
-// convention as every prior revision - the strictly-pooled floor block is
-// now just duty=1 alone, but the climb off it is far more gradual in dBm
-// terms than REVISION 5's (a real gain-reduction effect, not just a
-// pooling artifact), so normalized output doesn't reach 1% of full swing
-// until duty~166 (REVISION 5: duty~56) - a genuinely longer practical
-// dead zone. LUT[64]=1.0000 (duty=1023, the measured maximum, mean of 3
-// repeats within 0.002dB of each other) also matches prior convention.
-// This revision's top end is genuinely better resolved than REVISION 5's,
-// confirmed real by the attenuation-corrected comparison: only duty
-// 870-1023 (~15% of the range) sits within 0.3dB of saturation, versus
-// REVISION 5's duty 653-1023 (~36%), so the final table bin
-// (LUT[63]=0.8957/duty~916 to LUT[64]=1.0000/duty=1023, a 107-count span)
-// compresses far less than REVISION 5's 370-count final bin - see
-// envelope_predistort.h.
+// (64 equal bins). REVISION 7 - see envelope_predistort.h for the full
+// derivation, including the duty-for-duty comparison against REVISION 6
+// that isolated a real (non-uniform) ~1.6dB shift concentrated in the
+// turn-on knee, plausibly tied to the 5V PSU rework this revision was
+// built to check. Built the same exhaustive-sweep way as REVISIONS 4-6
+// (direct duty sweep, dBm read at every count, isotonic-regression-
+// smoothed then PCHIP-inverted), but the first sweep to include duty=0
+// itself (0-1023, 1024 points) rather than starting at duty=1, and
+// without REVISION 6's repeated duty=1023 anchor reading. LUT[0]=0.0000
+// (duty=0, the true hardware floor - not a "lowest tied duty" stand-in
+// like every prior revision needed). LUT[64]=1.0000 (duty=1023) anchors
+// to REVISION 6's ceiling by construction. Through the climb, commanded
+// duty runs a few PWM counts above REVISION 6's at the same table index
+// (see envelope_predistort.h for the full duty-for-duty dBm comparison
+// that separates this from a simple calibration offset).
 static const float ENV_PREDISTORT_LUT[65] = {
-    0.0010f, 0.1766f, 0.2021f, 0.2229f, 0.2390f, 0.2555f, 0.2684f, 0.2807f,
-    0.2908f, 0.3066f, 0.3170f, 0.3282f, 0.3372f, 0.3475f, 0.3580f, 0.3676f,
-    0.3758f, 0.3865f, 0.4030f, 0.4130f, 0.4225f, 0.4315f, 0.4412f, 0.4454f,
-    0.4575f, 0.4669f, 0.4769f, 0.4866f, 0.4954f, 0.5039f, 0.5121f, 0.5215f,
-    0.5283f, 0.5385f, 0.5479f, 0.5572f, 0.5665f, 0.5758f, 0.5851f, 0.5945f,
-    0.6038f, 0.6133f, 0.6226f, 0.6321f, 0.6410f, 0.6506f, 0.6604f, 0.6698f,
-    0.6794f, 0.6892f, 0.6995f, 0.7092f, 0.7192f, 0.7293f, 0.7396f, 0.7500f,
-    0.7614f, 0.7724f, 0.7843f, 0.7976f, 0.8124f, 0.8310f, 0.8550f, 0.8957f,
+    0.0000f, 0.1828f, 0.2104f, 0.2302f, 0.2460f, 0.2614f, 0.2742f, 0.2874f,
+    0.2995f, 0.3110f, 0.3225f, 0.3329f, 0.3440f, 0.3550f, 0.3646f, 0.3749f,
+    0.3846f, 0.3943f, 0.4035f, 0.4141f, 0.4232f, 0.4330f, 0.4433f, 0.4530f,
+    0.4618f, 0.4724f, 0.4810f, 0.4903f, 0.4995f, 0.5089f, 0.5185f, 0.5275f,
+    0.5375f, 0.5468f, 0.5554f, 0.5659f, 0.5746f, 0.5838f, 0.5930f, 0.6026f,
+    0.6119f, 0.6211f, 0.6298f, 0.6392f, 0.6485f, 0.6584f, 0.6679f, 0.6771f,
+    0.6871f, 0.6969f, 0.7066f, 0.7157f, 0.7268f, 0.7369f, 0.7467f, 0.7580f,
+    0.7691f, 0.7801f, 0.7926f, 0.8049f, 0.8203f, 0.8372f, 0.8610f, 0.8988f,
     1.0000f,
 };
 #define ENV_PREDISTORT_LUT_LAST_IDX 64   // ENV_PREDISTORT_LUT's last valid index

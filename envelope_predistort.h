@@ -208,7 +208,7 @@
  * the duty axis has moved again, more this time at the top than the
  * bottom.
  *
- * REVISION 6 (current): same exhaustive duty=1..1023 direct-sweep
+ * REVISION 6 (superseded): same exhaustive duty=1..1023 direct-sweep
  * methodology as REVISIONS 4-5 (dBm -> linear amplitude via 10^(dBm/20),
  * isotonic-regression/PAVA smoothing to enforce monotonicity while
  * removing single-count measurement noise, normalize to [0,1], PCHIP
@@ -303,6 +303,88 @@
  * exactly the kind of shift a static AM table can't tell you about on
  * its own. Still off by default, same convention.
  *
+ * REVISION 7 (current): built to answer a direct question, not just to
+ * refresh stale data - after the 5V PSU rail was reworked (previously
+ * off-spec, now "a proper 5V"), the concern was whether the RSET/PWM
+ * filter's DC-critical operating point moved, since its correctness
+ * depends on that rail. Same exhaustive-sweep methodology as REVISIONS
+ * 4-6, but for the FIRST TIME including duty=0 itself (previous sweeps
+ * started at duty=1) - 1024 points, duty 0 through 1023, one reading
+ * each, no repeats at any single duty (REVISION 6's 3-reading ceiling
+ * repeatability check was not repeated here - a known, minor reduction in
+ * confidence at that one anchor point, flagged rather than silently
+ * carried over).
+ *
+ * Floor and ceiling both land close to REVISION 6's: isotonic floor
+ * (duty 0-3, tied) reads -87.13 to -87.16dBm here vs. REVISION 6's
+ * -87.24dBm (duty=1 alone) - only ~0.1dB different. Ceiling (duty=1023)
+ * reads -28.38dBm here vs. REVISION 6's -28.80dBm - a larger, ~0.42dB
+ * difference. Because floor and ceiling moved by DIFFERENT amounts, this
+ * can't be only a uniform measurement-chain offset (a pad/cal difference
+ * would shift both ends equally) - there's a real, if modest, shape
+ * change to account for, unlike a same-attenuation same-session repeat
+ * would show.
+ *
+ * Isolating it the same way REVISION 6 isolated its own two stacked
+ * causes: reconstruct REVISION 6's dBm-vs-duty curve from its stored LUT
+ * (inverting the 65-point table back through its own floor/ceiling), then
+ * compare THIS sweep's directly-measured dBm at those same duty values,
+ * duty-for-duty, after removing the uniform +0.42dB ceiling-anchored
+ * offset. The residual isn't flat: it's near zero at duty=1023 (anchor
+ * point, zero by construction) and duty~900+ (within ~0.03dB), drifts
+ * negative (this sweep reading WEAKER than REVISION 6, correcting for the
+ * uniform offset) through the upper-mid climb (roughly -0.1 to -0.25dB,
+ * duty 400-850), and dips to its worst, about -1.6dB, right in the
+ * turn-on knee around duty~200-210 - before climbing back to only about
+ * -0.3dB near the floor (duty~1). A dip concentrated in the turn-on knee
+ * and converging at both the very bottom and the very top is the same
+ * qualitative signature REVISION 4->5's confirmed PNP-bias-starvation fix
+ * produced (bias-current-dependent nonlinearity shows up hardest in the
+ * transition region, not at the flat extremes) - consistent with, though
+ * not conclusive proof of, the DC-critical filter's operating point
+ * having shifted slightly now that the rail feeding it is accurate. No
+ * controlled same-session A/B against the OLD (off-spec) PSU exists to
+ * compare against, so ordinary session-to-session measurement variation
+ * (different day, connector reseat, ambient temperature) can't be fully
+ * ruled out as a contributing or alternative explanation - flagged as a
+ * real open uncertainty, not papered over. What IS clear either way: the
+ * effect, whatever its exact cause, is small - at most ~1.6dB - compared
+ * to the tens-of-dB shifts REVISION 5->6 traced to deliberate hardware
+ * redesign, so this is a refinement, not evidence of a major regression.
+ *
+ * In LUT terms: dead zone is duty 0-3 (tied), a shade wider than
+ * REVISION 6's single-point duty=1 floor, though that's partly just this
+ * being the first sweep to actually measure duty=0 rather than a real
+ * widening. LUT[0]=0.0000 (duty=0 - the true hardware zero, not the
+ * "lowest duty in the tied block" placeholder every prior revision needed
+ * because none of them had measured duty=0 directly). Through most of the
+ * climb (envelope index 1 through ~23), commanded duty runs a
+ * consistent +0.004 to +0.009 (roughly 4-9 PWM counts) ABOVE REVISION 6's
+ * at the same table index, tracking the knee-region dip found above; by
+ * the mid-to-upper climb the gap narrows to near-zero, and LUT[64]=1.0000
+ * (duty=1023) matches REVISION 6 exactly by construction (both anchor
+ * there). This table's own resolution check (65-point piecewise-linear
+ * vs. the dense 1024-point ground truth) is excellent through 5-95%
+ * envelope (RMS well under 1 count, max under 1 count) - as good as
+ * REVISION 6 managed - but shows large apparent error in the bottom 0-5%
+ * of envelope (RMS ~63 counts, max ~105 counts at duty=127): this is the
+ * same well-documented "dead-zone-plus-turn-on collapses into the first
+ * bin" effect every revision's own notes have flagged since REVISION 4
+ * (real commanded duty needs to sweep from ~0 to ~190 within envelope
+ * 0-1.5%, which one straight LUT segment can only approximate crudely),
+ * not a new defect specific to this revision. The 95-100% top plateau
+ * shows moderate error (RMS ~11 counts, max ~19 counts at the knee
+ * between the last two grid points), similar in kind to REVISION 4's own
+ * documented top-plateau limitation.
+ *
+ * NOT YET VALIDATED on real hardware beyond the measurement itself, same
+ * status every revision has carried at introduction. A two-tone/IMD
+ * re-check matters here for the same standing reason it has every time
+ * this table's duty axis moves - and doubly so this time, since the
+ * turn-on-knee dip found above is exactly the kind of bias-sensitive
+ * region a two-tone IMD sweep would be most likely to expose if it
+ * matters in practice. Still off by default, same convention.
+ *
  * PCHIP specifically (not a plain cubic spline), all revisions, to
  * avoid overshoot/ringing through the steep BS170 turn-on region, which
  * would break the monotonicity a pre-distortion table depends on to be
@@ -373,7 +455,23 @@
  * for the same reason REVISION 4->5's did: a gate-drive range this
  * different moves where turn-on and any bias-adjacent nonlinearity sit
  * in duty terms, which this static AM table can't confirm on its own.
- * Still off by default, same convention.
+ * SUPERSEDED by REVISION 7.
+ *
+ * REVISION 7 NOT YET VALIDATED ON REAL HARDWARE beyond the measurement
+ * itself either - see REVISION 7's own notes above. Built specifically to
+ * check whether the 5V PSU rework moved the DC-critical filter's
+ * operating point; found a real (non-uniform, not just a calibration
+ * offset), modest shift concentrated in the turn-on knee (~1.6dB at
+ * worst around duty~200-210), converging to near-zero at both the floor
+ * and the full-duty ceiling - a shape consistent with (not conclusively
+ * proof of) the PSU fix affecting bias-dependent nonlinearity in exactly
+ * the region REVISION 4->5's PNP-bias history already flagged as
+ * sensitive to this kind of thing. Ordinary session-to-session
+ * measurement variation can't be fully excluded as a contributing factor
+ * given no controlled same-session A/B against the old PSU exists. A
+ * two-tone/IMD re-check matters here more than usual, precisely because
+ * the moved region is the bias-sensitive knee. Still off by default, same
+ * convention.
  */
 
 #include <stdbool.h>
