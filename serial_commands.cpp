@@ -254,6 +254,14 @@ void handle_serial_commands(void)
             serial_reply("-> single-tone test signal (%.0fHz)\r\n", SINGLETONE_HZ);
         } else if (c == 'm' && src != AUDIO_SRC_MIC) {
             dsp_state_set_audio_source(AUDIO_SRC_MIC);
+            // 2026-09-21: re-baseline the ADC resampler's calibration
+            // window on every entry into mic mode - adc_continuous keeps
+            // running (and counting samples) regardless of audio source,
+            // but the resampler's own call-count only advances in mic
+            // mode, so a stale baseline here would corrupt the next
+            // calibration's measured ratio. See adc_capture.h's own
+            // comment on adc_capture_resample_prime_calibration().
+            adc_capture_resample_prime_calibration();
             serial_reply("-> live mic input\r\n");
         } else if (c == 'p' && src != AUDIO_SRC_ENVSTEP) {
             dsp_state_set_audio_source(AUDIO_SRC_ENVSTEP);
@@ -1119,6 +1127,12 @@ void handle_serial_commands(void)
             const PersistentSettings& p = settingsPresets[preset];
 
             dsp_state_set_audio_source(p.audio_source);
+            if (p.audio_source == AUDIO_SRC_MIC) {
+                // Same re-baseline as the 'm' handler above - a preset
+                // can switch INTO mic mode just as directly as typing
+                // 'm' can, and needs the same fresh calibration start.
+                adc_capture_resample_prime_calibration();
+            }
 #if AD9851_ATTACHED
             // relative_delay only exists under AD9851_ATTACHED (see
             // relative_delay.h) - guarded the same way here, so this

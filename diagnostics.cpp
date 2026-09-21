@@ -2754,6 +2754,26 @@ static void print_timing_and_adc_block(uint32_t now)
                                   long_avg_tps, tick_error_pct, SAMPLE_RATE_HZ,
                                   true_ratio, ADC_SAMPLES_PER_TICK);
                 }
+
+                // 2026-09-20: the fractional resampler in adc_capture.cpp
+                // (adc_capture_read_next_sample()) now measures its OWN
+                // true_ratio independently, from a different pair of
+                // counters (its own call count vs. the raw ISR sample
+                // total, not this print's separate dsp-tick-count/esp_timer
+                // pairing) - printed here purely as a cross-check. The two
+                // should converge to close to the same number; a
+                // persistent, non-noise-sized disagreement between them
+                // would itself be worth investigating rather than trusted
+                // blindly. Not "not calibrated yet" until at least one
+                // ADC_RATIO_CALIB_WINDOW_CALLS window (~4s) has completed.
+                if (diag_room_for(120)) {
+                    if (adc_capture_ratio_is_calibrated()) {
+                        Serial.printf("[resamp] calibrated true_ratio=%.4f (cross-check vs [dsp] true_ratio above)\r\n",
+                                      adc_capture_get_true_ratio());
+                    } else {
+                        Serial.printf("[resamp] not yet calibrated (first ~4s window still filling)\r\n");
+                    }
+                }
             }
         }
         if (diag_room_for(130)) {

@@ -62,6 +62,47 @@ static volatile uint32_t s_dbg_adc_fifo_max_available = 0;
 static volatile uint32_t s_dbg_adc_fifo_drop_count = 0;
 static int64_t s_adc_start_us = 0;
 
+// ---- Fractional resampler state (see adc_capture_read_next_sample()'s
+// own comment in adc_capture.h for the full design) - all task-context
+// only, touched exclusively from adc_capture_read_next_sample() and
+// adc_capture_reset_diag(), never from the ISR. ----
+//
+// 2026-09-20, BUGFIX: the original version of this block kept a single
+// ever-growing `float s_virtual_pos`, incremented by s_true_ratio (~4-5)
+// every dsp tick forever. float32 can only represent integers EXACTLY up
+// to 2^24 (16,777,216) - at ~64,000-80,000 increments/sec (true_ratio x
+// 16000 ticks/sec), that ceiling is reached in under 5 minutes of
+// continuous mic-mode operation. Past it, each addition silently rounds
+// to the nearest representable step (ULP doubling at every power-of-2
+// magnitude boundary beyond that point), corrupting both the per-tick
+// sample-count decision AND the interpolation fraction derived from it -
+// a real, physically-guaranteed source of new timing jitter/distortion
+// that gets WORSE the longer the board has been running, entirely
+// separate from (and probably worse than) the original ADC-rate-mismatch
+// artifact this resampler was built to fix. This is very likely what
+// user testing reported as new "noise products/IMD" after the first cut
+// of this code. Fixed by replacing the unbounded position with a BOUNDED
+// [0,1) phase accumulator (s_phase, always small - see
+// adc_capture_read_next_sample()) plus an exact-integer cumulative
+// target (s_resample_target_cumulative, uint32_t - integer accumulation
+// never loses precision short of a ~16.5-hour wraparound, which unsigned
+// arithmetic handles correctly via modular subtraction). Mathematically
+// equivalent to the original design's intent, verified by hand (floor/
+// frac decomposition telescopes correctly - see null_bias_investigation.md's
+// 2026-09-20 entry for the derivation) - just computed without ever
+// storing a large accumulating float.
+static float    s_true_ratio          = (float)ADC_SAMPLES_PER_TICK;  // calibrated Fs_adc/Fs_dsp ratio; seeded nominal until first window completes
+static bool     s_ratio_calibrated    = false;
+static uint32_t s_ratio_calib_start_samples = 0;   // s_dbg_adc_samples_total snapshot at window start
+static uint32_t s_ratio_calib_start_calls   = 0;   // s_resample_call_count snapshot at window start
+static uint32_t s_resample_call_count = 0;         // total calls to adc_capture_read_next_sample()
+static uint32_t s_resample_total_consumed = 0;     // total raw samples actually popped+filtered so far
+#define ADC_RESAMPLE_LOOKAHEAD_SAMPLES 2u   // need both bracket samples already filtered to interpolate - see read_next_sample()
+static uint32_t s_resample_target_cumulative = ADC_RESAMPLE_LOOKAHEAD_SAMPLES;  // exact-integer running target = floor(ideal position) + lookahead
+static float    s_phase               = 0.0f;      // BOUNDED [0,1) fractional accumulator - never grows, precision-safe indefinitely
+static float    s_filt_prev           = 2048.0f;   // filtered sample at the ideal floor position   - interpolation bracket
+static float    s_filt_curr           = 2048.0f;   // filtered sample one raw sample ahead of it     - interpolation bracket
+
 // adc_continuous's on_conv_done callback - ISR context, fires once per
 // completed conversion frame. edata->conv_frame_buffer is a direct
 // pointer into driver-owned memory (never free it) containing that
@@ -258,7 +299,6 @@ void adc_capture_init(void)
 
 float IRAM_ATTR adc_capture_read_next_sample(void)
 {
-    static float s_last_filtered_adc = 2048.0f;
     adc_lpf_mode_t mode = s_adc_lpf_mode;
 
     uint32_t tail = s_adc_fifo_tail;
@@ -269,58 +309,107 @@ float IRAM_ATTR adc_capture_read_next_sample(void)
     if (available > s_dbg_adc_fifo_max_available) s_dbg_adc_fifo_max_available = available;
     if (available < ADC_SAMPLES_PER_TICK) s_dbg_adc_fifo_starve_count++;
 
-    // Nominal N/tick whenever that many are genuinely available - NOT
-    // "everything available up to the cap" (an earlier version did that,
-    // which greedily drained the FIFO to near-zero the instant any burst
-    // landed, then starved for the next several ticks until the next one
-    // arrived - reintroducing the exact zero-order-hold staircase problem
-    // this whole FIFO design was meant to fix).
-    //
-    // The "+1" branch handles the small persistent surplus (true_ratio
-    // measured ~4.032 at the old 9600Hz rate, not exactly the nominal
-    // ratio - see diagnostics.cpp's long-window [dsp] print) by
-    // opportunistically taking one extra sample whenever one happens to
-    // already be waiting, continuously bleeding off the surplus in the
-    // smallest possible increment. Without this, a fixed cap-of-32
-    // catch-up threshold (see ADC_SAMPLES_PER_TICK_MAX) still works, but
-    // a slow surplus takes many tens of ms to accumulate enough to
-    // trigger it - producing periodic gulps that show up as regular
-    // visible/audible spikes. Soaking up 1 extra sample at a time instead
-    // means the correction is spread continuously rather than
-    // concentrated into periodic jolts.
-    //
-    // ADC_SAMPLES_PER_TICK_MAX is still checked first and kept as a
-    // genuine-backlog fallback (startup, mode switch) - that scenario
-    // needs to recover fast, not trickle back 1 sample at a time.
-    uint32_t to_pop;
-    if (available > ADC_SAMPLES_PER_TICK_MAX) {
-        to_pop = ADC_SAMPLES_PER_TICK_MAX;              // genuine backlog - catch up fast
-    } else if (available >= ADC_SAMPLES_PER_TICK + 1) {
-        to_pop = ADC_SAMPLES_PER_TICK + 1;              // small surplus present - bleed off 1
-    } else if (available >= ADC_SAMPLES_PER_TICK) {
-        to_pop = ADC_SAMPLES_PER_TICK;                  // normal case - steady nominal pace
-    } else {
-        to_pop = available;                              // genuinely starved - take what's there
+    // --- Periodic recalibration of the true Fs_adc/Fs_dsp ratio - see
+    // this function's doc comment in adc_capture.h for the full design
+    // rationale. Cheap (one subtraction + one division) and only runs
+    // once every ADC_RATIO_CALIB_WINDOW_CALLS calls, so no per-tick cost
+    // beyond the counter increment. ---
+    s_resample_call_count++;
+    uint32_t calls_since_calib = s_resample_call_count - s_ratio_calib_start_calls;
+    if (calls_since_calib >= ADC_RATIO_CALIB_WINDOW_CALLS) {
+        uint32_t samples_now = s_dbg_adc_samples_total;
+        uint32_t d_samples = samples_now - s_ratio_calib_start_samples;
+        if (calls_since_calib > 0) {
+            float measured = (float)d_samples / (float)calls_since_calib;
+            // Defensive sanity clamp - a real measurement should sit close
+            // to ADC_SAMPLES_PER_TICK; guards against ever feeding a
+            // garbage ratio into s_phase's recurrence below (e.g. from an
+            // unexpected counter reset mid-window) rather than trusting
+            // the arithmetic blindly.
+            if (measured >= 1.0f && measured <= (float)ADC_SAMPLES_PER_TICK_MAX) {
+                s_true_ratio = measured;
+                s_ratio_calibrated = true;
+            }
+        }
+        s_ratio_calib_start_samples = samples_now;
+        s_ratio_calib_start_calls   = s_resample_call_count;
+    }
+
+    // --- Fractional resampler: advance a BOUNDED [0,1) phase accumulator
+    // by the (calibrated) true ratio each tick - never an ever-growing
+    // absolute position (see the BUGFIX comment on this state block for
+    // why that matters) - then fold the integer part into an exact-
+    // integer running target to figure out how many NEW raw samples need
+    // to be popped+filtered to keep one full interpolation bracket
+    // (ADC_RESAMPLE_LOOKAHEAD_SAMPLES) ahead of the ideal position. ---
+    s_phase += s_true_ratio;
+    uint32_t whole = (uint32_t)floorf(s_phase);
+    s_phase -= (float)whole;   // back to [0,1) - this IS the interpolation weight for this tick's output
+    s_resample_target_cumulative += whole;
+    uint32_t desired_to_pop = (s_resample_target_cumulative > s_resample_total_consumed)
+                                  ? (s_resample_target_cumulative - s_resample_total_consumed)
+                                  : 0;
+
+    // Same two safety tiers as the old scheme, just guarding the new
+    // desired_to_pop instead of a hardcoded nominal+1: a genuine backlog
+    // (startup, mode switch) still needs to catch up fast rather than
+    // trickle back one interpolation-bracket sample at a time, and a
+    // genuinely starved FIFO still just takes what's there. Both are rare/
+    // transient - s_phase and s_resample_target_cumulative keep advancing
+    // regardless (they don't depend on to_pop actually being reached), so
+    // desired_to_pop on a later tick automatically includes any backlog
+    // still owed - normal ticks resume exactly where they should once the
+    // anomaly clears, same self-correcting behavior as the original
+    // integer bleed scheme had.
+    uint32_t to_pop = desired_to_pop;
+    if (to_pop > ADC_SAMPLES_PER_TICK_MAX) {
+        to_pop = ADC_SAMPLES_PER_TICK_MAX;   // genuine backlog - catch up fast
+    }
+    if (to_pop > available) {
+        to_pop = available;                  // genuinely starved - take what's there
     }
     for (uint32_t i = 0; i < to_pop; i++) {
         float raw = (float)s_adc_fifo[tail];
+        float filtered;
         switch (mode) {
             case ADC_LPF_MODE_BUTTERWORTH:
-                s_last_filtered_adc = ssb_biquad4_process(&s_adc_lpf_butterworth, raw);
+                filtered = ssb_biquad4_process(&s_adc_lpf_butterworth, raw);
                 break;
             case ADC_LPF_MODE_CHEBYSHEV:
-                s_last_filtered_adc = ssb_biquad4_process(&s_adc_lpf_chebyshev, raw);
+                filtered = ssb_biquad4_process(&s_adc_lpf_chebyshev, raw);
                 break;
             case ADC_LPF_MODE_OFF:
             default:
-                s_last_filtered_adc = raw;
+                filtered = raw;
                 break;
         }
+        s_filt_prev = s_filt_curr;
+        s_filt_curr = filtered;
         tail = (tail + 1) & ADC_FIFO_MASK;
     }
     s_adc_fifo_tail = tail;
+    s_resample_total_consumed += to_pop;
 
-    return s_last_filtered_adc;
+    // Linear interpolation between the two bracketing filtered samples, at
+    // s_phase - the bounded fractional remainder computed above, which IS
+    // exactly the leftover position (proven algebraically equivalent to
+    // frac(ideal absolute position) - see the BUGFIX comment on this
+    // state block). If to_pop was clamped short (starvation/backlog),
+    // s_filt_prev/s_filt_curr lag behind the ideal bracket and this
+    // degrades gracefully to a slightly stale interpolation - the same
+    // kind of graceful degradation the old scheme had during those same
+    // anomalies, not a new failure mode.
+    return s_filt_prev + s_phase * (s_filt_curr - s_filt_prev);
+}
+
+float adc_capture_get_true_ratio(void)
+{
+    return s_true_ratio;
+}
+
+bool adc_capture_ratio_is_calibrated(void)
+{
+    return s_ratio_calibrated;
 }
 
 void adc_capture_service(void)
@@ -385,6 +474,34 @@ const char *adc_capture_lpf_mode_name(adc_lpf_mode_t mode)
     }
 }
 
+// 2026-09-21, BUGFIX: found by reasoning through a user-reported
+// intermittent "funny mode with strange IMDs" seen on both 64k and 80k
+// (i.e. independent of ADC_CONT_SAMPLE_FREQ_HZ - pointing at something in
+// the shared resampler/calibration logic or a mode interaction, not the
+// ADC rate itself). adc_capture_read_next_sample() - and therefore
+// s_resample_call_count and the calibration window it drives - is only
+// ever called in mic mode (see that function's own doc comment); but
+// adc_continuous itself, and s_dbg_adc_samples_total with it, runs
+// UNCONDITIONALLY regardless of audio source (see adc_capture_service()'s
+// comment). So: spend any time in a non-mic mode ('s'/'t'/etc.), switch
+// back to 'm', and the very next calibration window measures
+// (samples produced during the ENTIRE non-mic interval, however long)
+// divided by (only that window's ~4s worth of calls) - a badly inflated
+// ratio. The defensive clamp in the calibration block below rejects the
+// most extreme cases (long time away), but a shorter mode excursion can
+// land the inflated value just within the accepted range, corrupting
+// s_true_ratio with a wrong-but-plausible-looking number and putting the
+// resampler into exactly the kind of "funny mode" reported. Fixed by
+// priming a fresh calibration baseline every time mic mode is
+// (re-)entered - see adc_capture_resample_prime_calibration() below and
+// its call sites in serial_commands.cpp - rather than only at boot and on
+// a manual 'r'.
+void adc_capture_resample_prime_calibration(void)
+{
+    s_ratio_calib_start_samples = s_dbg_adc_samples_total;
+    s_ratio_calib_start_calls   = s_resample_call_count;
+}
+
 void adc_capture_reset_diag(void)
 {
     s_dbg_adc_samples_total = 0;
@@ -395,6 +512,17 @@ void adc_capture_reset_diag(void)
     s_dbg_adc_fifo_max_available = 0;
     s_dbg_adc_fifo_drop_count = 0;
     s_adc_start_us = esp_timer_get_time();   // restarts the long-window average from now
+
+    // Restart the resampler's own calibration window from here too, so a
+    // manual 'r' reset gives a clean, from-now measurement rather than
+    // blending in whatever ratio was calibrated before the reset - kept
+    // deliberately consistent with the long-window average restart above.
+    // s_true_ratio itself (and s_ratio_calibrated) are intentionally left
+    // as-is: they're the best current estimate of the real hardware ratio
+    // and resetting them to the nominal seed would throw away a real
+    // measurement for no reason, unlike the diagnostic counters above
+    // which are just accumulators being zeroed.
+    adc_capture_resample_prime_calibration();
 }
 
 void adc_capture_get_diag(adc_capture_diag_t *out)

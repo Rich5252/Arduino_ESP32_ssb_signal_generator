@@ -121,7 +121,7 @@
 // tried before the whole experiment was called off - "keep the dB we've
 // already got" took priority. Left here for the next time someone's
 // tempted to touch this knob again.
-#define ADC_CONT_SAMPLE_FREQ_HZ   80000u   // within ESP32-S3's continuous-mode range
+#define ADC_CONT_SAMPLE_FREQ_HZ   64000u   // within ESP32-S3's continuous-mode range
 #define ADC_CONT_FRAME_SAMPLES    16    // DMA chunk size only now - see AVERAGING note above.
                                          // If adc_continuous_new_handle() errors on this, the
                                          // driver enforces a different frame-size constraint -
@@ -174,7 +174,7 @@
 //     Butterworth above 3000Hz at every order - at 4th order, e.g. -47.7dB
 //     vs -35.1dB at 8kHz, both converging to the same ultimate
 //     -24dB/octave slope far out (filter ORDER, not family, sets that).
-#define ADC_LPF_CUTOFF_HZ             2800.0f
+#define ADC_LPF_CUTOFF_HZ             3000.0f
 #define ADC_LPF_CHEBYSHEV_RIPPLE_DB   1.0f   // standard/commonly-cited spec; small (~1.4dB peak
                                               // at 4th order) in-band ripple bump in exchange for
                                               // the steeper rolloff above - inconsequential for
@@ -201,7 +201,29 @@
 // was tried and reverted - see ADC_CONT_SAMPLE_FREQ_HZ's own comment
 // above) - if either rate ever changes, check this stays an integer
 // division with zero remainder.
+//
+// 2026-09-20: this integer value is now ONLY the seed/reference point for
+// the fractional resampler below (adc_capture_read_next_sample()'s actual
+// per-tick pop count is driven by a MEASURED true_ratio, not this nominal
+// integer) - see that function's own comment block for why. Left defined
+// here unchanged (still used by ADC_SAMPLES_PER_TICK_MAX and diagnostic
+// printing, and it's still a real invariant worth keeping true - a
+// nonzero remainder here means SAMPLE_RATE_HZ itself isn't an integer
+// multiple away from ADC_CONT_SAMPLE_FREQ_HZ, e.g. 65000/16000, which
+// silently truncates and previously caused a NEW code-introduced ~1.5%
+// decimation error entirely separate from the ADC's own clock inaccuracy -
+// see moving_forward_notes.md's 2026-09-20 entries).
 #define ADC_SAMPLES_PER_TICK       (ADC_CONT_SAMPLE_FREQ_HZ / SAMPLE_RATE_HZ)
+
+// How many dsp-tick calls to adc_capture_read_next_sample() to average
+// over before recomputing the resampler's calibrated true_ratio (see that
+// function's comment). ~4 seconds at 16kHz - long enough to be a genuinely
+// low-noise average (same "long-window" reasoning diagnostics.cpp already
+// uses for its own independent rate measurement - averaging error shrinks
+// with window length), short enough to still track slow drift (thermal,
+// supply voltage) across a session rather than freezing in whatever the
+// very first measurement happened to be.
+#define ADC_RATIO_CALIB_WINDOW_CALLS   (SAMPLE_RATE_HZ * 4u)
 
 // CATCH-UP THRESHOLD - separate from the nominal rate above. This is the
 // "genuine backlog" cutoff the drain logic uses: available <= this ->
@@ -226,15 +248,77 @@ typedef struct {
 // body. Call once from setup().
 void adc_capture_init(void);
 
-// Pops the next batch of raw ADC samples out of the FIFO (nominal
-// ADC_SAMPLES_PER_TICK, with the same catch-up/bleed-off logic the
-// original inline block in dsp_task had), runs each through the selected
-// biquad (or passes it through raw if OFF), and returns the last (most
-// recent) filtered value in ADC-code units (~0-4095) - exactly what
-// dsp_task used to keep in s_last_filtered_adc before normalizing to
-// [-1,1] and DC-blocking itself. Called once per dsp_task tick, mic mode
-// only.
+// Pops the next batch of raw ADC samples out of the FIFO, runs each
+// through the selected biquad (or passes it through raw if OFF), and
+// returns this tick's decimated output sample in ADC-code units
+// (~0-4095) - exactly what dsp_task used to keep in s_last_filtered_adc
+// before normalizing to [-1,1] and DC-blocking itself. Called once per
+// dsp_task tick, mic mode only.
+//
+// 2026-09-20: PROPER FRACTIONAL RESAMPLER, replacing the old fixed-
+// ADC_SAMPLES_PER_TICK + integer "+1 opportunistic bleed" scheme. Two
+// things changed, addressing the two separate problems that scheme had:
+//
+// (1) CALIBRATED, not assumed, true_ratio. This project's own bench
+//     history (moving_forward_notes.md/null_bias_investigation.md,
+//     2026-09-20 entries) confirmed the ADC's real achieved sample rate
+//     never exactly matches ADC_CONT_SAMPLE_FREQ_HZ - measured ~80645-
+//     80795 sps against a configured 80000, still off against a
+//     configured 64000 too - and that this doesn't correlate with how
+//     "clean" a divisor the configured value is of any reference clock
+//     (both 80000 and 64000 divide the 80MHz APB clock exactly; neither
+//     ADC rate came out exact). Rather than hardcoding any specific
+//     board's one-time measurement (which the user's own "it varies a
+//     bit" observation argues against anyway), this function measures
+//     its OWN true_ratio at runtime: every ADC_RATIO_CALIB_WINDOW_CALLS
+//     calls, it compares how many raw ADC samples actually arrived
+//     (s_dbg_adc_samples_total, ISR-incremented) against how many times
+//     it was itself called over that same window, and updates
+//     s_true_ratio to the real measured average. Seeded at the nominal
+//     ADC_SAMPLES_PER_TICK value until the first window completes.
+//
+// (2) True fractional-position tracking + linear interpolation, not a
+//     hard integer "pop N or N+1, return whichever raw sample happened
+//     to be last". A BOUNDED [0,1) phase accumulator (s_phase - NOT an
+//     ever-growing absolute position; see the 2026-09-20 BUGFIX comment
+//     on adc_capture.cpp's resampler state block for why that distinction
+//     is load-bearing, not cosmetic - a first version of this used an
+//     unbounded float position and silently lost precision after a few
+//     minutes of continuous operation, itself producing new audible
+//     distortion) accumulates by true_ratio every call; its integer part
+//     says how many raw samples should have been consumed by now, and the
+//     leftover fraction is used to linearly interpolate between the two
+//     bracketing already-filtered raw samples for this tick's output -
+//     spreading the correction smoothly across every tick instead of
+//     concentrating it into periodic +1 "gulp" events. Each raw sample is
+//     still individually run through the LPF, in order, so the anti-alias
+//     filter's own time-domain behavior is unaffected - only which
+//     already-filtered sample(s) get used for the tick's output changed.
+//     Adds a fixed ~1 raw-sample-period (~12-15us) latency vs. the old
+//     scheme (needs one sample of lookahead to interpolate) - inaudible,
+//     not a practical concern.
+//
+// Not yet bench-tested. adc_capture_get_true_ratio()/
+// adc_capture_ratio_is_calibrated() below exist specifically so this can
+// be watched on real hardware (compare the resampler's own calibrated
+// value against diagnostics.cpp's independently-computed long-window
+// true_ratio - they should converge to the same number as a cross-check)
+// before trusting it silences the 645Hz-class artifact rather than just
+// moving it.
 float IRAM_ATTR adc_capture_read_next_sample(void);
+
+// The resampler's own live-calibrated Fs_adc/Fs_dsp ratio (see
+// adc_capture_read_next_sample()'s comment above) - NaN-free by
+// construction (starts at the nominal ADC_SAMPLES_PER_TICK, only ever
+// reassigned from a real measured ratio). Exists for diagnostics.cpp to
+// print alongside its own independently-computed true_ratio, as a live
+// cross-check that the two measurement methods agree.
+float adc_capture_get_true_ratio(void);
+
+// True once at least one full ADC_RATIO_CALIB_WINDOW_CALLS window has
+// completed and adc_capture_get_true_ratio() reflects a real measurement
+// rather than the nominal seed value.
+bool adc_capture_ratio_is_calibrated(void);
 
 // Drains adc_continuous's internal pool so it doesn't overflow -
 // discards everything read. Low priority, not time-critical; call from
@@ -263,6 +347,21 @@ const char *adc_capture_lpf_mode_name(adc_lpf_mode_t mode);
 
 // Zeros every counter/watermark below (the 'r' command's ADC-side reset).
 void adc_capture_reset_diag(void);
+
+// 2026-09-21: primes the resampler's calibration-window baseline to
+// "now" - MUST be called every time audio_source transitions into
+// AUDIO_SRC_MIC (see serial_commands.cpp's 'm' handler and its numeric-
+// preset-apply path), not just at boot/'r'. adc_continuous runs (and
+// s_dbg_adc_samples_total keeps incrementing) unconditionally regardless
+// of audio source, but adc_capture_read_next_sample() - which is what
+// actually advances the calibration window - only runs in mic mode. Any
+// time spent in a non-mic mode between calibration windows leaves the
+// baseline stale relative to the ISR's sample count, corrupting the next
+// calibration's measured ratio (in the tell-tale, project-first-observed
+// form of an intermittent "funny mode with strange IMDs" after switching
+// back into mic - see moving_forward_notes.md's 2026-09-21 entry). Cheap
+// and safe to call even when already in mic mode - just re-baselines.
+void adc_capture_resample_prime_calibration(void);
 
 void adc_capture_get_diag(adc_capture_diag_t *out);
 
