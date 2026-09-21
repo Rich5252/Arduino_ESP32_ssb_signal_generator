@@ -185,7 +185,20 @@ typedef struct
     // a deliberate bench-testing choice, not any kind of default.
     env_gdeq_variant_t env_gdeq_variant;  // 'G' - envelope_gdeq.h, default by default
 
-
+    // Added 2026-09-21 when the ALC (envelope_alc.h) and Soft-Limit
+    // (envelope_softlimit.h) stages were introduced - appended at the END
+    // for the same reason every trailing field above was: every existing
+    // preset's POSITIONAL initializer list below still lines up unchanged
+    // (C zero-fills both to false, matching their off-by-default
+    // convention - neither is bench-validated yet), only these two new
+    // trailing values need adding to presets that want either deliberately
+    // on. Both plain bools, same shape as env_ampeq_enable/
+    // env_ampeq_shelf2_enable above - no reset-on-transition subtlety
+    // beyond what each module's own _set_enabled() already handles
+    // internally (unity-gain reset for ALC, none needed for the stateless
+    // Soft-Limit).
+    bool env_alc_enable;         // 'l' - envelope_alc.h, off by default
+    bool env_softlimit_enable;   // 'S' - envelope_softlimit.h, off by default
 
 } PersistentSettings;
 
@@ -269,7 +282,7 @@ SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM },
     // envelope_interp_curve
 
 // Preset 4 - Diagnostic / raw ADC
-{ "ReSync Micr", AUDIO_SRC_MIC, 2.68f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV, true, false, 33.3f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, false, false, ENV_GDEQ_VARIANT_DEFAULT},
+{ "ReSync Micr", AUDIO_SRC_MIC, 2.68f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV, true, false, 33.3f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, false, false, ENV_GDEQ_VARIANT_DEFAULT },
 
 // Preset 5 -
 { "V4 Microphone tunedD7", AUDIO_SRC_MIC, 2.03f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV, true, true, 19.3f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, true, true, ENV_GDEQ_VARIANT_CANDIDATE_B },

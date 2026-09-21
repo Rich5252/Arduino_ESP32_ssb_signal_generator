@@ -120,6 +120,8 @@
 #include "test_signals.h"
 #include "envelope_gdeq.h"
 #include "envelope_ampeq.h"
+#include "envelope_alc.h"
+#include "envelope_softlimit.h"
 #include "envelope_predistort.h"
 #include "envelope_floor.h"
 #if AD9851_ATTACHED
@@ -744,6 +746,21 @@ static void IRAM_ATTR dsp_task(void* arg)
         // shelf 1 via 'a', shelf 2 via 'A' (split 2026-09-04).
         envelope = envelope_ampeq_process(envelope);
 
+        // ALC (envelope_alc.h) then Soft-Limit (envelope_softlimit.h) -
+        // 2026-09-21, added per the user's explicit placement instruction:
+        // both run here, AFTER gdeq/ampeq (so they see the real post-shelf
+        // signal, including any overshoot shelf2 introduces) and BEFORE
+        // predistort/the DC mapping just below - "needs to go before
+        // Distortion correction since that is needed 'always'" - NOT
+        // merely before the final hard clamp a few lines down, since
+        // predistort itself sits between here and that clamp and must
+        // always run. Independently toggleable ('l' for ALC, 'S' for
+        // Soft-Limit) and both off by default - see each header for the
+        // full design rationale. Unconditional call site (same convention
+        // as gdeq/ampeq above): each function itself no-ops when disabled.
+        envelope = envelope_alc_process(envelope);
+        envelope = envelope_softlimit_process(envelope);
+
         // envelope is roughly [0,1] for typical mic levels but not
         // rigorously bounded - clamp before handing off either way.
         //
@@ -1056,7 +1073,7 @@ void setup()
             .presence_freq_hz = 2200.0f,
             .presence_gain_db = 2.0f,
             .presence_q = 1.0f,
-            .comp_threshold = 0.1f,
+            .comp_threshold = 0.3f,
             .comp_ratio = 3.5f,
             .comp_attack_ms = 3.0f,
             .comp_release_ms = 120.0f,
@@ -1083,6 +1100,13 @@ void setup()
     // envelope_ampeq.h. Same "always init, regardless of enabled
     // default" reasoning as envelope_gdeq_init() just above.
     envelope_ampeq_init();
+
+    // ALC (envelope_alc.h) and Soft-Limit (envelope_softlimit.h) - added
+    // 2026-09-21. Same "always init, regardless of enabled default"
+    // reasoning as envelope_gdeq_init()/envelope_ampeq_init() just above -
+    // enabling either later via 'l'/'S' doesn't need a separate init path.
+    envelope_alc_init();
+    envelope_softlimit_init();
 
     // Always started now, regardless of the initial audio source - needed
     // so the mic path is live and ready the moment a 't'/'s'/'m' serial

@@ -8,6 +8,8 @@
 #include "adc_capture.h"
 #include "envelope_gdeq.h"
 #include "envelope_ampeq.h"
+#include "envelope_alc.h"
+#include "envelope_softlimit.h"
 #include "envelope_predistort.h"
 #include "envelope_floor.h"
 #include "envelope_output.h"
@@ -626,6 +628,43 @@ void handle_serial_commands(void)
                                    "came back marginally WORSE combined with shelf 1 in this "
                                    "unrefit-gdeq state (see envelope_ampeq.h / group_delay_fit_notes.md) "
                                    "- re-run 'w' chirp/TFA to check the current combined response" : "");
+        } else if (c == 'l') {
+            // ALC (Automatic Level Control) - see envelope_alc.h. Added
+            // 2026-09-21 alongside 'S' (Soft-Limit) below, per the user's
+            // request for a graceful alternative to the final hard clamp,
+            // independently toggleable from Soft-Limit. Runs after
+            // gdeq/ampeq, before predistort/the DC mapping - NOT bench-
+            // validated yet, first-cut defaults (envelope_alc.h).
+            bool now_on = !envelope_alc_get_enabled();
+            envelope_alc_set_enabled(now_on);   // internally resets gain to unity on an off->on transition
+            serial_reply("-> envelope ALC (leveler) %s", now_on ? "ON" : "off");
+            if (now_on) {
+                serial_reply(" - target=%.2f attack=%.1fms release=%.1fms (envelope_alc.h) - "
+                             "NOT bench-validated yet, first-cut defaults. Soft-Limit ('S') is separate.\r\n",
+                             (double)ENV_ALC_TARGET_LEVEL, (double)ENV_ALC_ATTACK_MS, (double)ENV_ALC_RELEASE_MS);
+            } else {
+                serial_reply("\r\n");
+            }
+        } else if (c == 'S') {
+            // Soft-Limit (soft-knee saturation) - see envelope_softlimit.h.
+            // Independent of 'l' above, same reasoning. Runs immediately
+            // after 'l' in the pipeline, still before predistort - NOT
+            // bench-validated yet, first-cut defaults. Lower rail fixed at
+            // envelope=0.0 (the actual rail, not a tunable knee) as of the
+            // 2026-09-21 bugfix - see envelope_softlimit.h for why the
+            // original ENV_SOFTLIMIT_KNEE_LO=0.15 design injected a DC
+            // floor at low signal levels.
+            bool now_on = !envelope_softlimit_get_enabled();
+            envelope_softlimit_set_enabled(now_on);
+            serial_reply("-> envelope Soft-Limit (soft-knee saturation) %s", now_on ? "ON" : "off");
+            if (now_on) {
+                serial_reply(" - upper knee=%.2f, lower rail=0.0 (span=%.2f) (envelope_softlimit.h) - "
+                             "NOT bench-validated yet, first-cut defaults. ALC ('l') is separate; final "
+                             "safety clamp becomes a no-op while this is on.\r\n",
+                             (double)ENV_SOFTLIMIT_KNEE_HI, (double)ENV_SOFTLIMIT_LOWER_SPAN);
+            } else {
+                serial_reply("\r\n");
+            }
         } else if (c == 'G') {
             // Runtime CYCLE between the fitted gdeq coefficient sets -
             // added 2026-09-05 as a plain two-way toggle after the a+A
@@ -1004,7 +1043,8 @@ void handle_serial_commands(void)
             // compressor_enable, master_gain_db, ad9851_output_enable,
             // env_predistort_enable, env_floor, freq_dev_slew_limit_hz,
             // envelope_interp_enable, envelope_interp_curve,
-            // env_ampeq_enable, env_ampeq_shelf2_enable) -
+            // env_ampeq_enable, env_ampeq_shelf2_enable, env_gdeq_variant,
+            // env_alc_enable, env_softlimit_enable) -
             // wrapped in braces with a trailing comma so the whole line
             // can be pasted directly into settingsPresets[] in settings.h
             // as a new preset entry.
@@ -1061,6 +1101,15 @@ void handle_serial_commands(void)
             // PREDICTION ONLY, not yet bench-validated at all. Pasting
             // either non-default constant here is a deliberate
             // bench-testing choice, not this project's default.
+            //
+            // env_alc_enable ('l', envelope_alc.h) and env_softlimit_enable
+            // ('S', envelope_softlimit.h) are the newest trailing fields -
+            // added 2026-09-21. Both plain bools, printed the same way as
+            // env_ampeq_enable/env_ampeq_shelf2_enable above. NEITHER is
+            // bench-validated yet - pasting "true" for either here means
+            // that preset starts up with first-cut, unvalidated defaults
+            // active; current project recommendation is "false" for both
+            // until real-hardware testing says otherwise.
 #if AD9851_ATTACHED
             float rel_delay = relative_delay_get_samples();
             bool rf_enabled = carrier_output_get_rf_enabled();
@@ -1103,7 +1152,7 @@ void handle_serial_commands(void)
                 "ENV_GDEQ_VARIANT_CANDIDATE_B", "ENV_GDEQ_VARIANT_A_CANDIDATE"
             };
             serial_reply("-> settings line (paste into settingsPresets[] in settings.h, then rename \"Live\"):\r\n");
-            serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s, %s, %s, %s, %s },\r\n",
+            serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s, %s, %s, %s, %s, %s, %s },\r\n",
                           audio_source_enum_name(dsp_state_get_audio_source()),
                           rel_delay,
                           envelope_output_get_pwm_offset(),
@@ -1121,7 +1170,9 @@ void handle_serial_commands(void)
                           k_interp_curve_enum_name[envelope_interp_get_curve()],
                           envelope_ampeq_get_enabled() ? "true" : "false",
                           envelope_ampeq_shelf2_get_enabled() ? "true" : "false",
-                          k_gdeq_variant_enum_name[envelope_gdeq_get_variant()]);
+                          k_gdeq_variant_enum_name[envelope_gdeq_get_variant()],
+                          envelope_alc_get_enabled() ? "true" : "false",
+                          envelope_softlimit_get_enabled() ? "true" : "false");
         } else if (c >= '0' && c <= '9') {
             int preset = c - '0';
             const PersistentSettings& p = settingsPresets[preset];
@@ -1202,6 +1253,15 @@ void handle_serial_commands(void)
             // requested variant wasn't fitted (see envelope_gdeq.h) - safe
             // to call unconditionally either way.
             envelope_gdeq_set_variant(p.env_gdeq_variant);
+
+            // Same reset-on-enable reasoning as the 'l' handler - shared
+            // via envelope_alc_set_enabled() itself, so an off->on
+            // transition on preset load also resets gain to unity, not
+            // just when toggled live. envelope_softlimit_set_enabled() is
+            // a plain store (stateless module, no transition concern) -
+            // added 2026-09-21 alongside env_alc_enable/env_softlimit_enable.
+            envelope_alc_set_enabled(p.env_alc_enable);
+            envelope_softlimit_set_enabled(p.env_softlimit_enable);
 
             serial_reply("-> preset %d: %s\r\n", preset, p.name);
         }

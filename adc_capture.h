@@ -174,7 +174,7 @@
 //     Butterworth above 3000Hz at every order - at 4th order, e.g. -47.7dB
 //     vs -35.1dB at 8kHz, both converging to the same ultimate
 //     -24dB/octave slope far out (filter ORDER, not family, sets that).
-#define ADC_LPF_CUTOFF_HZ             3000.0f
+#define ADC_LPF_CUTOFF_HZ             2800.0f
 #define ADC_LPF_CHEBYSHEV_RIPPLE_DB   1.0f   // standard/commonly-cited spec; small (~1.4dB peak
                                               // at 4th order) in-band ripple bump in exchange for
                                               // the steeper rolloff above - inconsequential for

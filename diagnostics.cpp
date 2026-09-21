@@ -8,6 +8,7 @@
 #include "adc_capture.h"
 #include "envelope_gdeq.h"
 #include "envelope_ampeq.h"
+#include "envelope_alc.h"
 #include "envelope_output.h"
 #include "ssb_dsp.h"
 #include "carrier_output.h"
@@ -2622,6 +2623,18 @@ static void print_timing_and_adc_block(uint32_t now)
         ssb_dsp_get_freq_dev_stats(dsp_state_get_ssb(), &fd_stats);
         Serial.printf("[dsp]   freq_dev: max_unclamped=%.0fHz (limit=%.0fHz) clip_count=%u\r\n",
                       fd_stats.max_unclamped_freq_dev_hz, MAX_FREQ_DEV_HZ, fd_stats.clip_count);
+    }
+
+    // 2026-09-21: ALC's own currently-applied gain (envelope_alc.h) -
+    // printed unconditionally (meaningful even while 'l' is off, reading
+    // back the pinned 1.0) so a persistently-low gain (riding near
+    // ENV_ALC_MIN_GAIN) or a canary trip is visible on the bench without
+    // needing to enable a separate debug build.
+    if (diag_room_for(80)) {
+        Serial.printf("[env]   alc: enabled=%s gain=%.3f canary_finite=%s\r\n",
+                      envelope_alc_get_enabled() ? "true" : "false",
+                      envelope_alc_get_gain(),
+                      envelope_alc_get_canary() ? "true" : "false");
     }
 
     // Null-bias diagnostic block moved out to its own function,
