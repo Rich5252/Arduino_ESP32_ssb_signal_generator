@@ -2829,6 +2829,14 @@ Separately noticed while pulling the live `'V'` output for this: it reports `[ad
 
 Also worth a mention, unprompted: the same `'V'` snapshot's `ad9851 breakdown: prep_us=2 spi_us=11` vs `write_us=37` leaves a ~24us unaccounted gap in the AD9851 write path - by itself larger than anything the filter-order question touches, and the more promising place to look for real CPU headroom if the new filter modes turn out to need it. Not investigated this session; parked here for whenever it's picked up.
 
+## 2026-09-23, later: repo's `ADC_CONT_SAMPLE_FREQ_HZ` brought in sync with the user's live board (80000 -> 64000)
+
+Noticed while pulling the `'V'` diagnostic for the ADC-filter-order thread above that the repo's `adc_capture.h` still had `ADC_CONT_SAMPLE_FREQ_HZ=80000u`, while the live board's own `[adc]` line read `actual=64152 sps (expected=64000)` - the 64000Hz setting this project settled on via the Fs-hunt investigation (2026-09-20/09-21 entries above; full mechanism in null_bias_investigation.md) had only ever been applied locally on the user's board, never committed here. User confirmed: "commit ADC_CONT_SAMPLE_FREQ_HZ=64000 your end. It works much better as previously discussed."
+
+Changed the `#define` and updated the two comments that asserted the OLD value as current/live state so they don't mislead a future reader: `adc_capture.h`'s `ADC_SAMPLES_PER_TICK` comment (now correctly says 64000/16000=4, with the 80000/16000=5 and 48000/16000=3 history kept as dated context rather than deleted) and `config.h`'s `SAMPLE_RATE_HZ` comment, which had explicitly stated "Rate is back to 80000... live again as written, not just historical" - appended a dated update rather than rewriting that sentence, so the historical narrative around the reverted 48000 experiment stays intact. Left every OTHER historical mention of 80000 alone (the dated 2026-09-02 GPIO13 coupling investigation, the chirp-factor=7 clock-mismatch writeup in ssb_mic_test_commands.md, etc.) - those are measurements taken AT 80000 and describing what was true then, not claims about today's config, so rewriting them would corrupt the historical record rather than correct it.
+
+No other code depends on the literal value 80000 (no `static_assert`/`#error` keyed to it) - `ADC_SAMPLES_PER_TICK = ADC_CONT_SAMPLE_FREQ_HZ / SAMPLE_RATE_HZ` stays a clean integer division (64000/16000=4) and the fractional resampler already measures its own true_ratio at runtime regardless, so this is a low-risk, mechanical sync rather than a behavior change in itself - the actual 64000 behavior has already been the user's live-tested configuration since the Fs-hunt work.
+
 ## Open items carried from earlier sessions, still unresolved
 
 - `MAX_FREQ_DEV_HZ` currently `20000.0f` (config.h:405) - a widened

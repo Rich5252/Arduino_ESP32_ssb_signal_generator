@@ -1071,7 +1071,7 @@ void setup()
             .enable = AUDIO_FX_ENABLED,
             .hpf_freq_hz = 300.0f,
             .presence_freq_hz = 2200.0f,
-            .presence_gain_db = 2.0f,
+            .presence_gain_db = 3.0f,
             .presence_q = 1.0f,
             .comp_threshold = 0.3f,
             .comp_ratio = 3.5f,

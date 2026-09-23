@@ -512,9 +512,19 @@
                                     // tried, to free Core-0 headroom for the wakeup-jitter work
                                     // below - reverted after real hardware showed no clear CPU
                                     // win and a real noise regression (see that #define's own
-                                    // "TRIED, REVERTED" comment for the full story). Rate is back
-                                    // to 80000 - the divisibility numbers above are live again as
-                                    // written, not just historical.
+                                    // "TRIED, REVERTED" comment for the full story). Rate was back
+                                    // to 80000 at the time this note was written - the divisibility
+                                    // numbers above were live as written then, not just historical.
+                                    //
+                                    // 2026-09-23 UPDATE: ADC_CONT_SAMPLE_FREQ_HZ is now 64000 (see
+                                    // that define's own 2026-09-23 comment in adc_capture.h) - a
+                                    // DIFFERENT change from the reverted 48000 experiment above,
+                                    // confirmed on real hardware as an improvement (lower ADC-clock
+                                    // rounding error - see moving_forward_notes.md's 2026-09-20/
+                                    // 09-21 entries). Divisibility still holds cleanly with
+                                    // SAMPLE_RATE_HZ=16000 (64000/16000=4, vs 80000's old 5;
+                                    // 2000000/16000=125 is unaffected, since gptimer's
+                                    // resolution_hz doesn't depend on the ADC rate).
 #define HILBERT_TAPS       65   // was briefly tested at 129 to check whether Hilbert filter
                                  // approximation accuracy was the source of the IMD floor that
                                  // tracks 1:1 with signal level below -6dB - real hardware A/B

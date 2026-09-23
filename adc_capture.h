@@ -121,7 +121,22 @@
 // tried before the whole experiment was called off - "keep the dB we've
 // already got" took priority. Left here for the next time someone's
 // tempted to touch this knob again.
-#define ADC_CONT_SAMPLE_FREQ_HZ   80000u   // within ESP32-S3's continuous-mode range
+//
+// 2026-09-23: changed to 64000 (from 80000) - this is a DIFFERENT change
+// from the 48000 experiment above (48000/16000=3, a genuinely smaller
+// ratio that starved the FIFO per the TRIED/REVERTED story above; 64000/
+// 16000=4, still an exact-integer ratio, one less than 80000's 5 but with
+// no starving observed). Confirmed on real hardware as the user's
+// preferred live configuration since the Fs-hunt investigation
+// (moving_forward_notes.md's 2026-09-20/09-21 entries, null_bias_
+// investigation.md's matching entries): 64000 lands on the same ~0.16%
+// ADC-clock rounding error as 16000/32000/48000/96000 (all at the floor
+// this project's clock-divider math allows), vs. 80000's own ~0.806%
+// error - a real, now-mechanistically-understood improvement, not just a
+// preference. This repo's value had been left at 80000 through that whole
+// investigation (the 64000 setting existed only as a local edit on the
+// user's board) until this commit brought the two back in sync.
+#define ADC_CONT_SAMPLE_FREQ_HZ   64000u   // within ESP32-S3's continuous-mode range
 #define ADC_CONT_FRAME_SAMPLES    16    // DMA chunk size only now - see AVERAGING note above.
                                          // If adc_continuous_new_handle() errors on this, the
                                          // driver enforces a different frame-size constraint -
@@ -174,7 +189,7 @@
 //     Butterworth above 3000Hz at every order - at 4th order, e.g. -47.7dB
 //     vs -35.1dB at 8kHz, both converging to the same ultimate
 //     -24dB/octave slope far out (filter ORDER, not family, sets that).
-#define ADC_LPF_CUTOFF_HZ             3000.0f
+#define ADC_LPF_CUTOFF_HZ             2800.0f
 #define ADC_LPF_CHEBYSHEV_RIPPLE_DB   1.0f   // standard/commonly-cited spec; small (~1.4dB peak
                                               // at 4th order) in-band ripple bump in exchange for
                                               // the steeper rolloff above - inconsequential for
@@ -196,11 +211,13 @@
 #define ADC_FIFO_MASK   (ADC_FIFO_SIZE - 1)
 
 // How many raw ADC samples dsp_task nominally consumes from the FIFO
-// each tick - the exact Fs_adc/Fs_dsp ratio. 80000/16000 = 5 exactly (was
-// 80000/10000 = 8 before SAMPLE_RATE_HZ was raised; a 48000/16000=3 rate
-// was tried and reverted - see ADC_CONT_SAMPLE_FREQ_HZ's own comment
-// above) - if either rate ever changes, check this stays an integer
-// division with zero remainder.
+// each tick - the exact Fs_adc/Fs_dsp ratio. Currently 64000/16000 = 4
+// exactly (2026-09-23: was 80000/16000 = 5 before ADC_CONT_SAMPLE_FREQ_HZ
+// moved to 64000 - see that define's own comment; before that, 80000/10000
+// = 8 before SAMPLE_RATE_HZ was raised; a 48000/16000=3 rate was also tried
+// and reverted, for an unrelated FIFO-starving reason - see
+// ADC_CONT_SAMPLE_FREQ_HZ's own comment above) - if either rate ever
+// changes, check this stays an integer division with zero remainder.
 //
 // 2026-09-20: this integer value is now ONLY the seed/reference point for
 // the fractional resampler below (adc_capture_read_next_sample()'s actual
