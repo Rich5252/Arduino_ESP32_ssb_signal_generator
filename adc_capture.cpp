@@ -33,6 +33,14 @@ static volatile uint32_t s_adc_fifo_tail = 0;   // written only by adc_capture_r
 // adc_capture_set_lpf_mode()).
 static ssb_biquad4_t s_adc_lpf_butterworth;
 static ssb_biquad4_t s_adc_lpf_chebyshev;
+// 2026-09-23: 6th/8th-order cascades (ssb_biquad6_t/ssb_biquad8_t - three/
+// four cascaded 2nd-order stages, see ssb_adc_filter.h) added alongside
+// the two 4th-order ones above, same "always initialized, only one
+// actually processes samples" reasoning.
+static ssb_biquad6_t s_adc_lpf_butterworth6;
+static ssb_biquad6_t s_adc_lpf_chebyshev6;
+static ssb_biquad8_t s_adc_lpf_butterworth8;
+static ssb_biquad8_t s_adc_lpf_chebyshev8;
 
 // Live OFF/Butterworth/Chebyshev toggle for the ADC LPF, via serial 'f' -
 // see serial_commands.cpp. Lets you compare filtered-vs-raw (or one filter
@@ -248,6 +256,16 @@ void adc_capture_init(void)
     ssb_biquad4_lpf_init(&s_adc_lpf_butterworth, ADC_LPF_CUTOFF_HZ, (float)ADC_CONT_SAMPLE_FREQ_HZ);
     ssb_biquad4_chebyshev_lpf_init(&s_adc_lpf_chebyshev, ADC_LPF_CUTOFF_HZ, (float)ADC_CONT_SAMPLE_FREQ_HZ,
                                     ADC_LPF_CHEBYSHEV_RIPPLE_DB);
+    // 2026-09-23: 6th/8th-order cascades, same fc_hz/ripple spec as the
+    // 4th-order pair above - see ssb_adc_filter.h for why a higher order at
+    // the SAME ripple spec doesn't cost extra ripple the way a naive
+    // double-pass of the 4th-order filter would.
+    ssb_biquad6_lpf_init(&s_adc_lpf_butterworth6, ADC_LPF_CUTOFF_HZ, (float)ADC_CONT_SAMPLE_FREQ_HZ);
+    ssb_biquad6_chebyshev_lpf_init(&s_adc_lpf_chebyshev6, ADC_LPF_CUTOFF_HZ, (float)ADC_CONT_SAMPLE_FREQ_HZ,
+                                    ADC_LPF_CHEBYSHEV_RIPPLE_DB);
+    ssb_biquad8_lpf_init(&s_adc_lpf_butterworth8, ADC_LPF_CUTOFF_HZ, (float)ADC_CONT_SAMPLE_FREQ_HZ);
+    ssb_biquad8_chebyshev_lpf_init(&s_adc_lpf_chebyshev8, ADC_LPF_CUTOFF_HZ, (float)ADC_CONT_SAMPLE_FREQ_HZ,
+                                    ADC_LPF_CHEBYSHEV_RIPPLE_DB);
 
     // Must register before starting - the driver returns ESP_ERR_INVALID_STATE
     // if you try to add a callback while already running.
@@ -378,6 +396,18 @@ float IRAM_ATTR adc_capture_read_next_sample(void)
             case ADC_LPF_MODE_CHEBYSHEV:
                 filtered = ssb_biquad4_process(&s_adc_lpf_chebyshev, raw);
                 break;
+            case ADC_LPF_MODE_BUTTERWORTH6:
+                filtered = ssb_biquad6_process(&s_adc_lpf_butterworth6, raw);
+                break;
+            case ADC_LPF_MODE_CHEBYSHEV6:
+                filtered = ssb_biquad6_process(&s_adc_lpf_chebyshev6, raw);
+                break;
+            case ADC_LPF_MODE_BUTTERWORTH8:
+                filtered = ssb_biquad8_process(&s_adc_lpf_butterworth8, raw);
+                break;
+            case ADC_LPF_MODE_CHEBYSHEV8:
+                filtered = ssb_biquad8_process(&s_adc_lpf_chebyshev8, raw);
+                break;
             case ADC_LPF_MODE_OFF:
             default:
                 filtered = raw;
@@ -452,6 +482,14 @@ void adc_capture_set_lpf_mode(adc_lpf_mode_t mode)
             ssb_biquad4_reset(&s_adc_lpf_butterworth);
         } else if (mode == ADC_LPF_MODE_CHEBYSHEV) {
             ssb_biquad4_reset(&s_adc_lpf_chebyshev);
+        } else if (mode == ADC_LPF_MODE_BUTTERWORTH6) {
+            ssb_biquad6_reset(&s_adc_lpf_butterworth6);
+        } else if (mode == ADC_LPF_MODE_CHEBYSHEV6) {
+            ssb_biquad6_reset(&s_adc_lpf_chebyshev6);
+        } else if (mode == ADC_LPF_MODE_BUTTERWORTH8) {
+            ssb_biquad8_reset(&s_adc_lpf_butterworth8);
+        } else if (mode == ADC_LPF_MODE_CHEBYSHEV8) {
+            ssb_biquad8_reset(&s_adc_lpf_chebyshev8);
         }
         // Switching TO off needs no reset - raw passthrough has no state.
     }
@@ -467,8 +505,12 @@ adc_lpf_mode_t adc_capture_get_lpf_mode(void)
 const char *adc_capture_lpf_mode_name(adc_lpf_mode_t mode)
 {
     switch (mode) {
-        case ADC_LPF_MODE_BUTTERWORTH: return "Butterworth";
-        case ADC_LPF_MODE_CHEBYSHEV:   return "Chebyshev";
+        case ADC_LPF_MODE_BUTTERWORTH:  return "Butterworth";
+        case ADC_LPF_MODE_CHEBYSHEV:    return "Chebyshev";
+        case ADC_LPF_MODE_BUTTERWORTH6: return "Butterworth6";
+        case ADC_LPF_MODE_CHEBYSHEV6:   return "Chebyshev6";
+        case ADC_LPF_MODE_BUTTERWORTH8: return "Butterworth8";
+        case ADC_LPF_MODE_CHEBYSHEV8:   return "Chebyshev8";
         case ADC_LPF_MODE_OFF:
         default:                      return "off";
     }
@@ -548,4 +590,20 @@ void adc_capture_get_lpf_canary(adc_lpf_canary_t *out)
                             && isfinite(s_adc_lpf_butterworth.stage2.z1) && isfinite(s_adc_lpf_butterworth.stage2.z2);
     out->chebyshev_finite = isfinite(s_adc_lpf_chebyshev.stage1.z1) && isfinite(s_adc_lpf_chebyshev.stage1.z2)
                           && isfinite(s_adc_lpf_chebyshev.stage2.z1) && isfinite(s_adc_lpf_chebyshev.stage2.z2);
+    // 2026-09-23: same finiteness check, extended to the 6th/8th-order
+    // cascades' extra stages.
+    out->butterworth6_finite = isfinite(s_adc_lpf_butterworth6.stage1.z1) && isfinite(s_adc_lpf_butterworth6.stage1.z2)
+                             && isfinite(s_adc_lpf_butterworth6.stage2.z1) && isfinite(s_adc_lpf_butterworth6.stage2.z2)
+                             && isfinite(s_adc_lpf_butterworth6.stage3.z1) && isfinite(s_adc_lpf_butterworth6.stage3.z2);
+    out->chebyshev6_finite = isfinite(s_adc_lpf_chebyshev6.stage1.z1) && isfinite(s_adc_lpf_chebyshev6.stage1.z2)
+                           && isfinite(s_adc_lpf_chebyshev6.stage2.z1) && isfinite(s_adc_lpf_chebyshev6.stage2.z2)
+                           && isfinite(s_adc_lpf_chebyshev6.stage3.z1) && isfinite(s_adc_lpf_chebyshev6.stage3.z2);
+    out->butterworth8_finite = isfinite(s_adc_lpf_butterworth8.stage1.z1) && isfinite(s_adc_lpf_butterworth8.stage1.z2)
+                             && isfinite(s_adc_lpf_butterworth8.stage2.z1) && isfinite(s_adc_lpf_butterworth8.stage2.z2)
+                             && isfinite(s_adc_lpf_butterworth8.stage3.z1) && isfinite(s_adc_lpf_butterworth8.stage3.z2)
+                             && isfinite(s_adc_lpf_butterworth8.stage4.z1) && isfinite(s_adc_lpf_butterworth8.stage4.z2);
+    out->chebyshev8_finite = isfinite(s_adc_lpf_chebyshev8.stage1.z1) && isfinite(s_adc_lpf_chebyshev8.stage1.z2)
+                           && isfinite(s_adc_lpf_chebyshev8.stage2.z1) && isfinite(s_adc_lpf_chebyshev8.stage2.z2)
+                           && isfinite(s_adc_lpf_chebyshev8.stage3.z1) && isfinite(s_adc_lpf_chebyshev8.stage3.z2)
+                           && isfinite(s_adc_lpf_chebyshev8.stage4.z1) && isfinite(s_adc_lpf_chebyshev8.stage4.z2);
 }

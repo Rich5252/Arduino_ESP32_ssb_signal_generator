@@ -218,6 +218,156 @@ void ssb_biquad4_chebyshev_lpf_init(ssb_biquad4_t *f, float fc_hz, float fs_hz, 
     // "close enough after 40 bisections" reasoning as the 2nd-order case).
 }
 
+// ---- 6th-order variant: three cascaded 2nd-order stages ----
+
+void ssb_biquad6_reset(ssb_biquad6_t *f)
+{
+    ssb_biquad_reset(&f->stage1);
+    ssb_biquad_reset(&f->stage2);
+    ssb_biquad_reset(&f->stage3);
+}
+
+float ssb_biquad6_process(ssb_biquad6_t *f, float in)
+{
+    float y = ssb_biquad_process(&f->stage1, in);
+    y = ssb_biquad_process(&f->stage2, y);
+    return ssb_biquad_process(&f->stage3, y);
+}
+
+void ssb_biquad6_lpf_init(ssb_biquad6_t *f, float fc_hz, float fs_hz)
+{
+    // Standard N=6 Butterworth per-stage Q values: Q_k = 1/(2*cos(theta_k)),
+    // theta_k = (2k-1)*pi/(2N) for k=1,2,3 - see header comment.
+    biquad_lpf_design(&f->stage1, fc_hz, fs_hz, 0.5176381f);
+    biquad_lpf_design(&f->stage2, fc_hz, fs_hz, 0.7071068f);
+    biquad_lpf_design(&f->stage3, fc_hz, fs_hz, 1.9318517f);
+}
+
+static float biquad6_mag_db(const ssb_biquad6_t *f, float f_hz, float fs_hz)
+{
+    return biquad_mag_db(&f->stage1, f_hz, fs_hz)
+         + biquad_mag_db(&f->stage2, f_hz, fs_hz)
+         + biquad_mag_db(&f->stage3, f_hz, fs_hz);
+}
+
+void ssb_biquad6_chebyshev_lpf_init(ssb_biquad6_t *f, float fc_hz, float fs_hz, float ripple_db)
+{
+    const float N = 6.0f;
+    float epsilon = sqrtf(powf(10.0f, ripple_db / 10.0f) - 1.0f);
+    float v       = (1.0f / N) * asinhf(1.0f / epsilon);
+
+    // Pole-pair angles for k=1,2,3 (N=6): theta_k = (2k-1)*pi/(2N).
+    float theta1 = (float)M_PI / 12.0f;         // k=1
+    float theta2 = 3.0f * (float)M_PI / 12.0f;  // k=2 (= pi/4)
+    float theta3 = 5.0f * (float)M_PI / 12.0f;  // k=3
+
+    float alpha1 = sinhf(v) * sinf(theta1), beta1 = coshf(v) * cosf(theta1);
+    float alpha2 = sinhf(v) * sinf(theta2), beta2 = coshf(v) * cosf(theta2);
+    float alpha3 = sinhf(v) * sinf(theta3), beta3 = coshf(v) * cosf(theta3);
+    float omega0_1 = sqrtf(alpha1 * alpha1 + beta1 * beta1);
+    float omega0_2 = sqrtf(alpha2 * alpha2 + beta2 * beta2);
+    float omega0_3 = sqrtf(alpha3 * alpha3 + beta3 * beta3);
+    float Q1 = omega0_1 / (2.0f * alpha1);
+    float Q2 = omega0_2 / (2.0f * alpha2);
+    float Q3 = omega0_3 / (2.0f * alpha3);
+
+    // Same shared-frequency-scale bisection as ssb_biquad4_chebyshev_lpf_init()
+    // - same bracket, since the qualitative shape (monotonic falloff past
+    // the ripple band) doesn't change with order, only verified numerically
+    // for N=6/N=8 rather than re-derived (see moving_forward_notes.md's
+    // 2026-09-23 entry for the check).
+    float lo = 0.3f, hi = 1.2f;
+    for (int i = 0; i < 40; i++) {
+        float mid = 0.5f * (lo + hi);
+        biquad_lpf_design(&f->stage1, fc_hz * mid * omega0_1, fs_hz, Q1);
+        biquad_lpf_design(&f->stage2, fc_hz * mid * omega0_2, fs_hz, Q2);
+        biquad_lpf_design(&f->stage3, fc_hz * mid * omega0_3, fs_hz, Q3);
+        float mag_db = biquad6_mag_db(f, fc_hz, fs_hz);
+        if (mag_db > -3.0103f) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+}
+
+// ---- 8th-order variant: four cascaded 2nd-order stages ----
+
+void ssb_biquad8_reset(ssb_biquad8_t *f)
+{
+    ssb_biquad_reset(&f->stage1);
+    ssb_biquad_reset(&f->stage2);
+    ssb_biquad_reset(&f->stage3);
+    ssb_biquad_reset(&f->stage4);
+}
+
+float ssb_biquad8_process(ssb_biquad8_t *f, float in)
+{
+    float y = ssb_biquad_process(&f->stage1, in);
+    y = ssb_biquad_process(&f->stage2, y);
+    y = ssb_biquad_process(&f->stage3, y);
+    return ssb_biquad_process(&f->stage4, y);
+}
+
+void ssb_biquad8_lpf_init(ssb_biquad8_t *f, float fc_hz, float fs_hz)
+{
+    // Standard N=8 Butterworth per-stage Q values: Q_k = 1/(2*cos(theta_k)),
+    // theta_k = (2k-1)*pi/(2N) for k=1..4 - see header comment.
+    biquad_lpf_design(&f->stage1, fc_hz, fs_hz, 0.5097956f);
+    biquad_lpf_design(&f->stage2, fc_hz, fs_hz, 0.6013449f);
+    biquad_lpf_design(&f->stage3, fc_hz, fs_hz, 0.8999762f);
+    biquad_lpf_design(&f->stage4, fc_hz, fs_hz, 2.5629154f);
+}
+
+static float biquad8_mag_db(const ssb_biquad8_t *f, float f_hz, float fs_hz)
+{
+    return biquad_mag_db(&f->stage1, f_hz, fs_hz)
+         + biquad_mag_db(&f->stage2, f_hz, fs_hz)
+         + biquad_mag_db(&f->stage3, f_hz, fs_hz)
+         + biquad_mag_db(&f->stage4, f_hz, fs_hz);
+}
+
+void ssb_biquad8_chebyshev_lpf_init(ssb_biquad8_t *f, float fc_hz, float fs_hz, float ripple_db)
+{
+    const float N = 8.0f;
+    float epsilon = sqrtf(powf(10.0f, ripple_db / 10.0f) - 1.0f);
+    float v       = (1.0f / N) * asinhf(1.0f / epsilon);
+
+    // Pole-pair angles for k=1..4 (N=8): theta_k = (2k-1)*pi/(2N).
+    float theta1 = (float)M_PI / 16.0f;         // k=1
+    float theta2 = 3.0f * (float)M_PI / 16.0f;  // k=2
+    float theta3 = 5.0f * (float)M_PI / 16.0f;  // k=3
+    float theta4 = 7.0f * (float)M_PI / 16.0f;  // k=4
+
+    float alpha1 = sinhf(v) * sinf(theta1), beta1 = coshf(v) * cosf(theta1);
+    float alpha2 = sinhf(v) * sinf(theta2), beta2 = coshf(v) * cosf(theta2);
+    float alpha3 = sinhf(v) * sinf(theta3), beta3 = coshf(v) * cosf(theta3);
+    float alpha4 = sinhf(v) * sinf(theta4), beta4 = coshf(v) * cosf(theta4);
+    float omega0_1 = sqrtf(alpha1 * alpha1 + beta1 * beta1);
+    float omega0_2 = sqrtf(alpha2 * alpha2 + beta2 * beta2);
+    float omega0_3 = sqrtf(alpha3 * alpha3 + beta3 * beta3);
+    float omega0_4 = sqrtf(alpha4 * alpha4 + beta4 * beta4);
+    float Q1 = omega0_1 / (2.0f * alpha1);
+    float Q2 = omega0_2 / (2.0f * alpha2);
+    float Q3 = omega0_3 / (2.0f * alpha3);
+    float Q4 = omega0_4 / (2.0f * alpha4);
+
+    float lo = 0.3f, hi = 1.2f;
+    for (int i = 0; i < 40; i++) {
+        float mid = 0.5f * (lo + hi);
+        biquad_lpf_design(&f->stage1, fc_hz * mid * omega0_1, fs_hz, Q1);
+        biquad_lpf_design(&f->stage2, fc_hz * mid * omega0_2, fs_hz, Q2);
+        biquad_lpf_design(&f->stage3, fc_hz * mid * omega0_3, fs_hz, Q3);
+        biquad_lpf_design(&f->stage4, fc_hz * mid * omega0_4, fs_hz, Q4);
+        float mag_db = biquad8_mag_db(f, fc_hz, fs_hz);
+        if (mag_db > -3.0103f) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+}
+
 // ---- Fixed-point (Q15) variant - integer only, safe to call from ISR ----
 
 static inline int32_t round_to_q15(float x)

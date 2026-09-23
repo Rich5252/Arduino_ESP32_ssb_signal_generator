@@ -122,6 +122,86 @@ void ssb_biquad4_lpf_init(ssb_biquad4_t *f, float fc_hz, float fs_hz);
 // correct while the whole pair slides to hit the target -3dB point).
 void ssb_biquad4_chebyshev_lpf_init(ssb_biquad4_t *f, float fc_hz, float fs_hz, float ripple_db);
 
+// ---- 6th-order variant: three cascaded 2nd-order stages ----
+//
+// 2026-09-23: added alongside the 8th-order variant below when the mic's
+// ADC anti-alias stopband (currently 4th order, ~3-8kHz region) was found
+// to be the limiting factor on out-of-band rejection once a better
+// electret capsule is fitted. Same "cascade of independently-transformed
+// biquads is mathematically exact, not an approximation" reasoning as
+// ssb_biquad4_t - just one more stage. Offered as the smaller of the two
+// steps (roughly +50% CPU over 4th order vs. 8th order's +100%) since a
+// live CPU-headroom check on this same day found real margin much
+// tighter than when the 2nd->4th jump was made (see
+// moving_forward_notes.md's 2026-09-23 entry) - worth having as a
+// fallback if 8th order's extra cost doesn't fit.
+typedef struct {
+    ssb_biquad_t stage1, stage2, stage3;
+} ssb_biquad6_t;
+
+void ssb_biquad6_reset(ssb_biquad6_t *f);
+float ssb_biquad6_process(ssb_biquad6_t *f, float in);
+
+// 6th-order Butterworth: three stages, same shared fc_hz, standard
+// per-stage pole-angle Qs for N=6 (theta_k=(2k-1)*pi/12, Q_k=1/(2*cos
+// (theta_k))): Q1=1/(2*cos(pi/12))=0.517638, Q2=1/(2*cos(pi/4))=0.707107
+// (the middle stage lands exactly on the familiar 2nd-order-Butterworth Q
+// by coincidence of the angle math, not a special case), Q3=1/(2*cos(5*
+// pi/12))=1.931852. Verified the same way as the N=4 case: composite -3dB
+// lands within <1e-6 of fc_hz as-is, no bisection needed.
+void ssb_biquad6_lpf_init(ssb_biquad6_t *f, float fc_hz, float fs_hz);
+
+// 6th-order Chebyshev Type I - same ellipse-pole-pair derivation and
+// same one-time bisection technique as ssb_biquad4_chebyshev_lpf_init(),
+// just with three (theta_k=(2k-1)*pi/12, k=1,2,3) pole pairs instead of
+// two. Numerically checked at fs=64000Hz/fc=3000Hz/1dB ripple: true -3dB
+// lands at fc_hz as designed, peak in-band ripple stays ~0.99dB (same as
+// the 4th-order design at the same ripple_db - going to a higher order at
+// a FIXED ripple spec does NOT multiply the ripple the way naively
+// cascading an existing filter with itself would; see this file's own
+// header comment and moving_forward_notes.md's 2026-09-23 entry for why
+// that distinction matters), while stopband rejection improves
+// substantially (~-76.9dB at 8kHz vs the 4th-order design's ~-48.4dB).
+void ssb_biquad6_chebyshev_lpf_init(ssb_biquad6_t *f, float fc_hz, float fs_hz, float ripple_db);
+
+// ---- 8th-order variant: four cascaded 2nd-order stages ----
+//
+// 2026-09-23: same motivation as ssb_biquad6_t above - the larger of the
+// two steps, roughly double the CPU of the 4th-order filter (four biquad
+// evaluations per raw ADC sample instead of two), same relationship the
+// existing 2nd->4th jump already established and validated ("4th order
+// roughly DOUBLES the dB rejection... for negligible extra CPU" per
+// adc_capture.h) - repeating that same doubling pattern one more time,
+// with a genuinely separately-designed higher-order filter rather than
+// running the existing 4th-order filter through itself twice (which would
+// instead roughly DOUBLE the ripple in dB terms, shift the effective
+// -3dB point, and double group delay - see moving_forward_notes.md's
+// 2026-09-23 entry for the full comparison).
+typedef struct {
+    ssb_biquad_t stage1, stage2, stage3, stage4;
+} ssb_biquad8_t;
+
+void ssb_biquad8_reset(ssb_biquad8_t *f);
+float ssb_biquad8_process(ssb_biquad8_t *f, float in);
+
+// 8th-order Butterworth: four stages, same shared fc_hz, standard
+// per-stage pole-angle Qs for N=8 (theta_k=(2k-1)*pi/16, Q_k=1/(2*cos
+// (theta_k))): Q1=0.509796, Q2=0.601345, Q3=0.899976, Q4=2.562915.
+// Same "cascading at the same fc_hz with these Qs is exact" guarantee as
+// N=4/N=6 - verified numerically (<1e-6 at fc_hz).
+void ssb_biquad8_lpf_init(ssb_biquad8_t *f, float fc_hz, float fs_hz);
+
+// 8th-order Chebyshev Type I - four (theta_k=(2k-1)*pi/16, k=1..4)
+// ellipse pole pairs, same bisection technique as the 4th/6th-order
+// versions. Numerically checked at fs=64000Hz/fc=3000Hz/1dB ripple: true
+// -3dB at fc_hz, peak in-band ripple still ~0.99dB (order-independent at
+// a fixed ripple spec, same point as the 6th-order comment above),
+// stopband rejection ~-105.8dB at 8kHz vs the 4th-order design's
+// ~-48.4dB - more than double, since Chebyshev's stopband slope (unlike
+// Butterworth's) doesn't scale purely linearly with order from a fixed
+// ripple-edge baseline.
+void ssb_biquad8_chebyshev_lpf_init(ssb_biquad8_t *f, float fc_hz, float fs_hz, float ripple_db);
+
 // ---- Fixed-point (Q15) variant - ISR-safe, integer only ----
 
 #define SSB_BIQUAD_FIXED_SHIFT   15   // Q15: coefficients scaled by 1<<15

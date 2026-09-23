@@ -2358,11 +2358,19 @@ static void canary_check_background(void)
 
     adc_lpf_canary_t adc_c;
     adc_capture_get_lpf_canary(&adc_c);
-    if ((!adc_c.butterworth_finite || !adc_c.chebyshev_finite) && s_dbg_canary_adclpf_bad_since_ms == 0) {
+    // 2026-09-23: extended to the 6th/8th-order cascades alongside the
+    // original 4th-order pair - see adc_capture_get_lpf_canary()'s comment.
+    bool adc_lpf_all_ok = adc_c.butterworth_finite && adc_c.chebyshev_finite
+                        && adc_c.butterworth6_finite && adc_c.chebyshev6_finite
+                        && adc_c.butterworth8_finite && adc_c.chebyshev8_finite;
+    if (!adc_lpf_all_ok && s_dbg_canary_adclpf_bad_since_ms == 0) {
         s_dbg_canary_adclpf_bad_since_ms = millis();
-        if (diag_room_for(120)) {
-            Serial.printf("[canary] adc lpf state MISMATCH (butw_ok=%d cheb_ok=%d)! first seen at t=%ums\r\n",
-                          (int)adc_c.butterworth_finite, (int)adc_c.chebyshev_finite, s_dbg_canary_adclpf_bad_since_ms);
+        if (diag_room_for(160)) {
+            Serial.printf("[canary] adc lpf state MISMATCH (butw4=%d cheb4=%d butw6=%d cheb6=%d butw8=%d cheb8=%d)! first seen at t=%ums\r\n",
+                          (int)adc_c.butterworth_finite, (int)adc_c.chebyshev_finite,
+                          (int)adc_c.butterworth6_finite, (int)adc_c.chebyshev6_finite,
+                          (int)adc_c.butterworth8_finite, (int)adc_c.chebyshev8_finite,
+                          s_dbg_canary_adclpf_bad_since_ms);
         }
     }
 }
@@ -2412,7 +2420,9 @@ static void canary_print_status(void)
     bool all_iir_ok = iir_c.eq_hpf_finite && iir_c.eq_presence_finite && iir_c.compressor_env_finite
                     && gdeq_c.stage1_finite && gdeq_c.stage2_finite
                     && ampeq_c.shelf1_finite && ampeq_c.shelf2_finite
-                    && adc_c.butterworth_finite && adc_c.chebyshev_finite;
+                    && adc_c.butterworth_finite && adc_c.chebyshev_finite
+                    && adc_c.butterworth6_finite && adc_c.chebyshev6_finite
+                    && adc_c.butterworth8_finite && adc_c.chebyshev8_finite;
     if (all_iir_ok) {
         Serial.printf("[canary] iir_state: OK (eq/comp/gdeq/ampeq/adc_lpf)\r\n");
     } else {
@@ -2431,9 +2441,14 @@ static void canary_print_status(void)
             Serial.printf("[canary] ampeq shelf state MISMATCH (s1_ok=%d s2_ok=%d)! first seen at t=%ums\r\n",
                           (int)ampeq_c.shelf1_finite, (int)ampeq_c.shelf2_finite, s_dbg_canary_ampeq_bad_since_ms);
         }
-        if (!adc_c.butterworth_finite || !adc_c.chebyshev_finite) {
-            Serial.printf("[canary] adc lpf state MISMATCH (butw_ok=%d cheb_ok=%d)! first seen at t=%ums\r\n",
-                          (int)adc_c.butterworth_finite, (int)adc_c.chebyshev_finite, s_dbg_canary_adclpf_bad_since_ms);
+        if (!adc_c.butterworth_finite || !adc_c.chebyshev_finite
+            || !adc_c.butterworth6_finite || !adc_c.chebyshev6_finite
+            || !adc_c.butterworth8_finite || !adc_c.chebyshev8_finite) {
+            Serial.printf("[canary] adc lpf state MISMATCH (butw4=%d cheb4=%d butw6=%d cheb6=%d butw8=%d cheb8=%d)! first seen at t=%ums\r\n",
+                          (int)adc_c.butterworth_finite, (int)adc_c.chebyshev_finite,
+                          (int)adc_c.butterworth6_finite, (int)adc_c.chebyshev6_finite,
+                          (int)adc_c.butterworth8_finite, (int)adc_c.chebyshev8_finite,
+                          s_dbg_canary_adclpf_bad_since_ms);
         }
     }
 }

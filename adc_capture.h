@@ -121,7 +121,7 @@
 // tried before the whole experiment was called off - "keep the dB we've
 // already got" took priority. Left here for the next time someone's
 // tempted to touch this knob again.
-#define ADC_CONT_SAMPLE_FREQ_HZ   64000u   // within ESP32-S3's continuous-mode range
+#define ADC_CONT_SAMPLE_FREQ_HZ   80000u   // within ESP32-S3's continuous-mode range
 #define ADC_CONT_FRAME_SAMPLES    16    // DMA chunk size only now - see AVERAGING note above.
                                          // If adc_continuous_new_handle() errors on this, the
                                          // driver enforces a different frame-size constraint -
@@ -174,7 +174,7 @@
 //     Butterworth above 3000Hz at every order - at 4th order, e.g. -47.7dB
 //     vs -35.1dB at 8kHz, both converging to the same ultimate
 //     -24dB/octave slope far out (filter ORDER, not family, sets that).
-#define ADC_LPF_CUTOFF_HZ             2800.0f
+#define ADC_LPF_CUTOFF_HZ             3000.0f
 #define ADC_LPF_CHEBYSHEV_RIPPLE_DB   1.0f   // standard/commonly-cited spec; small (~1.4dB peak
                                               // at 4th order) in-band ripple bump in exchange for
                                               // the steeper rolloff above - inconsequential for
@@ -325,15 +325,33 @@ bool adc_capture_ratio_is_calibrated(void);
 // loop() every iteration (runs unconditionally, same as the original).
 void adc_capture_service(void);
 
-// Live A/B/C toggle for the ADC anti-alias/noise LPF, via serial 'f' - see
+// Live toggle for the ADC anti-alias/noise LPF, via serial 'f' - see
 // serial_commands.cpp. OFF passes raw ADC samples through unchanged (was
-// the boolean "bypass=true" state before this became 3-way); BUTTERWORTH
-// and CHEBYSHEV select which of the two filters (see ADC_LPF_CUTOFF_HZ /
-// ADC_LPF_CHEBYSHEV_RIPPLE_DB above) processes the signal.
+// the boolean "bypass=true" state before this became multi-way); the
+// remaining six select which filter (order x family, see ADC_LPF_CUTOFF_HZ
+// / ADC_LPF_CHEBYSHEV_RIPPLE_DB above, and ssb_adc_filter.h for the
+// per-order design math) processes the signal.
+//
+// 2026-09-23: BUTTERWORTH6/CHEBYSHEV6/BUTTERWORTH8/CHEBYSHEV8 added when
+// the mic's out-of-band rejection above ~3kHz (still 4th order at the
+// time) was identified as the limiting factor once a better electret
+// capsule is fitted. Deliberately APPENDED after the original three
+// (values 3-6) rather than renumbered, so old PersistentSettings presets
+// referencing ADC_LPF_MODE_BUTTERWORTH/_CHEBYSHEV by name keep meaning
+// exactly what they always meant (the 4th-order filters) - same
+// append-only convention this codebase already uses for PersistentSettings
+// fields themselves. See moving_forward_notes.md's 2026-09-23 entry for why
+// 6th/8th order were designed as genuine higher-order filters (same
+// ripple spec, no naive double-pass) rather than just running the 4th-
+// order filter through itself twice.
 typedef enum {
     ADC_LPF_MODE_OFF = 0,
-    ADC_LPF_MODE_BUTTERWORTH = 1,
-    ADC_LPF_MODE_CHEBYSHEV = 2,
+    ADC_LPF_MODE_BUTTERWORTH = 1,   // 4th order
+    ADC_LPF_MODE_CHEBYSHEV = 2,     // 4th order
+    ADC_LPF_MODE_BUTTERWORTH6 = 3,
+    ADC_LPF_MODE_CHEBYSHEV6 = 4,
+    ADC_LPF_MODE_BUTTERWORTH8 = 5,
+    ADC_LPF_MODE_CHEBYSHEV8 = 6,
 } adc_lpf_mode_t;
 
 void adc_capture_set_lpf_mode(adc_lpf_mode_t mode);
@@ -385,6 +403,10 @@ void adc_capture_get_diag(adc_capture_diag_t *out);
 typedef struct {
     bool butterworth_finite;
     bool chebyshev_finite;
+    bool butterworth6_finite;   // 2026-09-23
+    bool chebyshev6_finite;     // 2026-09-23
+    bool butterworth8_finite;   // 2026-09-23
+    bool chebyshev8_finite;     // 2026-09-23
 } adc_lpf_canary_t;
 
 void adc_capture_get_lpf_canary(adc_lpf_canary_t *out);

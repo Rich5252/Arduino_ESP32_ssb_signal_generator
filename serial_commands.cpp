@@ -794,11 +794,17 @@ void handle_serial_commands(void)
                           k_curve_desc[next],
                           envelope_interp_get_enabled() ? "" : " - no effect until 'I' is ON");
         } else if (c == 'f') {
-            // Cycles off -> Butterworth -> Chebyshev -> off. See
-            // adc_capture.h's adc_lpf_mode_t / ADC_LPF_CUTOFF_HZ /
+            // Cycles off -> Butterworth(4th) -> Chebyshev(4th) ->
+            // Butterworth6 -> Chebyshev6 -> Butterworth8 -> Chebyshev8 ->
+            // off. See adc_capture.h's adc_lpf_mode_t / ADC_LPF_CUTOFF_HZ /
             // ADC_LPF_CHEBYSHEV_RIPPLE_DB for what each mode actually does.
+            // 2026-09-23: widened from %3 to %7 when the 6th/8th-order
+            // modes were added - CPU headroom was measured tight that same
+            // day (see moving_forward_notes.md's 2026-09-23 entry), so this
+            // is the live A/B tool for checking each order's actual
+            // [timing] cost on real hardware before settling on one.
             adc_lpf_mode_t mode = adc_capture_get_lpf_mode();
-            mode = (adc_lpf_mode_t)((mode + 1) % 3);
+            mode = (adc_lpf_mode_t)((mode + 1) % 7);
             adc_capture_set_lpf_mode(mode);
             serial_reply("-> ADC LPF: %s\r\n", adc_capture_lpf_mode_name(mode));
         } else if (c == 'n') {
@@ -1125,8 +1131,13 @@ void handle_serial_commands(void)
             // adc_lpf_mode prints as the enum constant name (ADC_LPF_MODE_OFF
             // etc.), not a string literal - it's a valid C identifier, so
             // the pasted line compiles directly into settingsPresets[].
-            static const char *k_adc_lpf_mode_enum_name[3] = {
-                "ADC_LPF_MODE_OFF", "ADC_LPF_MODE_BUTTERWORTH", "ADC_LPF_MODE_CHEBYSHEV"
+            // 2026-09-23: widened to 7 entries for the BUTTERWORTH6/
+            // CHEBYSHEV6/BUTTERWORTH8/CHEBYSHEV8 modes - see adc_lpf_mode_t
+            // in adc_capture.h.
+            static const char *k_adc_lpf_mode_enum_name[7] = {
+                "ADC_LPF_MODE_OFF", "ADC_LPF_MODE_BUTTERWORTH", "ADC_LPF_MODE_CHEBYSHEV",
+                "ADC_LPF_MODE_BUTTERWORTH6", "ADC_LPF_MODE_CHEBYSHEV6",
+                "ADC_LPF_MODE_BUTTERWORTH8", "ADC_LPF_MODE_CHEBYSHEV8"
             };
             // freq_dev_slew_limit_hz prints as the sentinel constant's own
             // name when off, same reasoning as adc_lpf_mode above - so the
