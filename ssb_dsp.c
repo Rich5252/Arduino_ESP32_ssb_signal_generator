@@ -24,25 +24,44 @@ typedef struct {
     float attack_coef, release_coef;   // one-pole envelope-follower coefficients
     float threshold, inv_ratio;
     float env;
-    float makeup_gain;   // automatic, see compute_compressor_makeup_gain() - keeps level roughly
-                          // consistent whether the compressor is on or off, unlike EQ's gain
-                          // (see ssb_dsp_s::master_gain comment for why that one's manual instead)
+    float makeup_gain;   // DYNAMIC as of 2026-09-24 - see peak_env/COMP_PEAK_HOLD_RELEASE_MS
+                          // below and compressor_process()'s comment. No longer a fixed
+                          // constant computed once at init/reconfigure.
+
+    // 2026-09-24: peak-tracking makeup gain, replacing the old fixed
+    // "assume the signal peaks at exactly 0dBFS" formula (see this file's
+    // git history for compute_compressor_makeup_gain(), removed here) -
+    // that assumption doesn't hold for a genuinely quiet source (e.g. the
+    // poor electret capsule currently in use, envelope readings well under
+    // 1.0), so the fixed makeup gain calibrated for a 0dBFS peak was
+    // wrong for this signal's ACTUAL peak - either under- or
+    // over-restoring it depending on how far the real peak sits from the
+    // assumed one. peak_env is a SEPARATE envelope follower from env
+    // above: same (fast) attack, since it needs to see every peak env
+    // itself reacts to, but a much slower release (COMP_PEAK_HOLD_RELEASE_MS)
+    // so it tracks the signal's sustained peak level over roughly a
+    // couple of seconds of programme material, not every syllable -
+    // reacting per-syllable would make makeup_gain itself pump audibly,
+    // exactly the kind of new-artifact risk this project's ALC design
+    // notes already flagged for a similarly-shaped problem. makeup_gain
+    // is recomputed every sample straight from peak_env's own
+    // gain-reduction curve (see compressor_process()), so whatever the
+    // signal's real peak actually is, that peak - not an assumed 0dBFS
+    // one - is what comes back out unchanged post-compression.
+    float peak_env;
+    float peak_release_coef;   // peak_env's release; its ATTACK reuses attack_coef above
 } compressor_t;
 
-// Standard "unity gain at 0dBFS" makeup gain: for a signal peaking at
-// full scale (0dB), the compressor's own gain reduction there is
-// threshold_db * (1 - 1/ratio) (both threshold_db and this product are
-// negative, i.e. a reduction) - this exactly cancels that, so a
-// full-scale peak comes out at roughly the same level whether the
-// compressor is engaged or not. Well-defined because threshold/ratio are
-// known constants, unlike EQ gain which depends on the input spectrum.
-static float compute_compressor_makeup_gain(float threshold, float ratio)
-{
-    if (threshold <= 0.0f || ratio <= 1.0f) return 1.0f;
-    float threshold_db = 20.0f * log10f(threshold);
-    float reduction_db = threshold_db * (1.0f - 1.0f / ratio);   // negative
-    return powf(10.0f, -reduction_db / 20.0f);                    // boost to cancel it
-}
+// 2026-09-24: peak_release_coef's time constant. Deliberately much slower
+// than comp_release_ms (typically ~120ms) - this needs to track the
+// signal's sustained peak level across a speech passage, not decay
+// between syllables, or the dynamically-recomputed makeup_gain in
+// compressor_process() would itself pump in time with the fast envelope's
+// own release. Not yet exposed as a separate audio_fx config field/serial
+// knob - first-cut fixed constant, worth revisiting if bench testing shows
+// 2s is too fast (audible pumping) or too slow (makeup gain lags a real
+// level change, e.g. moving away from the mic, for multiple seconds).
+#define COMP_PEAK_HOLD_RELEASE_MS   2000.0f
 
 // Denormal (subnormal) floats are numbers below ~1.2e-38f in magnitude -
 // still valid IEEE-754 values, but most FPUs (including Xtensa's) fall
@@ -261,6 +280,16 @@ float IRAM_ATTR ssb_shelf_biquad_process(ssb_shelf_biquad_t *f, float x)
 // Feed-forward soft limiter above threshold, fixed ratio. No log/exp/pow
 // per sample - attack/release coefficients (which DO need one expf each)
 // are computed once at init/reconfigure, never per sample.
+//
+// 2026-09-24: makeup_gain is now computed dynamically each sample from a
+// SEPARATE, slow peak-hold follower (peak_env) rather than assumed fixed
+// at init - see compressor_t's own comment for why. peak_env shares the
+// same curve-shape math the fast env/gain computation above already uses
+// (same threshold/inv_ratio, same "gain = compressed/env" shape) - just
+// evaluated at the slow-tracked peak instead of the fast envelope, and
+// inverted (env/compressed rather than compressed/env) since the goal
+// here is to CANCEL that reduction rather than apply it. No new
+// transcendental math - same multiply/divide cost as the block above.
 static inline float IRAM_ATTR compressor_process(compressor_t *c, float x)
 {
     float ax = fabsf(x);
@@ -274,6 +303,29 @@ static inline float IRAM_ATTR compressor_process(compressor_t *c, float x)
     } else {
         gain = 1.0f;
     }
+
+    // Slow peak-hold: same fast attack as env above (must see every peak
+    // env itself reacts to), much slower release (COMP_PEAK_HOLD_RELEASE_MS)
+    // so it reflects the signal's sustained peak level, not each syllable.
+    float peak_coef = (ax > c->peak_env) ? c->attack_coef : c->peak_release_coef;
+    c->peak_env = flush_denorm(c->peak_env + peak_coef * (ax - c->peak_env));
+
+    if (c->peak_env > c->threshold) {
+        float peak_compressed = c->threshold + (c->peak_env - c->threshold) * c->inv_ratio;
+        // peak_compressed > 0 is guaranteed here (threshold > 0 by
+        // ssb_dsp_set_compressor()'s validation, and the added term is
+        // non-negative above threshold) - no epsilon guard needed, unlike
+        // the env>1e-6f guard above which protects a genuinely-can-be-zero
+        // divisor.
+        c->makeup_gain = c->peak_env / peak_compressed;
+    } else {
+        // Peak has never (or not recently) exceeded threshold - nothing to
+        // restore, so no artificial boost. Matches this project's existing
+        // "attenuate/restore only, never manufacture gain that isn't
+        // justified by the signal itself" convention (see envelope_alc.h).
+        c->makeup_gain = 1.0f;
+    }
+
     return x * gain * c->makeup_gain;
 }
 
@@ -473,12 +525,19 @@ esp_err_t ssb_dsp_init(const ssb_dsp_config_t *cfg, ssb_dsp_handle_t *out_handle
         h->comp.threshold = threshold;
         h->comp.inv_ratio = 1.0f / ratio;
         h->comp.env = 0.0f;
-        h->comp.makeup_gain = compute_compressor_makeup_gain(threshold, ratio);
+        // 2026-09-24: peak_env seeded at 0 (not any assumed level) - with
+        // peak_env <= threshold, compressor_process() starts at
+        // makeup_gain=1.0 (no boost) until the real signal's peak has
+        // actually been observed, per its own comment. Shares attack_coef
+        // above; only needs its own (much slower) release coefficient.
+        h->comp.peak_env = 0.0f;
+        h->comp.peak_release_coef = 1.0f - expf(-1.0f / (h->sample_rate_hz * (COMP_PEAK_HOLD_RELEASE_MS / 1000.0f)));
+        h->comp.makeup_gain = 1.0f;
 
         ESP_LOGI(TAG, "ssb_dsp audio_fx enabled: hpf=%.0fHz presence=%.0fHz/%+.1fdB/Q%.2f "
-                 "comp=thresh%.2f/ratio%.1f:1/atk%.1fms/rel%.1fms",
+                 "comp=thresh%.2f/ratio%.1f:1/atk%.1fms/rel%.1fms/peak-hold-rel%.0fms",
                  hpf_fc, presence_fc, cfg->audio_fx.presence_gain_db, presence_q,
-                 threshold, ratio, attack_ms, release_ms);
+                 threshold, ratio, attack_ms, release_ms, COMP_PEAK_HOLD_RELEASE_MS);
     }
 
     *out_handle = h;
@@ -492,10 +551,14 @@ void ssb_dsp_set_compressor(ssb_dsp_handle_t handle, float threshold, float rati
     if (!handle || !handle->audio_fx_configured) return;
     if (threshold > 0.0f) handle->comp.threshold = threshold;
     if (ratio > 1.0f)     handle->comp.inv_ratio = 1.0f / ratio;
-    // Recompute from whatever's now current (not just the just-passed
-    // args - either one might have been left unchanged this call).
-    float current_ratio = 1.0f / handle->comp.inv_ratio;
-    handle->comp.makeup_gain = compute_compressor_makeup_gain(handle->comp.threshold, current_ratio);
+    // 2026-09-24: makeup_gain no longer needs recomputing here - it's
+    // derived every sample in compressor_process() from peak_env against
+    // whatever threshold/inv_ratio are current, so the very next sample
+    // after this call already reflects the new setting correctly. No
+    // reset of peak_env either: the signal's actual observed peak level
+    // didn't change just because threshold/ratio did, so there's nothing
+    // stale to clear (unlike env's reset-on-enable below, which is about
+    // resuming from a frozen value after a period of not running at all).
 }
 
 void IRAM_ATTR ssb_dsp_set_eq_enabled(ssb_dsp_handle_t handle, bool enable)
@@ -534,7 +597,15 @@ void IRAM_ATTR ssb_dsp_set_compressor_enabled(ssb_dsp_handle_t handle, bool enab
     // keeps running its OWN state update only inside compressor_process,
     // which isn't called at all while comp_enable is false, so env is
     // simply frozen, not decaying - starting clean avoids a jump/thump).
-    if (enable) handle->comp.env = 0.0f;
+    // 2026-09-24: peak_env gets the same treatment, same reasoning - and
+    // makeup_gain resets to the same neutral 1.0f ssb_dsp_init() seeds it
+    // with, since peak_env=0.0f means "nothing observed yet" the same way
+    // it does at init.
+    if (enable) {
+        handle->comp.env = 0.0f;
+        handle->comp.peak_env = 0.0f;
+        handle->comp.makeup_gain = 1.0f;
+    }
 }
 
 bool ssb_dsp_get_eq_enabled(ssb_dsp_handle_t handle)
@@ -562,7 +633,11 @@ void ssb_dsp_get_iir_canary(ssb_dsp_handle_t handle, ssb_dsp_iir_canary_t *out)
     }
     out->eq_hpf_finite = isfinite(handle->eq_hpf.y1) && isfinite(handle->eq_hpf.y2);
     out->eq_presence_finite = isfinite(handle->eq_presence.y1) && isfinite(handle->eq_presence.y2);
-    out->compressor_env_finite = isfinite(handle->comp.env);
+    // 2026-09-24: also covers peak_env/makeup_gain, the new peak-tracking
+    // state - still one bool, since all three are "is the compressor's
+    // internal state healthy," the same thing this field already meant.
+    out->compressor_env_finite = isfinite(handle->comp.env) && isfinite(handle->comp.peak_env)
+                               && isfinite(handle->comp.makeup_gain);
 }
 
 void IRAM_ATTR ssb_dsp_set_master_gain_db(ssb_dsp_handle_t handle, float gain_db)

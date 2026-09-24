@@ -178,14 +178,16 @@ void ssb_dsp_get_iir_canary(ssb_dsp_handle_t handle, ssb_dsp_iir_canary_t *out);
  * @brief Master gain trim, in dB, applied after EQ/compressor (or
  *        directly to the raw sample if audio_fx wasn't enabled at init -
  *        this always works). Deliberately manual rather than automatic:
- *        the compressor's gain reduction is exactly computable from its
- *        threshold/ratio (see ssb_dsp_set_compressor - its makeup gain
- *        is applied automatically now), but EQ's effect on perceived
- *        level depends on the input spectrum, which isn't something
- *        this module can know - use this to trim it out by ear/scope
- *        instead of trusting a guessed number. IRAM_ATTR: safe to call
- *        from the real-time path, though intended for occasional calls
- *        (e.g. a serial '+'/'-' command), not per-sample.
+ *        the compressor's own makeup gain is applied automatically (as of
+ *        2026-09-24, tracked dynamically from the signal's own observed
+ *        peak level rather than a fixed assumption that it peaks at
+ *        0dBFS - see ssb_dsp.c's compressor_t/compressor_process()
+ *        comments), but EQ's effect on perceived level depends on the
+ *        input spectrum, which isn't something this module can know -
+ *        use this to trim it out by ear/scope instead of trusting a
+ *        guessed number. IRAM_ATTR: safe to call from the real-time path,
+ *        though intended for occasional calls (e.g. a serial '+'/'-'
+ *        command), not per-sample.
  */
 void IRAM_ATTR ssb_dsp_set_master_gain_db(ssb_dsp_handle_t handle, float gain_db);
 float ssb_dsp_get_master_gain_db(ssb_dsp_handle_t handle);

@@ -388,7 +388,7 @@ Flagged, not yet tested: **GPIO9-12 (the AD9851 bit-bang interface) are the stro
 | Key | Effect |
 |---|---|
 | `e` | Toggle EQ (HPF + presence peak) on/off |
-| `c` | Toggle compressor on/off (automatic makeup gain applied) |
+| `c` | Toggle compressor on/off. Makeup gain is automatic and, as of 2026-09-24, dynamically tracks the signal's own observed peak level (a slow ~2s peak-hold, separate from the compressor's fast attack/release) rather than assuming the signal peaks at 0dBFS — so whatever level the actual source peaks at (e.g. a quiet mic) is what comes back out after compression, not an over/under-corrected guess. See `ssb_dsp.c`'s `compressor_t`/`compressor_process()` for the derivation |
 | `+` | Master gain +1.0dB |
 | `-` | Master gain -1.0dB |
 | `.` | Master gain +0.1dB (fine step) |
