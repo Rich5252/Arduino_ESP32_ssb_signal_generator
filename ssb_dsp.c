@@ -55,6 +55,39 @@ typedef struct {
     int level_db;                      // current ssb_dsp_set_compressor_level() setting
 } compressor_t;
 
+// 2026-09-25: Mic Squelch - see ssb_dsp_set_squelch_enabled()'s doc
+// comment in ssb_dsp.h for the full design rationale (why this exists
+// alongside envelope_floor.h rather than reusing it, why it sits here
+// rather than downstream on the demodulated envelope, and why three
+// separate one-pole stages rather than one instantaneous compare).
+#define SSB_DSP_SQUELCH_ATTACK_MS        5.0f   // detector: long enough that an isolated
+                                                  // single-sample click barely moves it (see
+                                                  // header doc comment's ~1.25%-of-impulse
+                                                  // figure), short enough to track genuine
+                                                  // speech onset within a few ms
+#define SSB_DSP_SQUELCH_RELEASE_MS      30.0f    // detector: how fast the LEVEL ESTIMATE itself
+                                                  // decays once real signal stops - deliberately
+                                                  // much faster than the GAIN's own release below,
+                                                  // this just tracks level, it doesn't shape the
+                                                  // audible transition
+#define SSB_DSP_SQUELCH_GAIN_ATTACK_MS   5.0f    // gate gain: fast open, don't clip speech onset
+#define SSB_DSP_SQUELCH_GAIN_RELEASE_MS 150.0f   // gate gain: slow close, avoid audible chatter on
+                                                  // brief in-word dips - this IS the number that
+                                                  // shapes the audible open/close transition
+#define SSB_DSP_SQUELCH_HYSTERESIS_RATIO 0.5f    // close threshold = 0.5x open threshold (~-6dB
+                                                  // Schmitt margin) - standard noise-gate practice,
+                                                  // stops chatter for a signal hovering at one level
+
+typedef struct {
+    volatile bool enable;
+    volatile float threshold;   // OPEN threshold; close threshold is threshold*HYSTERESIS_RATIO
+    float detector_attack_coef, detector_release_coef;
+    float detector_env;         // smoothed fabsf(audio_sample) - the level ESTIMATE
+    bool gate_open;             // Schmitt-trigger state
+    float gain_attack_coef, gain_release_coef;
+    float gain;                 // smoothed [0,1] multiplier actually applied to the sample
+} squelch_t;
+
 // 2026-09-25: per-level calibration table replacing the switchable-mode
 // compressor. {ratio, makeup_gain} pairs are CONSTANTS baked in from an
 // offline Python calibration against the user's own real mic-to-ADC
@@ -381,6 +414,35 @@ static inline float IRAM_ATTR compressor_process(compressor_t *c, float x)
     return x * gain * c->makeup_gain;
 }
 
+// Three-stage noise gate - see ssb_dsp_set_squelch_enabled()'s doc comment
+// in ssb_dsp.h for the full rationale. Detector tracks level (rejecting
+// brief clicks by construction), a Schmitt trigger turns that into a
+// hysteretic open/closed decision, and a separately-smoothed gain is what
+// actually gets multiplied - the only thing touching the sample value is
+// that last, continuous gain, so there is no hard clamp/kink anywhere in
+// the signal path itself (the class of bug envelope_floor.cpp's own
+// header documents two earlier, reverted designs hitting).
+static inline float IRAM_ATTR squelch_process(squelch_t *s, float x)
+{
+    float ax = fabsf(x);
+    float dcoef = (ax > s->detector_env) ? s->detector_attack_coef : s->detector_release_coef;
+    s->detector_env = flush_denorm(s->detector_env + dcoef * (ax - s->detector_env));
+
+    float open_thr = s->threshold;
+    float close_thr = s->threshold * SSB_DSP_SQUELCH_HYSTERESIS_RATIO;
+    if (s->gate_open) {
+        if (s->detector_env < close_thr) s->gate_open = false;
+    } else {
+        if (s->detector_env > open_thr) s->gate_open = true;
+    }
+
+    float target_gain = s->gate_open ? 1.0f : 0.0f;
+    float gcoef = (target_gain > s->gain) ? s->gain_attack_coef : s->gain_release_coef;
+    s->gain = flush_denorm(s->gain + gcoef * (target_gain - s->gain));
+
+    return x * s->gain;
+}
+
 struct ssb_dsp_s {
     int num_taps;
     int center;                 // (num_taps - 1) / 2, also the direct-path delay
@@ -485,6 +547,12 @@ struct ssb_dsp_s {
     volatile float mic_gain_db;
     volatile float mic_gain_linear;
 
+    // 2026-09-25: Mic Squelch - see ssb_dsp_set_squelch_enabled()'s doc
+    // comment in ssb_dsp.h. Unconditional/always-available, same reasoning
+    // as mic_gain_db just above (a mic-input-quality fix, not part of the
+    // audio_fx_configured EQ/compressor subsystem).
+    squelch_t squelch;
+
     // Sub-phase timing high-water marks, see ssb_dsp_get_profile().
     uint32_t max_audio_fx_us;
     uint32_t max_fir_us;
@@ -564,6 +632,23 @@ esp_err_t ssb_dsp_init(const ssb_dsp_config_t *cfg, ssb_dsp_handle_t *out_handle
     h->master_gain_linear = 1.0f;
     h->mic_gain_db = 0.0f;
     h->mic_gain_linear = 1.0f;
+
+    // 2026-09-25: Mic Squelch defaults - OFF (existing behavior unchanged
+    // until deliberately opted into), threshold at a conservative starting
+    // point (see ssb_dsp_set_squelch_enabled()'s doc comment - this is a
+    // reasoned first cut, not a measured optimum, tune on the bench).
+    // Coefficients computed once here (expf() at init only, never in the
+    // per-sample squelch_process() path), same convention as the
+    // compressor's own attack/release coefficients below.
+    h->squelch.enable = false;
+    h->squelch.threshold = 0.01f;
+    h->squelch.detector_attack_coef  = 1.0f - expf(-1.0f / (h->sample_rate_hz * (SSB_DSP_SQUELCH_ATTACK_MS / 1000.0f)));
+    h->squelch.detector_release_coef = 1.0f - expf(-1.0f / (h->sample_rate_hz * (SSB_DSP_SQUELCH_RELEASE_MS / 1000.0f)));
+    h->squelch.detector_env = 0.0f;
+    h->squelch.gate_open = false;
+    h->squelch.gain_attack_coef  = 1.0f - expf(-1.0f / (h->sample_rate_hz * (SSB_DSP_SQUELCH_GAIN_ATTACK_MS / 1000.0f)));
+    h->squelch.gain_release_coef = 1.0f - expf(-1.0f / (h->sample_rate_hz * (SSB_DSP_SQUELCH_GAIN_RELEASE_MS / 1000.0f)));
+    h->squelch.gain = 0.0f;
 
     h->audio_fx_configured = cfg->audio_fx.enable;
     h->eq_enable = cfg->audio_fx.enable;     // default both stages "on" if configured at all -
@@ -744,6 +829,39 @@ float ssb_dsp_get_mic_gain_db(ssb_dsp_handle_t handle)
     return handle ? handle->mic_gain_db : 0.0f;
 }
 
+void IRAM_ATTR ssb_dsp_set_squelch_enabled(ssb_dsp_handle_t handle, bool enable)
+{
+    if (!handle) return;
+    handle->squelch.enable = enable;
+    // Reset state on enable so a stale gain/gate-open value from a
+    // previous session doesn't briefly pass or block audio incorrectly
+    // the instant this is turned back on - same "start closed, prove
+    // there's a signal" conservative default ssb_dsp_init() uses.
+    if (enable) {
+        handle->squelch.gate_open = false;
+        handle->squelch.gain = 0.0f;
+        handle->squelch.detector_env = 0.0f;
+    }
+}
+
+bool ssb_dsp_get_squelch_enabled(ssb_dsp_handle_t handle)
+{
+    return handle ? handle->squelch.enable : false;
+}
+
+void IRAM_ATTR ssb_dsp_set_squelch_threshold(ssb_dsp_handle_t handle, float threshold)
+{
+    if (!handle) return;
+    if (threshold < SSB_DSP_SQUELCH_THRESHOLD_MIN) threshold = SSB_DSP_SQUELCH_THRESHOLD_MIN;
+    if (threshold > SSB_DSP_SQUELCH_THRESHOLD_MAX) threshold = SSB_DSP_SQUELCH_THRESHOLD_MAX;
+    handle->squelch.threshold = threshold;
+}
+
+float ssb_dsp_get_squelch_threshold(ssb_dsp_handle_t handle)
+{
+    return handle ? handle->squelch.threshold : 0.0f;
+}
+
 void ssb_dsp_get_freq_dev_stats(ssb_dsp_handle_t handle, ssb_dsp_freq_dev_stats_t *out)
 {
     if (!out) return;
@@ -896,6 +1014,16 @@ void IRAM_ATTR ssb_dsp_process_sample(ssb_dsp_handle_t handle,
     // default) costs nothing worth measuring.
     int64_t t0 = esp_timer_get_time();
     audio_sample *= handle->mic_gain_linear;
+
+    // 2026-09-25: Mic Squelch - deliberately BEFORE the compressor, not
+    // downstream on the envelope like envelope_floor/ALC/Soft-Limit - see
+    // ssb_dsp_set_squelch_enabled()'s doc comment in ssb_dsp.h for why
+    // ordering matters here specifically (the compressor's makeup_gain
+    // multiplies every sample unconditionally, so gating after it would
+    // mean gating already-amplified noise). Unconditional check on
+    // squelch.enable, independent of audio_fx_configured - same "always
+    // available" reasoning as mic gain just above.
+    if (handle->squelch.enable) audio_sample = squelch_process(&handle->squelch, audio_sample);
 
     // Optional pre-Hilbert conditioning: compressor -> EQ, on the raw
     // sample, before anything enters the Hilbert delay line. This keeps

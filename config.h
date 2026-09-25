@@ -161,6 +161,14 @@
 // '.'/',' above if bench use shows a need for finer control.
 #define MIC_GAIN_STEP_DB 1.0f  // per 'U'/'Y' keypress - see ssb_dsp_set_mic_gain_db()
 
+// 2026-09-25: Mic Squelch threshold step, per '('/')' keypress - see
+// ssb_dsp_set_squelch_enabled()'s doc comment in ssb_dsp.h. Threshold is
+// linear (full-scale-referenced), not dB, so this is a plain additive
+// step, not a multiplicative one - matches ENV_FLOOR_STEP's own
+// resolution (envelope_floor.cpp), chosen there to sit close to the
+// active PWM output path's own quantization step.
+#define SQUELCH_THRESHOLD_STEP 0.001f  // per '('/')' keypress - see ssb_dsp_set_squelch_threshold()
+
 // Mic-path DC-blocking single-pole filter's time constant, in seconds -
 // dsp_task computes dc_alpha = expf(-1.0f / (SAMPLE_RATE_HZ *
 // DC_BLOCK_TIME_CONSTANT_S)) from this at startup, instead of hardcoding

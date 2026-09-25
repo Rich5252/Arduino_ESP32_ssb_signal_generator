@@ -224,6 +224,21 @@ typedef struct
     float mic_gain_db;    // 'U'/'Y' - ssb_dsp.h, 0.0dB (unity) by default
     int comp_level_db;    // 'X'/'q' - ssb_dsp.h, level 0 (limiter only) by default
 
+    // 2026-09-25, later: Mic Squelch - appended at the END, same
+    // positional-append reason as every trailing field above. Zero-fills
+    // to squelch_enable=false, squelch_threshold=0.0 - a genuine
+    // preserves-prior-behavior default this time (unlike comp_level_db's
+    // deliberate change above): squelch didn't exist before, so "off,
+    // threshold irrelevant" is exactly the old behavior. See
+    // ssb_dsp_set_squelch_enabled()'s doc comment in ssb_dsp.h. NOTE:
+    // loading ANY preset - including every existing one below, none of
+    // which specify these two fields - resets squelch_threshold to 0.0,
+    // NOT ssb_dsp_init()'s own 0.01 runtime default (harmless while
+    // squelch_enable is also zero-filled to false, but worth knowing if
+    // dialing threshold live right after a preset load).
+    bool squelch_enable;       // 'W' - ssb_dsp.h, off by default
+    float squelch_threshold;  // '('/')' - ssb_dsp.h, 0.0 (off/no threshold) by default
+
 } PersistentSettings;
 
 
@@ -322,15 +337,15 @@ SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM },
 // preset 9 below, no independent real-voice calibration cross-check
 // applies to this one's mic_gain_db value, it's simply the user's stated
 // new setting.
-{ "Micr WhiteNoise", AUDIO_SRC_MIC, 2.68f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV8, true, true, 0.0f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, false, false, ENV_GDEQ_VARIANT_DEFAULT, true, true, 7.0f, 6 },
+{ "Micr WhiteNoise", AUDIO_SRC_MIC, 2.68f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV8, true, true, 0.0f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, false, false, ENV_GDEQ_VARIANT_DEFAULT, true, true, 14.0f, 6, true, 0.0160f },
 // Preset 9 - 2026-09-25: migrated to new mic-gain/compressor-level
 // architecture per explicit user request (old master_gain_db=6.3f moved
 // out; compressor now on with mic_gain_db=14.0f, comp_level_db=6). Per
 // the user, 14dB reflects a louder speaker setup than the 6.3dB voice
-// tuning this preset carried before - NOT a re-assertion of the earlier
+// tuning this preset carried before - NOT a re-assertion of the earlier, true, 0.0160f
 // 6.3dB/6.17dB calibration match noted 2026-09-25 (that comparison applies
 // to the OLD value this preset just moved away from, not to 14dB).
-{ "Micr Voice", AUDIO_SRC_MIC, 2.68f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV8, true, true, 0.0f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, false, false, ENV_GDEQ_VARIANT_DEFAULT, true, true, 14.0f, 6 }
+{ "Micr Voice", AUDIO_SRC_MIC, 2.68f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV8, true, true, 0.0f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, false, false, ENV_GDEQ_VARIANT_DEFAULT, true, true, 7.0f, 6, true, 0.0160f }
 };
 
 // If this array's size ever changes, ssb_mic_test.ino's serial handler

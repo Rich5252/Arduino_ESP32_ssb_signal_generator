@@ -933,6 +933,30 @@ void handle_serial_commands(void)
             serial_reply("-> compression level %d%s%s\r\n", level,
                           level == SSB_DSP_COMP_LEVEL_MIN ? " (limiter only, no boost)" : "",
                           ssb_dsp_get_compressor_enabled(dsp_state_get_ssb()) ? "" : " - no effect until 'c' is ON");
+        } else if (c == 'W') {
+            // 2026-09-25: Mic Squelch on/off - reuses 'W', free since the
+            // old switchable-compressor-mode cycling command it used to
+            // mean was removed entirely (see 'X's own comment above). See
+            // ssb_dsp_set_squelch_enabled()'s doc comment in ssb_dsp.h -
+            // this is a genuine "silence it" gate, NOT envelope_floor.h's
+            // 'x'/'z' (that one structurally can't reach zero, see its own
+            // 2026-09-25 doc update). Threshold via '('/')'.
+            bool now_on = !ssb_dsp_get_squelch_enabled(dsp_state_get_ssb());
+            ssb_dsp_set_squelch_enabled(dsp_state_get_ssb(), now_on);
+            serial_reply("-> mic squelch %s (threshold %.4f, see '('/')')\r\n", now_on ? "ON" : "off",
+                          ssb_dsp_get_squelch_threshold(dsp_state_get_ssb()));
+        } else if (c == '(') {
+            float new_thr = ssb_dsp_get_squelch_threshold(dsp_state_get_ssb()) - SQUELCH_THRESHOLD_STEP;
+            ssb_dsp_set_squelch_threshold(dsp_state_get_ssb(), new_thr);
+            new_thr = ssb_dsp_get_squelch_threshold(dsp_state_get_ssb());   // re-read: setter clamps
+            serial_reply("-> mic squelch threshold %.4f%s\r\n", new_thr,
+                          ssb_dsp_get_squelch_enabled(dsp_state_get_ssb()) ? "" : " - no effect until 'W' is ON");
+        } else if (c == ')') {
+            float new_thr = ssb_dsp_get_squelch_threshold(dsp_state_get_ssb()) + SQUELCH_THRESHOLD_STEP;
+            ssb_dsp_set_squelch_threshold(dsp_state_get_ssb(), new_thr);
+            new_thr = ssb_dsp_get_squelch_threshold(dsp_state_get_ssb());
+            serial_reply("-> mic squelch threshold %.4f%s\r\n", new_thr,
+                          ssb_dsp_get_squelch_enabled(dsp_state_get_ssb()) ? "" : " - no effect until 'W' is ON");
         } else if (c == '+') {
             float new_gain = ssb_dsp_get_master_gain_db(dsp_state_get_ssb()) + MASTER_GAIN_STEP_DB;
             dsp_state_set_master_gain_db(new_gain);
@@ -1168,6 +1192,18 @@ void handle_serial_commands(void)
             // level design). Neither is bench-validated yet; comp_level_db
             // defaults to 0 (limiter only, no boost) - a deliberate change
             // from the old design's automatic makeup gain.
+            //
+            // 2026-09-25, later: squelch_enable/squelch_threshold appended
+            // as two more trailing fields - ssb_dsp_set_squelch_enabled()/
+            // ssb_dsp_set_squelch_threshold() ('W' toggle, '('/')' step).
+            // Existing presets don't need editing (same positional-
+            // zero-fill convention as every other trailing field) - but
+            // note the zero-fill gives squelch_threshold=0.0, NOT
+            // ssb_dsp_init()'s own 0.01 runtime default: loading ANY
+            // existing preset resets threshold to 0.0 (harmless while
+            // squelch is off, same as every other zero-filled field, but
+            // worth knowing - '(' /')' after loading a preset starts from
+            // 0.0, not the pre-preset-load value). NOT bench-validated.
 #if AD9851_ATTACHED
             float rel_delay = relative_delay_get_samples();
             bool rf_enabled = carrier_output_get_rf_enabled();
@@ -1220,7 +1256,12 @@ void handle_serial_commands(void)
             // and %.2ff would silently round anything below 0.01 to "0.00f",
             // losing a deliberately-dialed-in floor value the moment it's
             // pasted into a preset.
-            serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.4ff, %s, %s, %s, %s, %s, %s, %s, %s, %.1ff, %d },\r\n",
+            // 2026-09-25: two more trailing fields appended - squelch_enable
+            // (%s, true/false) and squelch_threshold (%.4ff, same
+            // rounding-loss reasoning as env_floor's field above - the
+            // active step size is 0.001, %.2ff would round every
+            // meaningful value to 0.00f).
+            serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.4ff, %s, %s, %s, %s, %s, %s, %s, %s, %.1ff, %d, %s, %.4ff },\r\n",
                           audio_source_enum_name(dsp_state_get_audio_source()),
                           rel_delay,
                           envelope_output_get_pwm_offset(),
@@ -1242,7 +1283,9 @@ void handle_serial_commands(void)
                           envelope_alc_get_enabled() ? "true" : "false",
                           envelope_softlimit_get_enabled() ? "true" : "false",
                           ssb_dsp_get_mic_gain_db(dsp_state_get_ssb()),
-                          ssb_dsp_get_compressor_level(dsp_state_get_ssb()));
+                          ssb_dsp_get_compressor_level(dsp_state_get_ssb()),
+                          ssb_dsp_get_squelch_enabled(dsp_state_get_ssb()) ? "true" : "false",
+                          ssb_dsp_get_squelch_threshold(dsp_state_get_ssb()));
         } else if (c >= '0' && c <= '9') {
             int preset = c - '0';
             const PersistentSettings& p = settingsPresets[preset];
@@ -1340,6 +1383,14 @@ void handle_serial_commands(void)
             // comment) - safe to call unconditionally on every preset load.
             ssb_dsp_set_mic_gain_db(dsp_state_get_ssb(), p.mic_gain_db);
             ssb_dsp_set_compressor_level(dsp_state_get_ssb(), p.comp_level_db);
+
+            // 2026-09-25: Mic Squelch's two trailing fields - same
+            // unconditional-on-every-load pattern as mic gain/compression
+            // level just above. ssb_dsp_set_squelch_enabled() resets the
+            // gate/detector state on enable, so this is safe even when a
+            // preset switches squelch on that was previously off.
+            ssb_dsp_set_squelch_threshold(dsp_state_get_ssb(), p.squelch_threshold);
+            ssb_dsp_set_squelch_enabled(dsp_state_get_ssb(), p.squelch_enable);
 
             serial_reply("-> preset %d: %s\r\n", preset, p.name);
         }

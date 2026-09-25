@@ -255,6 +255,106 @@ void IRAM_ATTR ssb_dsp_set_mic_gain_db(ssb_dsp_handle_t handle, float gain_db);
 float ssb_dsp_get_mic_gain_db(ssb_dsp_handle_t handle);
 
 /**
+ * @brief 2026-09-25: Mic Squelch - a genuine "silence it" gate, requested
+ *        after ssb_dsp_set_mic_gain_db()'s finer-grained sibling,
+ *        envelope_floor.h, turned out (as flagged when that change shipped)
+ *        to be structurally incapable of this: envelope_floor RAISES the
+ *        bottom of the envelope range and can never reach zero by
+ *        construction (see its own header) - it was never going to fix
+ *        "spiky/crackly output at low mic input" no matter how finely its
+ *        step size was tuned, only reduce how far into a bad predistort
+ *        region near-silence could drive. This is the actual gate: below
+ *        threshold, output is forced toward true zero; above it, audio
+ *        passes through unaffected.
+ *
+ *        PLACEMENT - deliberately BEFORE the compressor/EQ (right after
+ *        mic gain, at the very top of ssb_dsp_process_sample()), not
+ *        downstream on the demodulated envelope like envelope_floor/
+ *        envelope_alc/envelope_softlimit are. This matters mechanically,
+ *        not just stylistically: the compressor's makeup_gain multiplies
+ *        EVERY sample unconditionally, including ones below its own
+ *        threshold (see compressor_process() in ssb_dsp.c - `gain=1.0`
+ *        below threshold, but `x * gain * makeup_gain` still applies
+ *        makeup regardless) - so quiet residual noise gets the same fixed
+ *        dB boost real speech does. Squelching AFTER the compressor would
+ *        mean gating a signal that's already been amplified up toward the
+ *        same operating range as quiet real speech, making the two hard
+ *        to tell apart. Squelching BEFORE it (here) gates the noise at
+ *        its true, un-boosted level, before anything downstream gets a
+ *        chance to amplify it.
+ *
+ *        ALGORITHM - three stages, not a single instantaneous compare,
+ *        specifically to avoid two failure modes: (1) a single noisy
+ *        sample or brief click falsely tripping the gate open, and (2)
+ *        the gate itself introducing a new discontinuity/click at every
+ *        open or close transition (the exact class of problem
+ *        envelope_floor.cpp's own header documents two EARLIER, reverted
+ *        designs hitting - a phase freeze and a hard envelope clamp, both
+ *        removed after real-hardware testing showed genuine new
+ *        distortion). Same "gain-computer + smoothed asymmetric
+ *        attack/release" topology envelope_alc.h already uses safely for
+ *        a related reason:
+ *          a) LEVEL DETECTOR - a one-pole follower on fabsf(audio_sample)
+ *             (post mic-gain, pre-compressor), its own attack/release
+ *             time constants chosen specifically to reject brief spikes:
+ *             at a 5ms attack time constant, one isolated single-sample
+ *             (62.5us @ 16kHz) impulse moves the detector by only
+ *             ~1-exp(-Ts/tau) =~ 1.25% of the impulse's own amplitude -
+ *             an isolated "crackle" click would need to be roughly 80x a
+ *             real signal's amplitude to trip this detector by itself,
+ *             while genuine sustained speech still registers within a
+ *             handful of milliseconds.
+ *          b) HYSTERESIS (Schmitt trigger) - opens above `threshold`,
+ *             closes only once the detector drops BELOW threshold *
+ *             SSB_DSP_SQUELCH_HYSTERESIS_RATIO (a lower, separate close
+ *             point) - standard noise-gate practice, prevents rapid
+ *             open/close "chatter" for a signal hovering right at a
+ *             single threshold value (which, unaddressed, would itself
+ *             sound like the exact crackle this feature exists to fix).
+ *          c) GAIN RAMP - the resulting open/closed decision drives a
+ *             SEPARATE one-pole smoothed gain (fast attack so genuine
+ *             speech onsets aren't clipped, slow release so brief
+ *             in-word dips don't cause audible chatter) that's what
+ *             actually multiplies the sample - continuous by
+ *             construction, so (unlike the reverted hard-clamp
+ *             envelope_floor design) there's no derivative discontinuity
+ *             introduced at the threshold itself.
+ *
+ *        Threshold is in the same full-scale-referenced linear units as
+ *        SSB_DSP_COMP_THRESHOLD (0.30) and the ~0.85 mic-gain calibration
+ *        target - NOT dB, NOT normalized to compressor_level. Range is
+ *        deliberately capped well below the compressor's own 0.30
+ *        threshold (SSB_DSP_SQUELCH_THRESHOLD_MAX below) so a
+ *        misconfigured squelch can't eat into legitimate quiet speech
+ *        that the compressor itself would still treat as normal signal.
+ *
+ *        Unconditional, independent of audio_fx_configured/comp_enable -
+ *        same "always available" reasoning as mic_gain_db/master_gain_db
+ *        (this is a mic-input-quality fix, useful whether or not the
+ *        compressor is even in use). OFF by default (threshold irrelevant
+ *        until enabled) - existing behavior unchanged until deliberately
+ *        opted into, same convention as every other toggle in this file.
+ *
+ *        NOT YET BENCH-VALIDATED - first cut, built from the documented
+ *        failure modes of three EARLIER related designs (envelope_floor's
+ *        two reverted attempts, envelope_alc's proven-safe topology) but
+ *        not itself measured against the actual reported crackle yet. The
+ *        specific attack/release/hysteresis numbers are reasoned starting
+ *        points, not fitted/measured optima - same epistemic status this
+ *        project gives every other "first cut" feature (see
+ *        envelope_alc.h's own status section for the pattern this
+ *        follows).
+ */
+#define SSB_DSP_SQUELCH_THRESHOLD_MIN   0.0f
+#define SSB_DSP_SQUELCH_THRESHOLD_MAX   0.10f   // well below SSB_DSP_COMP_THRESHOLD (0.30) -
+                                                  // see doc comment above for why
+
+void IRAM_ATTR ssb_dsp_set_squelch_enabled(ssb_dsp_handle_t handle, bool enable);
+bool ssb_dsp_get_squelch_enabled(ssb_dsp_handle_t handle);
+void IRAM_ATTR ssb_dsp_set_squelch_threshold(ssb_dsp_handle_t handle, float threshold);
+float ssb_dsp_get_squelch_threshold(ssb_dsp_handle_t handle);
+
+/**
  * @brief 2026-09-25: Compression Level - replaces free-running
  *        threshold/ratio (and the whole switchable-mode idea above) with a
  *        small set of discrete, integer-dB presets: 0 (SSB_DSP_COMP_LEVEL_MIN,

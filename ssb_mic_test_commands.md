@@ -393,6 +393,9 @@ Flagged, not yet tested: **GPIO9-12 (the AD9851 bit-bang interface) are the stro
 | `Y` | Mic Gain -1.0dB |
 | `X` | Compression level +1 (0-10) |
 | `q` | Compression level -1 (0-10) |
+| `W` | Toggle Mic Squelch on/off |
+| `(` | Mic Squelch threshold -0.001 |
+| `)` | Mic Squelch threshold +0.001 |
 | `+` | Master gain +1.0dB |
 | `-` | Master gain -1.0dB |
 | `.` | Master gain +0.1dB (fine step) |
@@ -412,6 +415,18 @@ Flagged, not yet tested: **GPIO9-12 (the AD9851 bit-bang interface) are the stro
 Master gain scales the *whole* chain (phase + envelope together, inside `ssb_dsp`) — different from the PWM range knobs above, which only touch envelope, and different from Mic Gain, which is applied before the compressor rather than after it. `.`/`,` give 0.1dB resolution for dialing in precise gain-sweep measurement points (e.g. re-measuring `envelope_predistort.h`'s calibration table at finer steps) without 10 presses of `+`/`-` per dB.
 
 **NOT bench-validated** — this whole redesign (Mic Gain, the new curve, the compression-level table, the safety clamp) is built and numerically verified against one offline recording, not yet tried on real hardware.
+
+**2026-09-25, later: Mic Squelch (`W`/`(`/`)`) — a genuine "silence it" gate, added after `envelope_floor` (`x`/`z`) turned out unable to do this.** `envelope_floor` raises the bottom of the envelope range and can never reach zero by construction (see its own 2026-09-25 doc update) — it was the wrong tool for "spiky/crackly output at low mic input" no matter how finely tuned. This is the actual gate: below threshold, output is forced toward true silence; above it, audio passes through unaffected.
+
+Sits *before* the compressor (right after Mic Gain), not downstream on the envelope the way `envelope_floor`/ALC (`l`)/Soft-Limit (`S`) are — deliberately, because the compressor's makeup gain multiplies every sample unconditionally, including ones below its own threshold, so squelching after it would mean gating noise that's already been amplified toward the same range as quiet real speech. Squelching first gates the noise at its true, un-boosted level.
+
+Three stages, not a single instantaneous compare, to avoid two failure modes: a single noisy sample tripping the gate open, and the gate itself clicking at every transition (the exact class of distortion two earlier, reverted `envelope_floor` designs hit — see that file's header). A smoothed level detector (5ms attack) tracks level while rejecting brief clicks — an isolated single-sample spike needs to be roughly 80x a real signal's amplitude to trip it by itself, while genuine sustained speech still registers within a few ms. A hysteresis (Schmitt-trigger) comparator opens above `threshold` and only closes once level drops to half that, preventing chatter for a signal hovering near one value. A separately-smoothed gain (fast 5ms attack, slow 150ms release) is what actually multiplies the sample, continuous by construction — no hard clamp or kink anywhere in the signal path.
+
+Threshold is linear, full-scale-referenced (same units as the compressor's own 0.30 threshold and the ~0.85 mic-gain calibration target) — NOT dB. Range is capped at 0.10, well below the compressor's own 0.30, so a misconfigured squelch can't eat real quiet speech. `(`/`)` step by 0.001 (matches `envelope_floor`'s own step, close to the active PWM path's quantization). `W` toggles on/off; OFF by default, threshold defaults to 0.01 at boot but **resets to 0.0 on every preset load** (`'0'`-`'9'`) since no existing preset specifies it yet — dial it in with `)` after loading a preset, before turning `W` on.
+
+**Important limitation, characterized numerically, not just asserted:** the 5ms detector attack means genuinely brief clicks (a fraction of a millisecond) need to be very loud (>80x threshold) to slip through, but a *sustained* burst of just a few milliseconds trips the gate open even at modest amplitude (as low as 2x threshold by 5ms). If the reported crackle is short bursts rather than isolated single-sample glitches, this squelch may only partially help — it's tuned to reject clicks, not to distinguish a few-ms burst of noise from a few-ms burst of quiet speech, which no envelope-following gate can fully do.
+
+**NOT bench-validated** — first cut, built from the documented failure modes of `envelope_floor`'s two reverted designs and ALC's proven-safe topology, verified numerically (synthetic click/burst/speech tests) but not yet tried against the actual reported crackle on real hardware.
 
 ## RF output
 
@@ -465,7 +480,7 @@ Workflow to reproduce a reading: `T` to a tone-pair preset, confirm `e`/`c` (EQ/
 
 | Key | Effect |
 |---|---|
-| `0`-`9` | Load a preset from `settings.h` — sets every lever above (audio source, relative delay, PWM offset/scale, gdeq, ADC LPF mode, EQ, compressor, master gain, RF output, envelope pre-distortion, envelope-null floor, freq_dev slew-rate limit, envelope output interpolation, interpolation curve, mic gain, compression level) in one command. Boot banner lists the current names (dynamically, from the array's own size — always up to date). |
+| `0`-`9` | Load a preset from `settings.h` — sets every lever above (audio source, relative delay, PWM offset/scale, gdeq, ADC LPF mode, EQ, compressor, master gain, RF output, envelope pre-distortion, envelope-null floor, freq_dev slew-rate limit, envelope output interpolation, interpolation curve, mic gain, compression level, mic squelch enable/threshold) in one command. Boot banner lists the current names (dynamically, from the array's own size — always up to date). |
 | `P` | Print the current value of every one of those same levers as a single comma-separated line, wrapped in `{ ... },` and in exactly `PersistentSettings`'s field order — copy/paste it straight into the `settingsPresets[]` array in `settings.h` as a new preset. Rename the placeholder `"Live"` name (and add a numbered comment above it, matching the existing presets' style) after pasting. |
 
 Edit the `settingsPresets` array in `settings.h` to change them, or dial in levers live and use `P` to generate the line instead of hand-typing values — check the live boot banner or `settings.h` itself for the current name/count rather than this doc, since the preset list changes often during active tuning. There's a compile-time check tying the array size to the `'0'`-`'9'` range (`settings.h`'s `static_assert`), so resizing it without updating `loop()`/`setup()`/`serial_commands.cpp`'s preset-select block — and the boot banner's own preset listing loop, which now reads the array size directly rather than a hardcoded count — fails the build instead of silently misbehaving.
