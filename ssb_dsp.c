@@ -20,62 +20,94 @@ typedef struct {
     float x1, x2, y1, y2;
 } biquad_t;
 
+// 2026-09-25: BP_COUNT breakpoints (threshold plus BP_COUNT-1 more, evenly
+// spaced up to SSB_DSP_COMP_XMAX) define a 3-SEGMENT piecewise-linear
+// approximation of a dB-domain/log soft-knee curve - see
+// ssb_dsp_set_compressor_level()'s doc comment in ssb_dsp.h for the full
+// design rationale. bp_x is fixed/shared across every calibrated level
+// (set once at init from the two constants below); only bp_y (the curve's
+// actual shape) and makeup_gain change when the level changes.
+#define SSB_DSP_COMP_BP_COUNT   4
+// Fixed, shared curve threshold - NOT independently configurable (see
+// ssb_audio_fx_config_t's 2026-09-25 comment in ssb_dsp.h for why: every
+// entry in k_comp_level_table below was calibrated against this exact
+// value on real voice data, and would silently go stale if this drifted
+// out from under it without a full recalibration).
+#define SSB_DSP_COMP_THRESHOLD  0.30f
+// Top breakpoint - deliberately a bit above 1.0 so genuine over-drive
+// (mic gain set a little high, or a single loud syllable) still gets a
+// smoothly-continued curve instead of a hard corner right at full scale.
+#define SSB_DSP_COMP_XMAX       1.05f
+
 typedef struct {
     float attack_coef, release_coef;   // one-pole envelope-follower coefficients
-    float threshold, inv_ratio;
     float env;
-    float makeup_gain;   // DYNAMIC as of 2026-09-24 - see peak_env/COMP_PEAK_HOLD_RELEASE_MS
-                          // below and compressor_process()'s comment. No longer a fixed
-                          // constant computed once at init/reconfigure.
-
-    // 2026-09-24: peak-tracking makeup gain, replacing the old fixed
-    // "assume the signal peaks at exactly 0dBFS" formula (see this file's
-    // git history for compute_compressor_makeup_gain(), removed here) -
-    // that assumption doesn't hold for a genuinely quiet source (e.g. the
-    // poor electret capsule currently in use, envelope readings well under
-    // 1.0), so the fixed makeup gain calibrated for a 0dBFS peak was
-    // wrong for this signal's ACTUAL peak - either under- or
-    // over-restoring it depending on how far the real peak sits from the
-    // assumed one. peak_env is a SEPARATE envelope follower from env
-    // above: same (fast) attack, since it needs to see every peak env
-    // itself reacts to, but a much slower release (COMP_PEAK_HOLD_RELEASE_MS)
-    // so it tracks the signal's sustained peak level over roughly a
-    // couple of seconds of programme material, not every syllable -
-    // reacting per-syllable would make makeup_gain itself pump audibly,
-    // exactly the kind of new-artifact risk this project's ALC design
-    // notes already flagged for a similarly-shaped problem. makeup_gain
-    // is recomputed every sample straight from peak_env's own
-    // gain-reduction curve (see compressor_process()), so whatever the
-    // signal's real peak actually is, that peak - not an assumed 0dBFS
-    // one - is what comes back out unchanged post-compression.
-    float peak_env;
-    float peak_release_coef;   // peak_env's release; its ATTACK reuses attack_coef above
+    float bp_x[SSB_DSP_COMP_BP_COUNT]; // fixed/shared breakpoint x-locations (threshold..XMAX)
+    float bp_y[SSB_DSP_COMP_BP_COUNT]; // CURRENT level's breakpoint y-values (pre-makeup) -
+                                        // recomputed only when the level changes, see
+                                        // ssb_dsp_set_compressor_level().
+    float makeup_gain;                 // CURRENT level's FIXED makeup gain - a baked-in
+                                        // constant from k_comp_level_table, never recomputed
+                                        // per-sample from env/peak/anything else (see
+                                        // ssb_dsp_set_compressor_level()'s doc comment in
+                                        // ssb_dsp.h for why this replaced the 2026-09-24
+                                        // peak-tracking scheme).
+    int level_db;                      // current ssb_dsp_set_compressor_level() setting
 } compressor_t;
 
-// 2026-09-24: peak_release_coef's time constant. Deliberately much slower
-// than comp_release_ms (typically ~120ms) - this needs to track the
-// signal's sustained peak level across a speech passage, not decay
-// between syllables, or the dynamically-recomputed makeup_gain in
-// compressor_process() would itself pump in time with the fast envelope's
-// own release. Not yet exposed as a separate audio_fx config field/serial
-// knob - first-cut fixed constant, worth revisiting if bench testing shows
-// 2s is too fast (audible pumping) or too slow (makeup gain lags a real
-// level change, e.g. moving away from the mic, for multiple seconds).
-#define COMP_PEAK_HOLD_RELEASE_MS   2000.0f
+// 2026-09-25: per-level calibration table replacing the switchable-mode
+// compressor. {ratio, makeup_gain} pairs are CONSTANTS baked in from an
+// offline Python calibration against the user's own real mic-to-ADC
+// recording (G4AHN.wav), bisecting ratio to hit each target dB of RMS
+// gain (assuming mic gain has normalized input peak to ~0.85 - see
+// ssb_dsp_set_mic_gain_db()), then fixing makeup_gain at the exact
+// peak-restoring value found at that ratio. Index 0 is level 0's
+// special-cased {ratio, makeup=1.0} limiter pair, NOT part of the same
+// search family as 1-9 - see ssb_dsp_set_compressor_level()'s doc comment
+// in ssb_dsp.h. Full methodology and the raw calibration run's output are
+// logged in moving_forward_notes.md's 2026-09-25 entry.
+//
+// 2026-09-25 (second pass, same day): extended from a 0-6 table to 0-10 on
+// explicit user request. Levels 7-9 continue bisecting for their literal
+// nominal target (+7/+8/+9dB) same as 1-6 always did. Level 10 does NOT -
+// a first attempt at this extension bisected literally for +9dB and +10dB
+// and found BOTH saturate the search's ratio_hi=50.0 ceiling, converging
+// to IDENTICAL {ratio=50.0, makeup=2.775268} entries at only +8.36dB
+// each - not a bug in the search, but a real physical ceiling: as
+// ratio->infinity the curve degenerates to a hard limiter fixed at
+// SSB_DSP_COMP_THRESHOLD, and even that true hard-clip case only measures
+// ~+8.53dB of RMS gain on G4AHN.wav (independently recomputed directly,
+// not via bisection, to confirm this wasn't itself a search-bound
+// artifact). Level 10 here is instead calibrated to an explicitly chosen,
+// genuinely-achievable +8.35dB target (comfortably clear of the ~8.5dB
+// asymptote so the bisection search converges normally, not against its
+// bound) - distinct from level 9's +8.1dB, at the cost of the label no
+// longer meaning a clean "+10dB". See the SSB_DSP_COMP_LEVEL_MAX doc
+// comment in ssb_dsp.h for the full explanation and the historical note
+// on an earlier listening test that judged true +10dB (under the old,
+// pre-this-table scheme) to already hurt intelligibility - levels 7-10
+// here are numerically verified (bisection cross-checked bit-for-bit
+// against a standalone C reimplementation reading G4AHN.wav directly) but
+// NOT yet subjectively re-validated by ear.
+typedef struct {
+    float ratio;
+    float makeup_gain;
+} comp_level_entry_t;
 
-// 2026-09-24: SSB_DSP_COMP_MODE_PEAK_NORMALIZE's own two constants - see
-// ssb_dsp.h's ssb_dsp_comp_mode_t doc comment for the mode's rationale.
-// TARGET is where the tracked peak gets scaled TO (deliberately a bit
-// under 1.0 - the peak tracker's attack, though fast, still lags a truly
-// instantaneous transient by ~one attack time-constant, same finite-attack
-// caveat every feed-forward envelope-based gain scheme here already has;
-// this margin is a first-cut guess at covering that, not a measured
-// number). MAX_GAIN is a safety ceiling on the ONE division this mode
-// performs (target/peak_env) - without it, a peak_env that decays toward
-// zero during a long silence would otherwise ask for unbounded gain on
-// pure noise floor. Neither is exposed as a separate tunable yet.
-#define COMP_PEAK_NORMALIZE_TARGET     0.90f
-#define COMP_PEAK_NORMALIZE_MAX_GAIN   10.0f
+static const comp_level_entry_t k_comp_level_table[SSB_DSP_COMP_LEVEL_MAX - SSB_DSP_COMP_LEVEL_MIN + 1] = {
+    /* level 0  (limiter, no makeup)  */ {  5.0000f, 1.000000f },
+    /* level 1  (~+1.0dB measured)    */ {  1.1355f, 1.133124f },
+    /* level 2  (~+2.0dB measured)    */ {  1.3123f, 1.282759f },
+    /* level 3  (~+3.0dB measured)    */ {  1.5527f, 1.450924f },
+    /* level 4  (~+4.0dB measured)    */ {  1.8990f, 1.639888f },
+    /* level 5  (~+5.0dB measured)    */ {  2.4412f, 1.852198f },
+    /* level 6  (~+6.0dB measured)    */ {  3.4117f, 2.090712f },
+    /* level 7  (~+7.0dB measured)    */ {  5.6513f, 2.358638f },
+    /* level 8  (~+7.6dB measured)    */ {  9.3100f, 2.534993f },
+    /* level 9  (~+8.1dB measured)    */ { 20.1842f, 2.691641f },
+    /* level 10 (~+8.35dB measured -  */
+    /*   NOT +10dB, see comment above)*/ { 48.4601f, 2.773442f },
+};
 
 // Denormal (subnormal) floats are numbers below ~1.2e-38f in magnitude -
 // still valid IEEE-754 values, but most FPUs (including Xtensa's) fall
@@ -291,107 +323,59 @@ float IRAM_ATTR ssb_shelf_biquad_process(ssb_shelf_biquad_t *f, float x)
     return y;
 }
 
-// Feed-forward soft limiter above threshold, fixed ratio. No log/exp/pow
-// per sample - attack/release coefficients (which DO need one expf each)
-// are computed once at init/reconfigure, never per sample.
+// 2026-09-25: 3-segment piecewise-linear interpolation over the compressor's
+// fixed breakpoints (bp_x[0]=threshold .. bp_x[3]=XMAX). Unrolled 3-way
+// branch instead of a loop - same reasoning as the FIR/delay-line code
+// elsewhere in this file (Xtensa has no hardware integer divider and a
+// 4-element loop isn't worth the branch overhead). Caller guarantees
+// a > bp_x[0] (the below-threshold case is handled separately, cheaper,
+// in compressor_process()). Roughly 2x a plain single-segment linear
+// curve's per-sample cost - see moving_forward_notes.md's CPU-benchmark
+// entry from earlier this session for the (x86, non-representative but
+// directionally useful) measurement this estimate is based on; the
+// authoritative number is ssb_dsp_get_profile()'s max_audio_fx_us on real
+// hardware.
+static inline float IRAM_ATTR piecewise3_interp(const float *bp_x, const float *bp_y, float a)
+{
+    if (a <= bp_x[1]) {
+        return bp_y[0] + (a - bp_x[0]) * (bp_y[1] - bp_y[0]) / (bp_x[1] - bp_x[0]);
+    } else if (a <= bp_x[2]) {
+        return bp_y[1] + (a - bp_x[1]) * (bp_y[2] - bp_y[1]) / (bp_x[2] - bp_x[1]);
+    } else {
+        // Segment 3 extends past bp_x[3] too (linear extrapolation) rather
+        // than hard-clamping here - ssb_dsp_process_sample()'s output clamp
+        // (see that function) is what actually protects against over-range
+        // output, so this doesn't need its own separate ceiling logic.
+        return bp_y[2] + (a - bp_x[2]) * (bp_y[3] - bp_y[2]) / (bp_x[3] - bp_x[2]);
+    }
+}
+
+// Feed-forward soft-knee compressor: env decides HOW MUCH gain reduction
+// applies (via the 3-segment piecewise curve above), that gain is applied
+// to the raw (signed) sample x, then a FIXED per-level makeup gain (see
+// ssb_dsp_set_compressor_level()) restores level. No log/exp/pow per
+// sample - attack/release coefficients (expf, at init/reconfigure) and the
+// curve's own breakpoint y-values (log10f/powf, only when the level
+// changes) are the only transcendental math anywhere near this; the
+// per-sample path here is pure compares/mults/adds/one divide.
 //
-// 2026-09-24: makeup_gain is now computed dynamically each sample from a
-// SEPARATE, slow peak-hold follower (peak_env) rather than assumed fixed
-// at init - see compressor_t's own comment for why. peak_env shares the
-// same curve-shape math the fast env/gain computation above already uses
-// (same threshold/inv_ratio, same "gain = compressed/env" shape) - just
-// evaluated at the slow-tracked peak instead of the fast envelope, and
-// inverted (env/compressed rather than compressed/env) since the goal
-// here is to CANCEL that reduction rather than apply it. No new
-// transcendental math - same multiply/divide cost as the block above.
-//
-// 2026-09-24, later: takes `mode` (ssb_dsp_comp_mode_t) to select between
-// this ratio-curve behavior and SSB_DSP_COMP_MODE_PEAK_NORMALIZE's plain
-// linear scale - see ssb_dsp.h's doc comment on the enum for the
-// rationale (short version: assume voice's own high crest factor means
-// real peaks get hit reasonably often, so just track that peak and scale
-// the WHOLE signal to it - no squashing curve, less makeup gain injected
-// into whatever's below threshold than ratio mode needs for the same
-// target peak, and one fewer moving part than the ratio-curve + makeup
-// combination). env and peak_env are updated UNCONDITIONALLY regardless
-// of mode, same reasoning as this project's other reset-on-transition
-// fixes (ssb_dsp_set_eq_enabled() etc.) - so switching modes live never
-// resumes either follower from a stale/frozen value.
-static inline float IRAM_ATTR compressor_process(compressor_t *c, float x, ssb_dsp_comp_mode_t mode)
+// 2026-09-25: makeup_gain is now a FIXED constant (see compressor_t's own
+// comment) - no peak tracker, no per-sample recomputation, replacing the
+// 2026-09-24 dynamic peak-tracking scheme entirely (removed along with the
+// switchable-mode compressor - see ssb_dsp.h's 2026-09-25 comment above
+// the old enum for why).
+static inline float IRAM_ATTR compressor_process(compressor_t *c, float x)
 {
     float ax = fabsf(x);
     float coef = (ax > c->env) ? c->attack_coef : c->release_coef;
     c->env = flush_denorm(c->env + coef * (ax - c->env));
 
-    // Slow peak-hold: same fast attack as env above (must see every peak
-    // env itself reacts to), much slower release (COMP_PEAK_HOLD_RELEASE_MS)
-    // so it reflects the signal's sustained peak level, not each syllable.
-    // Shared by BOTH modes below.
-    float peak_coef = (ax > c->peak_env) ? c->attack_coef : c->peak_release_coef;
-    c->peak_env = flush_denorm(c->peak_env + peak_coef * (ax - c->peak_env));
-
     float gain;
-    if (mode == SSB_DSP_COMP_MODE_PEAK_NORMALIZE) {
-        // No squashing curve at all - env (above) is still updated but
-        // unused here. A single linear scale, so crest factor is
-        // untouched: quiet and loud content get multiplied by exactly the
-        // same factor at any instant.
-        gain = 1.0f;
-        if (c->peak_env > c->threshold) {
-            c->makeup_gain = COMP_PEAK_NORMALIZE_TARGET / c->peak_env;
-            if (c->makeup_gain > COMP_PEAK_NORMALIZE_MAX_GAIN) {
-                c->makeup_gain = COMP_PEAK_NORMALIZE_MAX_GAIN;   // guards pure silence/noise floor
-            }
-        } else {
-            // Below threshold - same "nothing to restore, no artificial
-            // boost" reasoning as SSB_DSP_COMP_MODE_RATIO below, and what
-            // keeps genuine silence from ever hitting the MAX_GAIN ceiling.
-            c->makeup_gain = 1.0f;
-        }
-    } else if (mode == SSB_DSP_COMP_MODE_LIMIT_ONLY) {
-        // 2026-09-24, later: same squashing curve as SSB_DSP_COMP_MODE_RATIO
-        // below, but makeup_gain is permanently 1.0 - never computed from
-        // env, peak_env, or anything else. This is the mode that can never
-        // amplify ANYTHING, at any instant, by construction: below
-        // threshold the signal is untouched (bit-identical to
-        // passthrough), above threshold gain<=1 only ever attenuates. See
-        // ssb_dsp.h's ssb_dsp_comp_mode_t doc comment for the real-hardware
-        // symptom (toggling 'c' under the ORIGINAL fixed ~2.36x makeup
-        // gain forced a master-gain retrim every time) this mode directly
-        // targets.
-        if (c->env > c->threshold) {
-            float compressed = c->threshold + (c->env - c->threshold) * c->inv_ratio;
-            gain = (c->env > 1e-6f) ? (compressed / c->env) : 1.0f;
-        } else {
-            gain = 1.0f;
-        }
-        c->makeup_gain = 1.0f;
+    if (c->env > c->bp_x[0]) {
+        float compressed = piecewise3_interp(c->bp_x, c->bp_y, c->env);
+        gain = (c->env > 1e-6f) ? (compressed / c->env) : 1.0f;
     } else {
-        // SSB_DSP_COMP_MODE_RATIO (default) - unchanged from the earlier
-        // 2026-09-24 redesign.
-        if (c->env > c->threshold) {
-            float compressed = c->threshold + (c->env - c->threshold) * c->inv_ratio;
-            gain = (c->env > 1e-6f) ? (compressed / c->env) : 1.0f;
-        } else {
-            gain = 1.0f;
-        }
-
-        if (c->peak_env > c->threshold) {
-            float peak_compressed = c->threshold + (c->peak_env - c->threshold) * c->inv_ratio;
-            // peak_compressed > 0 is guaranteed here (threshold > 0 by
-            // ssb_dsp_set_compressor()'s validation, and the added term is
-            // non-negative above threshold) - no epsilon guard needed,
-            // unlike the env>1e-6f guard above which protects a
-            // genuinely-can-be-zero divisor.
-            c->makeup_gain = c->peak_env / peak_compressed;
-        } else {
-            // Peak has never (or not recently) exceeded threshold - nothing
-            // to restore, so no artificial boost. Matches this project's
-            // existing "attenuate/restore only, never manufacture gain
-            // that isn't justified by the signal itself" convention (see
-            // envelope_alc.h).
-            c->makeup_gain = 1.0f;
-        }
+        gain = 1.0f;
     }
 
     return x * gain * c->makeup_gain;
@@ -473,13 +457,6 @@ struct ssb_dsp_s {
     bool audio_fx_configured;
     volatile bool eq_enable;
     volatile bool comp_enable;
-    // 2026-09-24: which compressor algorithm runs while comp_enable is
-    // true - see ssb_dsp_comp_mode_t in ssb_dsp.h. Same volatile reasoning
-    // as eq_enable/comp_enable above (written from a command handler,
-    // read every sample from the real-time path). Defaults to
-    // SSB_DSP_COMP_MODE_RATIO (value 0) at init, matching this project's
-    // "new field defaults to whatever preserves prior behavior" convention.
-    volatile ssb_dsp_comp_mode_t comp_mode;
     biquad_t eq_hpf;
     biquad_t eq_presence;
     compressor_t comp;
@@ -498,6 +475,15 @@ struct ssb_dsp_s {
     // multiplies by, keeping the hot path a single plain multiply.
     volatile float master_gain_db;
     volatile float master_gain_linear;
+
+    // 2026-09-25: Mic Gain - same exact pattern as master_gain_db/linear
+    // just above, applied at the OTHER end of the chain (see
+    // ssb_dsp_process_sample()) - before compressor/EQ instead of after.
+    // See ssb_dsp_set_mic_gain_db()'s doc comment in ssb_dsp.h for why this
+    // was missing and what it fixes. Always available, independent of
+    // audio_fx_configured - useful even with EQ/compressor both off.
+    volatile float mic_gain_db;
+    volatile float mic_gain_linear;
 
     // Sub-phase timing high-water marks, see ssb_dsp_get_profile().
     uint32_t max_audio_fx_us;
@@ -576,19 +562,18 @@ esp_err_t ssb_dsp_init(const ssb_dsp_config_t *cfg, ssb_dsp_handle_t *out_handle
 
     h->master_gain_db = 0.0f;
     h->master_gain_linear = 1.0f;
+    h->mic_gain_db = 0.0f;
+    h->mic_gain_linear = 1.0f;
 
     h->audio_fx_configured = cfg->audio_fx.enable;
     h->eq_enable = cfg->audio_fx.enable;     // default both stages "on" if configured at all -
     h->comp_enable = cfg->audio_fx.enable;   // individually toggled later via the setters below
-    h->comp_mode = SSB_DSP_COMP_MODE_RATIO;  // 2026-09-24: default - see ssb_dsp_comp_mode_t
     if (h->audio_fx_configured) {
         float hpf_fc      = cfg->audio_fx.hpf_freq_hz > 0.0f ? cfg->audio_fx.hpf_freq_hz : 300.0f;
         float presence_fc = cfg->audio_fx.presence_freq_hz > 0.0f ? cfg->audio_fx.presence_freq_hz : 2200.0f;
         float presence_q  = cfg->audio_fx.presence_q > 0.0f ? cfg->audio_fx.presence_q : 1.0f;
         float attack_ms   = cfg->audio_fx.comp_attack_ms > 0.0f ? cfg->audio_fx.comp_attack_ms : 3.0f;
         float release_ms  = cfg->audio_fx.comp_release_ms > 0.0f ? cfg->audio_fx.comp_release_ms : 120.0f;
-        float threshold   = cfg->audio_fx.comp_threshold > 0.0f ? cfg->audio_fx.comp_threshold : 0.3f;
-        float ratio        = cfg->audio_fx.comp_ratio > 1.0f ? cfg->audio_fx.comp_ratio : 3.5f;
 
         biquad_set_highpass(&h->eq_hpf, hpf_fc, h->sample_rate_hz, 0.707f);
         biquad_set_peaking(&h->eq_presence, presence_fc, h->sample_rate_hz, presence_q,
@@ -598,43 +583,33 @@ esp_err_t ssb_dsp_init(const ssb_dsp_config_t *cfg, ssb_dsp_handle_t *out_handle
         // init only, never in the per-sample compressor_process() path.
         h->comp.attack_coef  = 1.0f - expf(-1.0f / (h->sample_rate_hz * (attack_ms / 1000.0f)));
         h->comp.release_coef = 1.0f - expf(-1.0f / (h->sample_rate_hz * (release_ms / 1000.0f)));
-        h->comp.threshold = threshold;
-        h->comp.inv_ratio = 1.0f / ratio;
         h->comp.env = 0.0f;
-        // 2026-09-24: peak_env seeded at 0 (not any assumed level) - with
-        // peak_env <= threshold, compressor_process() starts at
-        // makeup_gain=1.0 (no boost) until the real signal's peak has
-        // actually been observed, per its own comment. Shares attack_coef
-        // above; only needs its own (much slower) release coefficient.
-        h->comp.peak_env = 0.0f;
-        h->comp.peak_release_coef = 1.0f - expf(-1.0f / (h->sample_rate_hz * (COMP_PEAK_HOLD_RELEASE_MS / 1000.0f)));
-        h->comp.makeup_gain = 1.0f;
+
+        // 2026-09-25: fixed/shared breakpoint x-locations - see
+        // SSB_DSP_COMP_THRESHOLD/SSB_DSP_COMP_XMAX and compressor_t's own
+        // comment. Set once here, never touched again (not even by
+        // ssb_dsp_set_compressor_level(), which only ever rewrites bp_y).
+        h->comp.bp_x[0] = SSB_DSP_COMP_THRESHOLD;
+        h->comp.bp_x[1] = SSB_DSP_COMP_THRESHOLD + (SSB_DSP_COMP_XMAX - SSB_DSP_COMP_THRESHOLD) / 3.0f;
+        h->comp.bp_x[2] = SSB_DSP_COMP_THRESHOLD + 2.0f * (SSB_DSP_COMP_XMAX - SSB_DSP_COMP_THRESHOLD) / 3.0f;
+        h->comp.bp_x[3] = SSB_DSP_COMP_XMAX;
+
+        // Default to level 0 (plain limiter, no boost) - a deliberate
+        // behavior change from the old fixed-makeup-gain design (see
+        // moving_forward_notes.md's 2026-09-25 entry): dial in
+        // ssb_dsp_set_compressor_level() explicitly to get any RMS boost.
+        ssb_dsp_set_compressor_level(h, SSB_DSP_COMP_LEVEL_MIN);
 
         ESP_LOGI(TAG, "ssb_dsp audio_fx enabled: hpf=%.0fHz presence=%.0fHz/%+.1fdB/Q%.2f "
-                 "comp=thresh%.2f/ratio%.1f:1/atk%.1fms/rel%.1fms/peak-hold-rel%.0fms",
+                 "comp=thresh%.2f/atk%.1fms/rel%.1fms, level=%d (0=limiter-only default)",
                  hpf_fc, presence_fc, cfg->audio_fx.presence_gain_db, presence_q,
-                 threshold, ratio, attack_ms, release_ms, COMP_PEAK_HOLD_RELEASE_MS);
+                 (double)SSB_DSP_COMP_THRESHOLD, attack_ms, release_ms, SSB_DSP_COMP_LEVEL_MIN);
     }
 
     *out_handle = h;
     ESP_LOGI(TAG, "ssb_dsp initialized: taps=%d group_delay=%d samples, fs=%.0fHz, max_dev=%.0fHz",
              h->num_taps, h->center, h->sample_rate_hz, h->max_freq_dev_hz);
     return ESP_OK;
-}
-
-void ssb_dsp_set_compressor(ssb_dsp_handle_t handle, float threshold, float ratio)
-{
-    if (!handle || !handle->audio_fx_configured) return;
-    if (threshold > 0.0f) handle->comp.threshold = threshold;
-    if (ratio > 1.0f)     handle->comp.inv_ratio = 1.0f / ratio;
-    // 2026-09-24: makeup_gain no longer needs recomputing here - it's
-    // derived every sample in compressor_process() from peak_env against
-    // whatever threshold/inv_ratio are current, so the very next sample
-    // after this call already reflects the new setting correctly. No
-    // reset of peak_env either: the signal's actual observed peak level
-    // didn't change just because threshold/ratio did, so there's nothing
-    // stale to clear (unlike env's reset-on-enable below, which is about
-    // resuming from a frozen value after a period of not running at all).
 }
 
 void IRAM_ATTR ssb_dsp_set_eq_enabled(ssb_dsp_handle_t handle, bool enable)
@@ -673,14 +648,11 @@ void IRAM_ATTR ssb_dsp_set_compressor_enabled(ssb_dsp_handle_t handle, bool enab
     // keeps running its OWN state update only inside compressor_process,
     // which isn't called at all while comp_enable is false, so env is
     // simply frozen, not decaying - starting clean avoids a jump/thump).
-    // 2026-09-24: peak_env gets the same treatment, same reasoning - and
-    // makeup_gain resets to the same neutral 1.0f ssb_dsp_init() seeds it
-    // with, since peak_env=0.0f means "nothing observed yet" the same way
-    // it does at init.
+    // 2026-09-25: makeup_gain is no longer reset here - it's a fixed
+    // per-level constant now (see ssb_dsp_set_compressor_level()), not
+    // state that drifts while disabled, so there's nothing stale to clear.
     if (enable) {
         handle->comp.env = 0.0f;
-        handle->comp.peak_env = 0.0f;
-        handle->comp.makeup_gain = 1.0f;
     }
 }
 
@@ -694,23 +666,36 @@ bool ssb_dsp_get_compressor_enabled(ssb_dsp_handle_t handle)
     return handle && handle->audio_fx_configured && handle->comp_enable;
 }
 
-// 2026-09-24: no state reset here, unlike ssb_dsp_set_compressor_enabled()
-// above - switching mode doesn't stop/restart the compressor the way
-// enable/disable does, env and peak_env keep running continuously either
-// way (compressor_process() updates both unconditionally regardless of
-// mode), so there's no frozen/stale state to clean up on a mode switch,
-// only a different formula being applied to state that's already live and
-// valid.
-void IRAM_ATTR ssb_dsp_set_compressor_mode(ssb_dsp_handle_t handle, ssb_dsp_comp_mode_t mode)
+// 2026-09-25: recomputes bp_y (the 3-segment curve's actual shape) from
+// this level's calibrated ratio, and copies in its fixed makeup_gain - see
+// this function's doc comment in ssb_dsp.h for the full design. log10f/
+// powf here are fine: this only runs when the level changes (a rare,
+// human-triggered event via a serial command), never per audio sample.
+// No env reset - switching level doesn't stop/restart the compressor the
+// way enable/disable does, so there's no frozen/stale state to clean up,
+// only a different curve/makeup being applied to state that's already
+// live and valid (same reasoning the old mode-switch function had).
+void IRAM_ATTR ssb_dsp_set_compressor_level(ssb_dsp_handle_t handle, int level_db)
 {
     if (!handle || !handle->audio_fx_configured) return;
-    handle->comp_mode = mode;
+    if (level_db < SSB_DSP_COMP_LEVEL_MIN) level_db = SSB_DSP_COMP_LEVEL_MIN;
+    if (level_db > SSB_DSP_COMP_LEVEL_MAX) level_db = SSB_DSP_COMP_LEVEL_MAX;
+
+    const comp_level_entry_t *e = &k_comp_level_table[level_db - SSB_DSP_COMP_LEVEL_MIN];
+    float thr_db = 20.0f * log10f(handle->comp.bp_x[0]);
+    for (int i = 0; i < SSB_DSP_COMP_BP_COUNT; i++) {
+        float a_db = 20.0f * log10f(handle->comp.bp_x[i]);
+        float out_db = thr_db + (a_db - thr_db) / e->ratio;
+        handle->comp.bp_y[i] = powf(10.0f, out_db / 20.0f);
+    }
+    handle->comp.makeup_gain = e->makeup_gain;
+    handle->comp.level_db = level_db;
 }
 
-ssb_dsp_comp_mode_t ssb_dsp_get_compressor_mode(ssb_dsp_handle_t handle)
+int ssb_dsp_get_compressor_level(ssb_dsp_handle_t handle)
 {
-    if (!handle || !handle->audio_fx_configured) return SSB_DSP_COMP_MODE_RATIO;
-    return handle->comp_mode;
+    if (!handle || !handle->audio_fx_configured) return SSB_DSP_COMP_LEVEL_MIN;
+    return handle->comp.level_db;
 }
 
 void ssb_dsp_get_iir_canary(ssb_dsp_handle_t handle, ssb_dsp_iir_canary_t *out)
@@ -728,11 +713,11 @@ void ssb_dsp_get_iir_canary(ssb_dsp_handle_t handle, ssb_dsp_iir_canary_t *out)
     }
     out->eq_hpf_finite = isfinite(handle->eq_hpf.y1) && isfinite(handle->eq_hpf.y2);
     out->eq_presence_finite = isfinite(handle->eq_presence.y1) && isfinite(handle->eq_presence.y2);
-    // 2026-09-24: also covers peak_env/makeup_gain, the new peak-tracking
-    // state - still one bool, since all three are "is the compressor's
-    // internal state healthy," the same thing this field already meant.
-    out->compressor_env_finite = isfinite(handle->comp.env) && isfinite(handle->comp.peak_env)
-                               && isfinite(handle->comp.makeup_gain);
+    // 2026-09-25: makeup_gain is a fixed per-level constant now (not
+    // per-sample-computed state), but still worth including here - a
+    // corrupted comp struct (e.g. stack/heap smash) would show up in any
+    // of its fields, and this canary is cheap either way.
+    out->compressor_env_finite = isfinite(handle->comp.env) && isfinite(handle->comp.makeup_gain);
 }
 
 void IRAM_ATTR ssb_dsp_set_master_gain_db(ssb_dsp_handle_t handle, float gain_db)
@@ -745,6 +730,18 @@ void IRAM_ATTR ssb_dsp_set_master_gain_db(ssb_dsp_handle_t handle, float gain_db
 float ssb_dsp_get_master_gain_db(ssb_dsp_handle_t handle)
 {
     return handle ? handle->master_gain_db : 0.0f;
+}
+
+void IRAM_ATTR ssb_dsp_set_mic_gain_db(ssb_dsp_handle_t handle, float gain_db)
+{
+    if (!handle) return;
+    handle->mic_gain_db = gain_db;
+    handle->mic_gain_linear = powf(10.0f, gain_db / 20.0f);
+}
+
+float ssb_dsp_get_mic_gain_db(ssb_dsp_handle_t handle)
+{
+    return handle ? handle->mic_gain_db : 0.0f;
 }
 
 void ssb_dsp_get_freq_dev_stats(ssb_dsp_handle_t handle, ssb_dsp_freq_dev_stats_t *out)
@@ -891,6 +888,15 @@ void IRAM_ATTR ssb_dsp_process_sample(ssb_dsp_handle_t handle,
 {
     int N = handle->num_taps;
 
+    // 2026-09-25: Mic Gain - unconditional, applied BEFORE compressor/EQ,
+    // works even with audio_fx_configured false (raw passthrough), same
+    // "always available" reasoning as master_gain_linear below. This is
+    // the stage that was missing - see ssb_dsp_set_mic_gain_db()'s doc
+    // comment in ssb_dsp.h. Single multiply; mic_gain_linear==1.0f (the
+    // default) costs nothing worth measuring.
+    int64_t t0 = esp_timer_get_time();
+    audio_sample *= handle->mic_gain_linear;
+
     // Optional pre-Hilbert conditioning: compressor -> EQ, on the raw
     // sample, before anything enters the Hilbert delay line. This keeps
     // it fully decoupled from the Hilbert filter's `center`-tap group
@@ -898,18 +904,39 @@ void IRAM_ATTR ssb_dsp_process_sample(ssb_dsp_handle_t handle,
     // EQ and compressor are checked independently now (eq_enable,
     // comp_enable) so each can be A/B'd live via serial command without
     // recompiling - see ssb_dsp_set_eq_enabled()/ssb_dsp_set_compressor_enabled().
-    int64_t t0 = esp_timer_get_time();
     if (handle->audio_fx_configured) {
-        if (handle->comp_enable) audio_sample = compressor_process(&handle->comp, audio_sample, handle->comp_mode);
+        if (handle->comp_enable) audio_sample = compressor_process(&handle->comp, audio_sample);
         if (handle->eq_enable) {
             audio_sample = biquad_process(&handle->eq_hpf, audio_sample);
             audio_sample = biquad_process(&handle->eq_presence, audio_sample);
         }
+        // 2026-09-25: hard output safety clamp - added specifically because
+        // offline calibration against the user's real mic-to-ADC recording
+        // (G4AHN.wav) measured genuine full-scale overshoot (up to 1.79 at
+        // the most aggressive tested compression level) that a "worst-case
+        // steady-state envelope" analysis alone did NOT predict. Mechanism:
+        // compressor_process()'s gain decision is based on the SMOOTHED
+        // envelope (env), but applied to the INSTANTANEOUS raw sample - a
+        // fast attack transient can momentarily exceed env before the
+        // envelope follower catches up (a well-known feed-forward-
+        // compressor limitation; a look-ahead design would avoid it at the
+        // cost of added latency, not attempted here). This clamp is the
+        // actual backstop against that, not the fixed per-level makeup
+        // gain table alone - see ssb_dsp_set_compressor_level()'s doc
+        // comment in ssb_dsp.h for the full numeric finding. Placed after
+        // EQ too, since the presence-peak boost can also add a little
+        // level on top of whatever the compressor produced.
+        if (audio_sample > 1.0f) audio_sample = 1.0f;
+        else if (audio_sample < -1.0f) audio_sample = -1.0f;
     }
     // Master gain - unconditional, works even with audio_fx_configured
     // false (raw passthrough). Single multiply; master_gain_linear==1.0f
     // (the default) costs nothing worth measuring, so this doesn't need
-    // its own guard the way EQ/compressor do.
+    // its own guard the way EQ/compressor do. Deliberately AFTER the
+    // safety clamp above - this is the RF/output power control, not part
+    // of what that clamp is protecting (a user setting master_gain_db > 0
+    // is a deliberate choice, not the transient-overshoot bug being
+    // guarded against).
     audio_sample *= handle->master_gain_linear;
     int64_t t1 = esp_timer_get_time();
     uint32_t audio_fx_us = (uint32_t)(t1 - t0);

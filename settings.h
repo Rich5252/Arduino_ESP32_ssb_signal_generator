@@ -200,14 +200,29 @@ typedef struct
     bool env_alc_enable;         // 'l' - envelope_alc.h, off by default
     bool env_softlimit_enable;   // 'S' - envelope_softlimit.h, off by default
 
-    // Added 2026-09-24 when ssb_dsp_comp_mode_t (ssb_dsp.h) was introduced -
-    // appended at the END, same reasoning as every trailing field above:
-    // every existing preset's positional initializer list keeps working
-    // unchanged, C zero-fills this to SSB_DSP_COMP_MODE_RATIO (deliberately
-    // value 0 - see that enum's own comment), which is exactly the
-    // compressor's original behavior. Only a preset that wants the new
-    // SSB_DSP_COMP_MODE_PEAK_NORMALIZE mode deliberately needs to set this.
-    ssb_dsp_comp_mode_t comp_mode;  // 'W' - ssb_dsp.h, ratio mode by default
+    // 2026-09-25: comp_mode (ssb_dsp_comp_mode_t, added 2026-09-24) is GONE -
+    // the whole switchable-mode compressor it selected between was removed
+    // the same day it would have needed a second trailing field added for
+    // the third mode - see ssb_dsp.h's 2026-09-25 comment for the full
+    // reasoning (the user's own real mic recording showed the actual fix
+    // needed was a Mic Gain stage upstream, not another compressor mode).
+    //
+    // Replacing it, appended at the END for the usual reason (every
+    // existing preset's positional initializer list keeps working
+    // unchanged): mic_gain_db (C zero-fills to 0.0f/unity - no effect
+    // until deliberately set, same as master_gain_db's own convention) and
+    // comp_level_db (C zero-fills to 0 = SSB_DSP_COMP_LEVEL_MIN, i.e. a
+    // plain limiter with no makeup gain - see
+    // ssb_dsp_set_compressor_level()'s doc comment in ssb_dsp.h). NOTE
+    // this is a deliberate BEHAVIOR CHANGE from the old default, not a
+    // "preserves prior behavior" zero-fill the way every other trailing
+    // field above was: the pre-2026-09-25 compressor applied automatic
+    // makeup gain by default, this one does not - an existing preset that
+    // relied on hearing a boost with 'c' on will need comp_level_db set
+    // explicitly (1-6) to get one back, now from a properly voice-
+    // calibrated table instead of an unvalidated fixed formula.
+    float mic_gain_db;    // 'U'/'Y' - ssb_dsp.h, 0.0dB (unity) by default
+    int comp_level_db;    // 'X'/'q' - ssb_dsp.h, level 0 (limiter only) by default
 
 } PersistentSettings;
 
@@ -300,10 +315,22 @@ SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM },
 { "V4 Two tone tuned", AUDIO_SRC_TWOTONE, 2.15f, 0.20f, 0.90f, false, ADC_LPF_MODE_OFF, false, false, 0.6f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, true, ENVELOPE_INTERP_CURVE_CATMULL_ROM },
 // Preset 7 -
 { "TwoToneButwGD Env 1.6-2.9", AUDIO_SRC_TWOTONE, 2.96f, 0.40f, 0.46f, true, ADC_LPF_MODE_OFF, false, false, 1.0f, true, false, 0.0f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM },  // was 1.85f @ 10000Hz; adc_lpf_bypass=true
-// Preset 8 -
-{ "Micr WhiteNoise", AUDIO_SRC_MIC, 2.68f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV8, true, false, 29.3f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, false, false, ENV_GDEQ_VARIANT_DEFAULT, true, true },
-// Preset 9 -
-{ "Micr Voice", AUDIO_SRC_MIC, 2.68f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV8, true, false, 6.3f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, false, false, ENV_GDEQ_VARIANT_DEFAULT, true, true }
+// Preset 8 - 2026-09-25: migrated to new mic-gain/compressor-level
+// architecture per explicit user request (old master_gain_db=29.3f moved
+// out; compressor now on with mic_gain_db=7.0f, comp_level_db=6). This is
+// the noise-test preset (speaker at low volume, not speech) - unlike
+// preset 9 below, no independent real-voice calibration cross-check
+// applies to this one's mic_gain_db value, it's simply the user's stated
+// new setting.
+{ "Micr WhiteNoise", AUDIO_SRC_MIC, 2.68f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV8, true, true, 0.0f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, false, false, ENV_GDEQ_VARIANT_DEFAULT, true, true, 7.0f, 6 },
+// Preset 9 - 2026-09-25: migrated to new mic-gain/compressor-level
+// architecture per explicit user request (old master_gain_db=6.3f moved
+// out; compressor now on with mic_gain_db=14.0f, comp_level_db=6). Per
+// the user, 14dB reflects a louder speaker setup than the 6.3dB voice
+// tuning this preset carried before - NOT a re-assertion of the earlier
+// 6.3dB/6.17dB calibration match noted 2026-09-25 (that comparison applies
+// to the OLD value this preset just moved away from, not to 14dB).
+{ "Micr Voice", AUDIO_SRC_MIC, 2.68f, 0.36f, 0.48f, true, ADC_LPF_MODE_CHEBYSHEV8, true, true, 0.0f, true, true, 0.00f, SSB_DSP_FREQ_DEV_SLEW_UNLIMITED_HZ, false, ENVELOPE_INTERP_CURVE_CATMULL_ROM, false, false, ENV_GDEQ_VARIANT_DEFAULT, true, true, 14.0f, 6 }
 };
 
 // If this array's size ever changes, ssb_mic_test.ino's serial handler

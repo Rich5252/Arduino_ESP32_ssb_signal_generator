@@ -62,11 +62,20 @@ typedef struct {
     float presence_freq_hz;     ///< Presence-peak center, e.g. 2200.0f.
     float presence_gain_db;     ///< Presence-peak gain in dB, e.g. 4.0f. 0.0f = no boost (filter still runs).
     float presence_q;           ///< Presence-peak Q, e.g. 1.0f.
-    float comp_threshold;       ///< Compressor threshold, linear envelope units (post-HPF signal is
-                                 ///< typically < ~1.0), e.g. 0.3f. Only levels above this are compressed.
-    float comp_ratio;           ///< Compression ratio above threshold, e.g. 3.5f means 3.5:1.
     float comp_attack_ms;       ///< Envelope-follower attack time, e.g. 3.0f.
     float comp_release_ms;      ///< Envelope-follower release time, e.g. 120.0f.
+    // 2026-09-25: comp_threshold/comp_ratio REMOVED from this config struct -
+    // see ssb_dsp_set_compressor_level()'s doc comment below for the full
+    // replacement design. Short version: the compressor's threshold is now
+    // a fixed internal constant (SSB_DSP_COMP_THRESHOLD in ssb_dsp.c, 0.30f)
+    // shared by every calibrated level, not independently configurable -
+    // the whole point of the per-level {ratio, makeup} table is that it was
+    // measured against ONE specific threshold on real voice data, and would
+    // silently go stale (wrong achieved dB, or worse, the safety-margin
+    // analysis behind it) if threshold could drift out from under it
+    // without the table being recalibrated to match. Compression amount is
+    // now selected via ssb_dsp_set_compressor_level() instead of a free
+    // threshold/ratio pair.
 } ssb_audio_fx_config_t;
 
 typedef struct {
@@ -121,16 +130,6 @@ void ssb_dsp_deinit(ssb_dsp_handle_t handle);
 int ssb_dsp_group_delay_samples(ssb_dsp_handle_t handle);
 
 /**
- * @brief Live-tweak the compressor's threshold/ratio without re-running
- *        ssb_dsp_init(). EQ shape and attack/release are fixed at init
- *        (they involve trig/exp, deliberately kept out of any per-sample
- *        or frequently-called path); threshold/ratio are cheap to change
- *        on the fly if you want a physical pot or serial command for it.
- *        No-op if audio_fx wasn't enabled at init.
- */
-void ssb_dsp_set_compressor(ssb_dsp_handle_t handle, float threshold, float ratio);
-
-/**
  * @brief Independently enable/disable the EQ (HPF + presence peak) and
  *        compressor stages at runtime - e.g. from a serial command, to
  *        A/B each one's contribution without recompiling. Both default
@@ -147,65 +146,24 @@ bool ssb_dsp_get_eq_enabled(ssb_dsp_handle_t handle);
 bool ssb_dsp_get_compressor_enabled(ssb_dsp_handle_t handle);
 
 /**
- * @brief 2026-09-24: which ALGORITHM the compressor stage runs, independent
- *        of comp_enable above (which just gates whether it runs at all).
+ * @brief 2026-09-25: the switchable-mode compressor (SSB_DSP_COMP_MODE_RATIO
+ *        / PEAK_NORMALIZE / LIMIT_ONLY, added and removed again the same
+ *        week) is GONE - see moving_forward_notes.md's 2026-09-25 entry for
+ *        the full reasoning. Short version: the user's own real mic-to-ADC
+ *        recording (G4AHN.wav) showed that ALL of that mode-switching and
+ *        curve-shape tuning was calibrated against an unrealistically loud
+ *        signal - the real recording's peak barely reached 42% of full
+ *        scale, so the compressor's threshold (0.1-0.3 depending which
+ *        config you look at) almost never engaged at all. The actual fix
+ *        needed a stage upstream of the compressor, not another compressor
+ *        mode - see ssb_dsp_set_mic_gain_db() below.
  *
- *        SSB_DSP_COMP_MODE_RATIO (default, value 0 so existing
- *        PersistentSettings presets/configs that never set this field keep
- *        their exact original behavior): the original threshold/ratio
- *        soft-knee curve - loud content gets squashed toward threshold,
- *        proportionally more so at a higher ratio, then a peak-tracked
- *        makeup gain restores the signal's own recently-observed peak.
- *        This actively changes the signal's crest factor (peak-to-average
- *        ratio) - that's the point of a ratio compressor.
- *
- *        SSB_DSP_COMP_MODE_PEAK_NORMALIZE: no squashing curve at all - a
- *        single linear scale factor (comp_threshold still gates it: below
- *        threshold, untouched) derived purely from the same peak tracker,
- *        aimed at keeping the tracked peak sitting at a fixed target level
- *        (see COMP_PEAK_NORMALIZE_TARGET in ssb_dsp.c). Crest factor is
- *        UNCHANGED by this mode - quiet and loud content are scaled by
- *        exactly the same factor at any instant, so for a source that's
- *        already expected to reach its natural peaks reasonably often
- *        (a reasonable assumption for voice's own high crest factor),
- *        this needs LESS makeup gain than ratio mode to reach the same
- *        target peak - see null_bias_investigation.md's 2026-09-24 entry
- *        for the exact numeric comparison. First-cut, NOT bench-validated.
- *
- *        SSB_DSP_COMP_MODE_LIMIT_ONLY (added 2026-09-24, later, per a real
- *        bench observation): the same threshold/ratio squashing curve as
- *        RATIO above, but with NO makeup gain step at all - makeup_gain
- *        is permanently 1.0, full stop, not tracked from anything. Below
- *        threshold the signal is completely unchanged (bit-identical to
- *        passthrough); above threshold it is ONLY EVER attenuated, never
- *        restored or boosted. This is the one mode that can structurally
- *        never amplify anything, at any instant, by construction - no
- *        peak tracker, no lag, no threshold-crossing timing window for
- *        noise to sneak through (the failure mode identified in this same
- *        day's discussion of the other two modes' peak-hold release
- *        time). The direct real-hardware motivation: the ORIGINAL
- *        pre-2026-09-24 compressor's fixed makeup gain (~2.36x for
- *        threshold=0.3/ratio=3.5) was applied unconditionally to
- *        EVERYTHING, all the time, including below threshold - toggling
- *        'c' on raised the whole signal (noise floor included) by that
- *        fixed factor, which is why master gain needed re-trimming down
- *        every time 'c' was toggled on to avoid hitting the output
- *        ceiling. This mode is the direct fix for exactly that symptom:
- *        no gain ever gets added, so 'c' toggling never requires a master
- *        gain retrim. The cost, vs. the other two modes: it doesn't
- *        restore the compressed peak's level (unlike RATIO/PEAK_NORMALIZE)
- *        and doesn't raise RMS/reduce crest factor at all - loud content
- *        gets quieter, nothing else changes. A plain peak limiter, not a
- *        loudness-raising compressor.
+ *        Replacing it: ONE compressor algorithm (a 3-segment piecewise-
+ *        linear approximation of a dB-domain/log soft-knee curve, per the
+ *        user's explicit request), with a small number of discrete,
+ *        integer-dB "compression level" presets instead of free-running
+ *        threshold/ratio - see ssb_dsp_set_compressor_level() below.
  */
-typedef enum {
-    SSB_DSP_COMP_MODE_RATIO = 0,
-    SSB_DSP_COMP_MODE_PEAK_NORMALIZE = 1,
-    SSB_DSP_COMP_MODE_LIMIT_ONLY = 2,
-} ssb_dsp_comp_mode_t;
-
-void IRAM_ATTR ssb_dsp_set_compressor_mode(ssb_dsp_handle_t handle, ssb_dsp_comp_mode_t mode);
-ssb_dsp_comp_mode_t ssb_dsp_get_compressor_mode(ssb_dsp_handle_t handle);
 
 /**
  * @brief 2026-09-11: NaN/Inf canary for this module's three IIR-style
@@ -252,6 +210,158 @@ void ssb_dsp_get_iir_canary(ssb_dsp_handle_t handle, ssb_dsp_iir_canary_t *out);
  */
 void IRAM_ATTR ssb_dsp_set_master_gain_db(ssb_dsp_handle_t handle, float gain_db);
 float ssb_dsp_get_master_gain_db(ssb_dsp_handle_t handle);
+
+/**
+ * @brief 2026-09-25: Mic Gain - a manual trim applied to the raw sample
+ *        BEFORE compressor/EQ (mirrors master_gain_db's exact pattern -
+ *        human-friendly dB in, precomputed linear multiply in the hot
+ *        path - except this one runs at the START of ssb_dsp_process_sample()
+ *        instead of the end).
+ *
+ *        This is the control this project was missing, identified by
+ *        researching the FLEX-6600/SmartSDR gain-staging architecture (Mic
+ *        Gain -> TX EQ -> Speech Processor -> RF/ALC, Mic Gain manual and
+ *        NOT automatic) and then CONFIRMED against the user's own real
+ *        mic-to-ADC recording: master_gain_db is applied AFTER the
+ *        compressor/EQ, so it was already functioning as "RF Power," not
+ *        "Mic Gain" - there was no control at all for the signal's level
+ *        going INTO the compressor. Every threshold/ratio number tuned
+ *        earlier in this project's life was tuned against whatever level
+ *        happened to arrive from the ADC (a fixed analog gain stage,
+ *        varying with mic-to-mouth distance and capsule sensitivity) - a
+ *        genuinely different level every session, with no way to correct
+ *        it before the compressor saw it.
+ *
+ *        Deliberately manual, same reasoning as master_gain_db: there's no
+ *        way for this module to know the mic capsule's sensitivity or the
+ *        operator's mic-to-mouth distance, so it can't self-normalize
+ *        correctly - set it by ear/scope (or watch the envelope/profile
+ *        diagnostics already exposed via the 'V' command) so that ordinary
+ *        speech peaks land close to the level the compressor's calibration
+ *        assumes (see ssb_dsp_set_compressor_level() below - the per-level
+ *        table was derived assuming a peak-normalized input, NOT an
+ *        arbitrary raw ADC level). 0.0dB (unity) at init - existing
+ *        behavior is unchanged until this is deliberately dialed in.
+ *
+ *        Applies unconditionally whenever ssb_dsp_process_sample() runs
+ *        (real mic input, and also TWOTONE/singletone/chirp test signals,
+ *        which already go through this same function) - same scope as the
+ *        existing compressor/EQ stage, not gated by audio_fx_configured
+ *        (this is useful even with EQ/compressor both disabled, e.g. to
+ *        trim a hot ADC input before it reaches the Hilbert transform at
+ *        all).
+ */
+void IRAM_ATTR ssb_dsp_set_mic_gain_db(ssb_dsp_handle_t handle, float gain_db);
+float ssb_dsp_get_mic_gain_db(ssb_dsp_handle_t handle);
+
+/**
+ * @brief 2026-09-25: Compression Level - replaces free-running
+ *        threshold/ratio (and the whole switchable-mode idea above) with a
+ *        small set of discrete, integer-dB presets: 0 (SSB_DSP_COMP_LEVEL_MIN,
+ *        a plain limiter, no boost) through 10 (SSB_DSP_COMP_LEVEL_MAX,
+ *        the most aggressive preset shipped). Values outside that range are
+ *        clamped, not rejected.
+ *
+ *        WHAT EACH LEVEL MEANS: dB of measured RMS/power gain on the
+ *        user's OWN real voice (G4AHN.wav), assuming mic gain (see
+ *        ssb_dsp_set_mic_gain_db() above) has already been set so the
+ *        input peaks around the same level (0.85, roughly -1.4dBFS) the
+ *        calibration itself was normalized to. "Level 6" was chosen,
+ *        measured, and verified to deliver close to +6.0dB of real RMS
+ *        gain on that actual recording - not a guessed number, and not an
+ *        abstract knob position. Levels 7-9 continue the same +1dB-per-step
+ *        pattern (+7, +8, +9dB nominal). Level 10 is NOT +10dB: at this
+ *        threshold (0.30, shared/fixed across all levels) and on this
+ *        recording's actual statistics, +10dB and even +9dB of RMS gain are
+ *        PHYSICALLY UNREACHABLE by any ratio, however extreme - as
+ *        ratio->infinity the curve degenerates to a hard limiter fixed at
+ *        the threshold, and even that true hard-clip asymptote only
+ *        achieves ~+8.5dB measured RMS gain on G4AHN.wav (confirmed
+ *        2026-09-25: an initial calibration attempt targeting literal
+ *        +9dB/+10dB just saturated the search's ratio ceiling and produced
+ *        two IDENTICAL, mislabeled entries - see moving_forward_notes.md's
+ *        2026-09-25 entry for the full investigation). Level 10 is
+ *        therefore calibrated to a genuinely achievable +8.35dB instead,
+ *        distinct from level 9's +8.1dB and level 8's +7.6dB - the last
+ *        three steps compress together more tightly than the +1dB/step
+ *        pattern below them because they're approaching that hard physical
+ *        ceiling, not because of a calibration shortcut.
+ *
+ *        HISTORICAL NOTE: an earlier revision of this same calibration
+ *        pass found a project listening test judged +10dB (as it existed
+ *        under the OLD free-running scheme, not this table) to already
+ *        audibly hurt intelligibility, and shipped only levels 0-6 as a
+ *        result. This 2026-09-25 extension to 0-10 was requested
+ *        explicitly by the user with awareness that plain "level 10" no
+ *        longer means a clean +10dB - it means "the most aggressive
+ *        setting this threshold/recording combination can actually
+ *        deliver, ~+8.5dB, sounding more clipped/distorted than levels
+ *        7-8 for only marginal extra loudness." No new listening test has
+ *        been run to re-confirm intelligibility at levels 7-10; treat them
+ *        as numerically verified but NOT YET subjectively validated.
+ *
+ *        If mic gain is set differently than 0.85 peak, or the input
+ *        material has different statistics than G4AHN.wav (different
+ *        voice, different mic, music, noise), the ACTUAL achieved dB will
+ *        differ from the label - the label is a calibrated estimate for
+ *        this one real recording, not a live measurement or a guarantee.
+ *
+ *        LEVEL 0 IS SPECIAL-CASED, not just "the bottom of the same curve
+ *        family evaluated at 0dB": searching for a ratio that hits exactly
+ *        0dB of restored-peak RMS gain naturally converges to ratio=1 (no
+ *        compression at all, verified numerically during calibration) -
+ *        that's a bypass, not "a simple audio side limiter" as requested.
+ *        Level 0 instead fixes makeup_gain at EXACTLY 1.0 (no restoration,
+ *        no boost, ever) paired with a moderately firm ratio chosen to
+ *        genuinely catch real overshoot - measured on the real recording,
+ *        this comes out to a very slight (a fraction of a dB) RMS
+ *        REDUCTION, which is the correct, expected behavior for a limiter:
+ *        it only ever takes away, never adds.
+ *
+ *        HOW THE CURVE/TABLE WORKS (the implementation, not just the
+ *        knob): a fixed, shared threshold (SSB_DSP_COMP_THRESHOLD in
+ *        ssb_dsp.c, 0.30f - NOT independently configurable, see
+ *        ssb_audio_fx_config_t's comment) and four fixed, shared breakpoint
+ *        x-locations feed a 3-segment piecewise-linear approximation of a
+ *        dB-domain (log) soft-knee curve, per the user's explicit request
+ *        ("replace the original with a 3 segment log curve"). Each level's
+ *        {ratio, makeup_gain} pair is a CONSTANT baked in at build time
+ *        from an offline Python calibration against G4AHN.wav (bisecting
+ *        ratio to hit each target dB, computing makeup once as the exact
+ *        peak-restoring value at that ratio, then verifying the result on
+ *        the real recording) - see moving_forward_notes.md's 2026-09-25
+ *        entry for the full table and methodology. Calling this function
+ *        only recomputes the 4 breakpoint y-values from that level's ratio
+ *        (log10f/powf - fine here, this is a rare, human-triggered event,
+ *        never called per-sample) and copies in the fixed makeup_gain -
+ *        it does NOT touch env or re-run any search at runtime.
+ *
+ *        WHY A FIXED, PRE-CALIBRATED CONSTANT rather than the
+ *        peak-tracking dynamic makeup gain the 2026-09-24 RATIO/
+ *        PEAK_NORMALIZE modes used: that scheme's peak_env follower has a
+ *        real, measured lag - a fast attack (matching env's own attack, by
+ *        design) still can't react to a transient inside its own attack
+ *        window, and during calibration on the REAL recording this showed
+ *        up as genuine full-scale overshoot (measured peaks over 1.0,
+ *        1.79 at the most aggressive tested level) that a "worst-case
+ *        steady-state envelope" safety analysis alone did NOT predict. A
+ *        fixed makeup constant doesn't remove that mechanism (the
+ *        envelope-based GAIN decision still has the same attack lag - see
+ *        compressor_process() in ssb_dsp.c), but it does remove one
+ *        moving part's worth of surprise, and the real fix for the
+ *        transient-overshoot mechanism is the hard output clamp
+ *        ssb_dsp_process_sample() now applies after this whole stage (see
+ *        that function) - a genuine safety net, confirmed necessary by
+ *        this exact measurement, not a theoretical nicety.
+ *
+ *        NOT YET BENCH-VALIDATED on real hardware - this whole design is
+ *        built and numerically verified against ONE offline recording.
+ */
+#define SSB_DSP_COMP_LEVEL_MIN  0
+#define SSB_DSP_COMP_LEVEL_MAX  10
+
+void IRAM_ATTR ssb_dsp_set_compressor_level(ssb_dsp_handle_t handle, int level_db);
+int ssb_dsp_get_compressor_level(ssb_dsp_handle_t handle);
 
 /**
  * @brief Evidence for setting max_freq_dev_hz from real data instead of

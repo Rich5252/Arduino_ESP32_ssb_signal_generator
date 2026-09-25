@@ -153,6 +153,14 @@
                                         // points (e.g. envelope_predistort.h's calibration table)
                                         // without needing 10 presses of '+'/'-' to move 1dB
 
+// 2026-09-25: Mic Gain step, per 'U'/'Y' keypress - see
+// ssb_dsp_set_mic_gain_db()'s doc comment in ssb_dsp.h for why this
+// control exists (it's the "normalize input before the compressor" stage
+// this project was missing). 1.0dB matches MASTER_GAIN_STEP_DB's
+// resolution - no separate fine-step variant yet, add one the same way as
+// '.'/',' above if bench use shows a need for finer control.
+#define MIC_GAIN_STEP_DB 1.0f  // per 'U'/'Y' keypress - see ssb_dsp_set_mic_gain_db()
+
 // Mic-path DC-blocking single-pole filter's time constant, in seconds -
 // dsp_task computes dc_alpha = expf(-1.0f / (SAMPLE_RATE_HZ *
 // DC_BLOCK_TIME_CONSTANT_S)) from this at startup, instead of hardcoding

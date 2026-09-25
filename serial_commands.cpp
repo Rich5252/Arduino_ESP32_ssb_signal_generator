@@ -752,11 +752,14 @@ void handle_serial_commands(void)
                                    "effect until this is toggled off again" : "");
         } else if (c == 'x') {
             envelope_floor_raise();
-            serial_reply("-> envelope-null floor raised to %.2f (see envelope_floor.h)\r\n",
+            // 2026-09-25: %.2f -> %.4f alongside ENV_FLOOR_STEP's 0.02->0.001
+            // drop - at 2 decimal places every step below 0.01 prints as
+            // "0.00", indistinguishable from off.
+            serial_reply("-> envelope-null floor raised to %.4f (see envelope_floor.h)\r\n",
                           envelope_floor_get());
         } else if (c == 'z') {
             envelope_floor_lower();
-            serial_reply("-> envelope-null floor lowered to %.2f (see envelope_floor.h)\r\n",
+            serial_reply("-> envelope-null floor lowered to %.4f (see envelope_floor.h)\r\n",
                           envelope_floor_get());
         } else if (c == '}') {
             ssb_dsp_raise_freq_dev_slew_limit(dsp_state_get_ssb());
@@ -896,33 +899,39 @@ void handle_serial_commands(void)
             bool now_on = !ssb_dsp_get_compressor_enabled(dsp_state_get_ssb());
             ssb_dsp_set_compressor_enabled(dsp_state_get_ssb(), now_on);
             serial_reply("-> compressor %s\r\n", now_on ? "ON" : "off");
-        } else if (c == 'W') {
-            // 2026-09-24: cycles which ALGORITHM the compressor runs while
-            // 'c' has it enabled - see ssb_dsp.h's ssb_dsp_comp_mode_t doc
-            // comment. Independent of 'c' itself, same "separate on/off vs
-            // mode-select controls" pattern as adc_lpf_mode's 'f' toggle
-            // being independent of anything that gates the ADC path as a
-            // whole.
-            // 2026-09-24, later: widened from %2 to %3 for the new
-            // SSB_DSP_COMP_MODE_LIMIT_ONLY (attenuate-only, no makeup gain
-            // at all - see ssb_dsp.h).
-            ssb_dsp_comp_mode_t mode = ssb_dsp_get_compressor_mode(dsp_state_get_ssb());
-            mode = (ssb_dsp_comp_mode_t)((mode + 1) % 3);
-            ssb_dsp_set_compressor_mode(dsp_state_get_ssb(), mode);
-            const char *mode_desc;
-            switch (mode) {
-                case SSB_DSP_COMP_MODE_PEAK_NORMALIZE:
-                    mode_desc = "Peak-normalize (linear scale to target peak, crest factor unchanged)";
-                    break;
-                case SSB_DSP_COMP_MODE_LIMIT_ONLY:
-                    mode_desc = "Limit-only (attenuate above threshold, NO makeup gain - can never amplify anything)";
-                    break;
-                case SSB_DSP_COMP_MODE_RATIO:
-                default:
-                    mode_desc = "Ratio (threshold/ratio squashing curve + peak-tracked makeup)";
-                    break;
-            }
-            serial_reply("-> compressor mode: %s%s\r\n", mode_desc,
+        } else if (c == 'U') {
+            // 2026-09-25: Mic Gain up - see ssb_dsp_set_mic_gain_db()'s doc
+            // comment in ssb_dsp.h. Set this FIRST (by ear/scope, or
+            // watching envelope stats via 'V') so ordinary speech peaks
+            // land near the level ssb_dsp_set_compressor_level()'s
+            // calibration table assumes (~0.85, see that function's doc
+            // comment) - THEN dial in compression level with 'X'/'q'.
+            float new_gain = ssb_dsp_get_mic_gain_db(dsp_state_get_ssb()) + MIC_GAIN_STEP_DB;
+            ssb_dsp_set_mic_gain_db(dsp_state_get_ssb(), new_gain);
+            serial_reply("-> mic gain %+.1f dB\r\n", new_gain);
+        } else if (c == 'Y') {
+            float new_gain = ssb_dsp_get_mic_gain_db(dsp_state_get_ssb()) - MIC_GAIN_STEP_DB;
+            ssb_dsp_set_mic_gain_db(dsp_state_get_ssb(), new_gain);
+            serial_reply("-> mic gain %+.1f dB\r\n", new_gain);
+        } else if (c == 'X') {
+            // 2026-09-25: Compression Level up - replaces the old 'W'
+            // mode-cycling command entirely (freed up, not reassigned) -
+            // see ssb_dsp_set_compressor_level()'s doc comment in
+            // ssb_dsp.h for the full design (a small integer-dB table
+            // calibrated against the user's own real voice recording,
+            // 0=plain limiter through 6=~+6dB measured RMS gain).
+            int level = ssb_dsp_get_compressor_level(dsp_state_get_ssb()) + 1;
+            ssb_dsp_set_compressor_level(dsp_state_get_ssb(), level);
+            level = ssb_dsp_get_compressor_level(dsp_state_get_ssb());   // re-read: setter clamps
+            serial_reply("-> compression level %d%s%s\r\n", level,
+                          level == SSB_DSP_COMP_LEVEL_MIN ? " (limiter only, no boost)" : "",
+                          ssb_dsp_get_compressor_enabled(dsp_state_get_ssb()) ? "" : " - no effect until 'c' is ON");
+        } else if (c == 'q') {
+            int level = ssb_dsp_get_compressor_level(dsp_state_get_ssb()) - 1;
+            ssb_dsp_set_compressor_level(dsp_state_get_ssb(), level);
+            level = ssb_dsp_get_compressor_level(dsp_state_get_ssb());
+            serial_reply("-> compression level %d%s%s\r\n", level,
+                          level == SSB_DSP_COMP_LEVEL_MIN ? " (limiter only, no boost)" : "",
                           ssb_dsp_get_compressor_enabled(dsp_state_get_ssb()) ? "" : " - no effect until 'c' is ON");
         } else if (c == '+') {
             float new_gain = ssb_dsp_get_master_gain_db(dsp_state_get_ssb()) + MASTER_GAIN_STEP_DB;
@@ -1078,7 +1087,8 @@ void handle_serial_commands(void)
             // env_predistort_enable, env_floor, freq_dev_slew_limit_hz,
             // envelope_interp_enable, envelope_interp_curve,
             // env_ampeq_enable, env_ampeq_shelf2_enable, env_gdeq_variant,
-            // env_alc_enable, env_softlimit_enable, comp_mode) -
+            // env_alc_enable, env_softlimit_enable, mic_gain_db,
+            // comp_level_db) -
             // wrapped in braces with a trailing comma so the whole line
             // can be pasted directly into settingsPresets[] in settings.h
             // as a new preset entry.
@@ -1145,22 +1155,19 @@ void handle_serial_commands(void)
             // active; current project recommendation is "false" for both
             // until real-hardware testing says otherwise.
             //
-            // comp_mode ('W', ssb_dsp.h's ssb_dsp_comp_mode_t) is the newest
-            // trailing field - added 2026-09-24, now a 3-way choice:
-            // SSB_DSP_COMP_MODE_RATIO (original threshold/ratio squashing
-            // curve + peak-tracked makeup gain), SSB_DSP_COMP_MODE_PEAK_NORMALIZE
-            // (linear scale-to-target-peak, no squashing curve, crest
-            // factor unchanged), and SSB_DSP_COMP_MODE_LIMIT_ONLY (same
-            // squashing curve as Ratio but makeup_gain permanently fixed at
-            // 1.0 - attenuate-only, can never amplify the noise floor or
-            // restore the compressed peak's level; added same day, directly
-            // from real-hardware feedback that the original fixed-makeup
-            // design forced a master-gain retrim whenever 'c' was toggled
-            // on, to avoid hitting the output ceiling). Prints as the enum
-            // constant name, same convention as adc_lpf_mode/
-            // envelope_interp_curve/env_gdeq_variant above. None of the
-            // three modes is bench-validated yet; SSB_DSP_COMP_MODE_RATIO
-            // (the original behavior) remains this project's default.
+            // comp_mode was here through 2026-09-24 - REMOVED 2026-09-25
+            // along with the whole switchable-mode compressor (see
+            // ssb_dsp.h's 2026-09-25 comment for why: the user's own real
+            // mic recording showed the actual missing piece was a Mic Gain
+            // stage upstream, not another compressor mode). The two
+            // trailing fields are now mic_gain_db ('U'/'Y',
+            // ssb_dsp_set_mic_gain_db() - a plain float dB, printed the
+            // same way as master_gain_db) and comp_level_db ('X'/'q',
+            // ssb_dsp_set_compressor_level() - a plain int 0-10, see that
+            // function's doc comment in ssb_dsp.h for the full calibrated-
+            // level design). Neither is bench-validated yet; comp_level_db
+            // defaults to 0 (limiter only, no boost) - a deliberate change
+            // from the old design's automatic makeup gain.
 #if AD9851_ATTACHED
             float rel_delay = relative_delay_get_samples();
             bool rf_enabled = carrier_output_get_rf_enabled();
@@ -1207,15 +1214,13 @@ void handle_serial_commands(void)
                 "ENV_GDEQ_VARIANT_DEFAULT", "ENV_GDEQ_VARIANT_AA_CANDIDATE",
                 "ENV_GDEQ_VARIANT_CANDIDATE_B", "ENV_GDEQ_VARIANT_A_CANDIDATE"
             };
-            // comp_mode prints as the enum constant name, same convention
-            // as the tables above - see this function's header comment's
-            // comp_mode note.
-            static const char *k_comp_mode_enum_name[3] = {
-                "SSB_DSP_COMP_MODE_RATIO", "SSB_DSP_COMP_MODE_PEAK_NORMALIZE",
-                "SSB_DSP_COMP_MODE_LIMIT_ONLY"
-            };
             serial_reply("-> settings line (paste into settingsPresets[] in settings.h, then rename \"Live\"):\r\n");
-            serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s, %s, %s, %s, %s, %s, %s, %s },\r\n",
+            // env_floor's field (the 12th %f below) is %.4ff, not %.2ff like
+            // its neighbors - 2026-09-25: ENV_FLOOR_STEP dropped to 0.001,
+            // and %.2ff would silently round anything below 0.01 to "0.00f",
+            // losing a deliberately-dialed-in floor value the moment it's
+            // pasted into a preset.
+            serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.4ff, %s, %s, %s, %s, %s, %s, %s, %s, %.1ff, %d },\r\n",
                           audio_source_enum_name(dsp_state_get_audio_source()),
                           rel_delay,
                           envelope_output_get_pwm_offset(),
@@ -1236,7 +1241,8 @@ void handle_serial_commands(void)
                           k_gdeq_variant_enum_name[envelope_gdeq_get_variant()],
                           envelope_alc_get_enabled() ? "true" : "false",
                           envelope_softlimit_get_enabled() ? "true" : "false",
-                          k_comp_mode_enum_name[ssb_dsp_get_compressor_mode(dsp_state_get_ssb())]);
+                          ssb_dsp_get_mic_gain_db(dsp_state_get_ssb()),
+                          ssb_dsp_get_compressor_level(dsp_state_get_ssb()));
         } else if (c >= '0' && c <= '9') {
             int preset = c - '0';
             const PersistentSettings& p = settingsPresets[preset];
@@ -1327,11 +1333,13 @@ void handle_serial_commands(void)
             envelope_alc_set_enabled(p.env_alc_enable);
             envelope_softlimit_set_enabled(p.env_softlimit_enable);
 
-            // No reset-on-change concern (see ssb_dsp_set_compressor_mode()'s
-            // own comment) - safe to call unconditionally on every preset
-            // load, same as adc_lpf_mode/envelope_interp_curve above.
-            // Added 2026-09-24.
-            ssb_dsp_set_compressor_mode(dsp_state_get_ssb(), p.comp_mode);
+            // 2026-09-25: replaces the old comp_mode load here. Mic gain
+            // is a plain manual trim (same pattern as master_gain_db just
+            // above) - no reset-on-change concern. Compression level has
+            // none either (see ssb_dsp_set_compressor_level()'s own
+            // comment) - safe to call unconditionally on every preset load.
+            ssb_dsp_set_mic_gain_db(dsp_state_get_ssb(), p.mic_gain_db);
+            ssb_dsp_set_compressor_level(dsp_state_get_ssb(), p.comp_level_db);
 
             serial_reply("-> preset %d: %s\r\n", preset, p.name);
         }

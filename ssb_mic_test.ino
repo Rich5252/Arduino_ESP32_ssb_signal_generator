@@ -1071,10 +1071,19 @@ void setup()
             .enable = AUDIO_FX_ENABLED,
             .hpf_freq_hz = 300.0f,
             .presence_freq_hz = 2200.0f,
-            .presence_gain_db = 3.0f,
+            .presence_gain_db = 2.0f,
             .presence_q = 1.0f,
-            .comp_threshold = 0.3f,
-            .comp_ratio = 3.5f,
+            // 2026-09-25: comp_threshold/comp_ratio REMOVED - the
+            // compressor's threshold is now a fixed internal constant
+            // (SSB_DSP_COMP_THRESHOLD, ssb_dsp.c) shared by the whole
+            // voice-calibrated level table, and ratio is selected via
+            // ssb_dsp_set_compressor_level() instead of set here. See
+            // ssb_dsp.h's 2026-09-25 comment above the old
+            // ssb_dsp_comp_mode_t enum for the full story - this project's
+            // actual deployed value here had drifted to 0.1f (not the
+            // 0.3f the old doc comment used as an example), underscoring
+            // why an independently-configurable, unvalidated threshold was
+            // part of the problem.
             .comp_attack_ms = 3.0f,
             .comp_release_ms = 120.0f,
         },

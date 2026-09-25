@@ -36,7 +36,21 @@
 
 #include "envelope_floor.h"
 
-#define ENV_FLOOR_STEP 0.02f
+// 2026-09-25: 0.02 -> 0.001, at the user's explicit request. 0.02 (in dB
+// terms, 20*log10(0.02) = -34dBc - the achievable null depth once floor
+// engages at all, since floor+= (1-floor)*0 = floor is the minimum
+// output this remap can ever produce) was the ONLY non-zero value
+// reachable with one 'x' press - a huge first step given this project's
+// own predistort measurements put true-zero null depth at ~-58dBc (see
+// envelope_predistort.h). 0.001 (-60dB) is comparably fine-grained to
+// that number - closer to "nudge the floor up a hair" than "give up 24dB
+// of null depth in one keypress." Also deliberately close to one raw PWM
+// LSB at RSET_MOD_LEDC_RES=10 bits (1/1023 = 0.000978, see
+// envelope_output.h) - a step finer than the output hardware can actually
+// resolve would just add keypresses without a measurable effect, so this
+// is close to the natural bottom of usefully fine, not an arbitrary
+// round number.
+#define ENV_FLOOR_STEP 0.001f
 #define ENV_FLOOR_MAX  0.50f
 
 static volatile float s_envelope_floor = 0.0f;
