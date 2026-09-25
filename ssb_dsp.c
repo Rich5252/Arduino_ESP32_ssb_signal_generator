@@ -63,6 +63,20 @@ typedef struct {
 // level change, e.g. moving away from the mic, for multiple seconds).
 #define COMP_PEAK_HOLD_RELEASE_MS   2000.0f
 
+// 2026-09-24: SSB_DSP_COMP_MODE_PEAK_NORMALIZE's own two constants - see
+// ssb_dsp.h's ssb_dsp_comp_mode_t doc comment for the mode's rationale.
+// TARGET is where the tracked peak gets scaled TO (deliberately a bit
+// under 1.0 - the peak tracker's attack, though fast, still lags a truly
+// instantaneous transient by ~one attack time-constant, same finite-attack
+// caveat every feed-forward envelope-based gain scheme here already has;
+// this margin is a first-cut guess at covering that, not a measured
+// number). MAX_GAIN is a safety ceiling on the ONE division this mode
+// performs (target/peak_env) - without it, a peak_env that decays toward
+// zero during a long silence would otherwise ask for unbounded gain on
+// pure noise floor. Neither is exposed as a separate tunable yet.
+#define COMP_PEAK_NORMALIZE_TARGET     0.90f
+#define COMP_PEAK_NORMALIZE_MAX_GAIN   10.0f
+
 // Denormal (subnormal) floats are numbers below ~1.2e-38f in magnitude -
 // still valid IEEE-754 values, but most FPUs (including Xtensa's) fall
 // back to a slow microcoded/trap path to handle them instead of the
@@ -290,40 +304,94 @@ float IRAM_ATTR ssb_shelf_biquad_process(ssb_shelf_biquad_t *f, float x)
 // inverted (env/compressed rather than compressed/env) since the goal
 // here is to CANCEL that reduction rather than apply it. No new
 // transcendental math - same multiply/divide cost as the block above.
-static inline float IRAM_ATTR compressor_process(compressor_t *c, float x)
+//
+// 2026-09-24, later: takes `mode` (ssb_dsp_comp_mode_t) to select between
+// this ratio-curve behavior and SSB_DSP_COMP_MODE_PEAK_NORMALIZE's plain
+// linear scale - see ssb_dsp.h's doc comment on the enum for the
+// rationale (short version: assume voice's own high crest factor means
+// real peaks get hit reasonably often, so just track that peak and scale
+// the WHOLE signal to it - no squashing curve, less makeup gain injected
+// into whatever's below threshold than ratio mode needs for the same
+// target peak, and one fewer moving part than the ratio-curve + makeup
+// combination). env and peak_env are updated UNCONDITIONALLY regardless
+// of mode, same reasoning as this project's other reset-on-transition
+// fixes (ssb_dsp_set_eq_enabled() etc.) - so switching modes live never
+// resumes either follower from a stale/frozen value.
+static inline float IRAM_ATTR compressor_process(compressor_t *c, float x, ssb_dsp_comp_mode_t mode)
 {
     float ax = fabsf(x);
     float coef = (ax > c->env) ? c->attack_coef : c->release_coef;
     c->env = flush_denorm(c->env + coef * (ax - c->env));
 
-    float gain;
-    if (c->env > c->threshold) {
-        float compressed = c->threshold + (c->env - c->threshold) * c->inv_ratio;
-        gain = (c->env > 1e-6f) ? (compressed / c->env) : 1.0f;
-    } else {
-        gain = 1.0f;
-    }
-
     // Slow peak-hold: same fast attack as env above (must see every peak
     // env itself reacts to), much slower release (COMP_PEAK_HOLD_RELEASE_MS)
     // so it reflects the signal's sustained peak level, not each syllable.
+    // Shared by BOTH modes below.
     float peak_coef = (ax > c->peak_env) ? c->attack_coef : c->peak_release_coef;
     c->peak_env = flush_denorm(c->peak_env + peak_coef * (ax - c->peak_env));
 
-    if (c->peak_env > c->threshold) {
-        float peak_compressed = c->threshold + (c->peak_env - c->threshold) * c->inv_ratio;
-        // peak_compressed > 0 is guaranteed here (threshold > 0 by
-        // ssb_dsp_set_compressor()'s validation, and the added term is
-        // non-negative above threshold) - no epsilon guard needed, unlike
-        // the env>1e-6f guard above which protects a genuinely-can-be-zero
-        // divisor.
-        c->makeup_gain = c->peak_env / peak_compressed;
-    } else {
-        // Peak has never (or not recently) exceeded threshold - nothing to
-        // restore, so no artificial boost. Matches this project's existing
-        // "attenuate/restore only, never manufacture gain that isn't
-        // justified by the signal itself" convention (see envelope_alc.h).
+    float gain;
+    if (mode == SSB_DSP_COMP_MODE_PEAK_NORMALIZE) {
+        // No squashing curve at all - env (above) is still updated but
+        // unused here. A single linear scale, so crest factor is
+        // untouched: quiet and loud content get multiplied by exactly the
+        // same factor at any instant.
+        gain = 1.0f;
+        if (c->peak_env > c->threshold) {
+            c->makeup_gain = COMP_PEAK_NORMALIZE_TARGET / c->peak_env;
+            if (c->makeup_gain > COMP_PEAK_NORMALIZE_MAX_GAIN) {
+                c->makeup_gain = COMP_PEAK_NORMALIZE_MAX_GAIN;   // guards pure silence/noise floor
+            }
+        } else {
+            // Below threshold - same "nothing to restore, no artificial
+            // boost" reasoning as SSB_DSP_COMP_MODE_RATIO below, and what
+            // keeps genuine silence from ever hitting the MAX_GAIN ceiling.
+            c->makeup_gain = 1.0f;
+        }
+    } else if (mode == SSB_DSP_COMP_MODE_LIMIT_ONLY) {
+        // 2026-09-24, later: same squashing curve as SSB_DSP_COMP_MODE_RATIO
+        // below, but makeup_gain is permanently 1.0 - never computed from
+        // env, peak_env, or anything else. This is the mode that can never
+        // amplify ANYTHING, at any instant, by construction: below
+        // threshold the signal is untouched (bit-identical to
+        // passthrough), above threshold gain<=1 only ever attenuates. See
+        // ssb_dsp.h's ssb_dsp_comp_mode_t doc comment for the real-hardware
+        // symptom (toggling 'c' under the ORIGINAL fixed ~2.36x makeup
+        // gain forced a master-gain retrim every time) this mode directly
+        // targets.
+        if (c->env > c->threshold) {
+            float compressed = c->threshold + (c->env - c->threshold) * c->inv_ratio;
+            gain = (c->env > 1e-6f) ? (compressed / c->env) : 1.0f;
+        } else {
+            gain = 1.0f;
+        }
         c->makeup_gain = 1.0f;
+    } else {
+        // SSB_DSP_COMP_MODE_RATIO (default) - unchanged from the earlier
+        // 2026-09-24 redesign.
+        if (c->env > c->threshold) {
+            float compressed = c->threshold + (c->env - c->threshold) * c->inv_ratio;
+            gain = (c->env > 1e-6f) ? (compressed / c->env) : 1.0f;
+        } else {
+            gain = 1.0f;
+        }
+
+        if (c->peak_env > c->threshold) {
+            float peak_compressed = c->threshold + (c->peak_env - c->threshold) * c->inv_ratio;
+            // peak_compressed > 0 is guaranteed here (threshold > 0 by
+            // ssb_dsp_set_compressor()'s validation, and the added term is
+            // non-negative above threshold) - no epsilon guard needed,
+            // unlike the env>1e-6f guard above which protects a
+            // genuinely-can-be-zero divisor.
+            c->makeup_gain = c->peak_env / peak_compressed;
+        } else {
+            // Peak has never (or not recently) exceeded threshold - nothing
+            // to restore, so no artificial boost. Matches this project's
+            // existing "attenuate/restore only, never manufacture gain
+            // that isn't justified by the signal itself" convention (see
+            // envelope_alc.h).
+            c->makeup_gain = 1.0f;
+        }
     }
 
     return x * gain * c->makeup_gain;
@@ -405,6 +473,13 @@ struct ssb_dsp_s {
     bool audio_fx_configured;
     volatile bool eq_enable;
     volatile bool comp_enable;
+    // 2026-09-24: which compressor algorithm runs while comp_enable is
+    // true - see ssb_dsp_comp_mode_t in ssb_dsp.h. Same volatile reasoning
+    // as eq_enable/comp_enable above (written from a command handler,
+    // read every sample from the real-time path). Defaults to
+    // SSB_DSP_COMP_MODE_RATIO (value 0) at init, matching this project's
+    // "new field defaults to whatever preserves prior behavior" convention.
+    volatile ssb_dsp_comp_mode_t comp_mode;
     biquad_t eq_hpf;
     biquad_t eq_presence;
     compressor_t comp;
@@ -505,6 +580,7 @@ esp_err_t ssb_dsp_init(const ssb_dsp_config_t *cfg, ssb_dsp_handle_t *out_handle
     h->audio_fx_configured = cfg->audio_fx.enable;
     h->eq_enable = cfg->audio_fx.enable;     // default both stages "on" if configured at all -
     h->comp_enable = cfg->audio_fx.enable;   // individually toggled later via the setters below
+    h->comp_mode = SSB_DSP_COMP_MODE_RATIO;  // 2026-09-24: default - see ssb_dsp_comp_mode_t
     if (h->audio_fx_configured) {
         float hpf_fc      = cfg->audio_fx.hpf_freq_hz > 0.0f ? cfg->audio_fx.hpf_freq_hz : 300.0f;
         float presence_fc = cfg->audio_fx.presence_freq_hz > 0.0f ? cfg->audio_fx.presence_freq_hz : 2200.0f;
@@ -616,6 +692,25 @@ bool ssb_dsp_get_eq_enabled(ssb_dsp_handle_t handle)
 bool ssb_dsp_get_compressor_enabled(ssb_dsp_handle_t handle)
 {
     return handle && handle->audio_fx_configured && handle->comp_enable;
+}
+
+// 2026-09-24: no state reset here, unlike ssb_dsp_set_compressor_enabled()
+// above - switching mode doesn't stop/restart the compressor the way
+// enable/disable does, env and peak_env keep running continuously either
+// way (compressor_process() updates both unconditionally regardless of
+// mode), so there's no frozen/stale state to clean up on a mode switch,
+// only a different formula being applied to state that's already live and
+// valid.
+void IRAM_ATTR ssb_dsp_set_compressor_mode(ssb_dsp_handle_t handle, ssb_dsp_comp_mode_t mode)
+{
+    if (!handle || !handle->audio_fx_configured) return;
+    handle->comp_mode = mode;
+}
+
+ssb_dsp_comp_mode_t ssb_dsp_get_compressor_mode(ssb_dsp_handle_t handle)
+{
+    if (!handle || !handle->audio_fx_configured) return SSB_DSP_COMP_MODE_RATIO;
+    return handle->comp_mode;
 }
 
 void ssb_dsp_get_iir_canary(ssb_dsp_handle_t handle, ssb_dsp_iir_canary_t *out)
@@ -805,7 +900,7 @@ void IRAM_ATTR ssb_dsp_process_sample(ssb_dsp_handle_t handle,
     // recompiling - see ssb_dsp_set_eq_enabled()/ssb_dsp_set_compressor_enabled().
     int64_t t0 = esp_timer_get_time();
     if (handle->audio_fx_configured) {
-        if (handle->comp_enable) audio_sample = compressor_process(&handle->comp, audio_sample);
+        if (handle->comp_enable) audio_sample = compressor_process(&handle->comp, audio_sample, handle->comp_mode);
         if (handle->eq_enable) {
             audio_sample = biquad_process(&handle->eq_hpf, audio_sample);
             audio_sample = biquad_process(&handle->eq_presence, audio_sample);

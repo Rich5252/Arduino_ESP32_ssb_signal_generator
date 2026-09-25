@@ -896,6 +896,34 @@ void handle_serial_commands(void)
             bool now_on = !ssb_dsp_get_compressor_enabled(dsp_state_get_ssb());
             ssb_dsp_set_compressor_enabled(dsp_state_get_ssb(), now_on);
             serial_reply("-> compressor %s\r\n", now_on ? "ON" : "off");
+        } else if (c == 'W') {
+            // 2026-09-24: cycles which ALGORITHM the compressor runs while
+            // 'c' has it enabled - see ssb_dsp.h's ssb_dsp_comp_mode_t doc
+            // comment. Independent of 'c' itself, same "separate on/off vs
+            // mode-select controls" pattern as adc_lpf_mode's 'f' toggle
+            // being independent of anything that gates the ADC path as a
+            // whole.
+            // 2026-09-24, later: widened from %2 to %3 for the new
+            // SSB_DSP_COMP_MODE_LIMIT_ONLY (attenuate-only, no makeup gain
+            // at all - see ssb_dsp.h).
+            ssb_dsp_comp_mode_t mode = ssb_dsp_get_compressor_mode(dsp_state_get_ssb());
+            mode = (ssb_dsp_comp_mode_t)((mode + 1) % 3);
+            ssb_dsp_set_compressor_mode(dsp_state_get_ssb(), mode);
+            const char *mode_desc;
+            switch (mode) {
+                case SSB_DSP_COMP_MODE_PEAK_NORMALIZE:
+                    mode_desc = "Peak-normalize (linear scale to target peak, crest factor unchanged)";
+                    break;
+                case SSB_DSP_COMP_MODE_LIMIT_ONLY:
+                    mode_desc = "Limit-only (attenuate above threshold, NO makeup gain - can never amplify anything)";
+                    break;
+                case SSB_DSP_COMP_MODE_RATIO:
+                default:
+                    mode_desc = "Ratio (threshold/ratio squashing curve + peak-tracked makeup)";
+                    break;
+            }
+            serial_reply("-> compressor mode: %s%s\r\n", mode_desc,
+                          ssb_dsp_get_compressor_enabled(dsp_state_get_ssb()) ? "" : " - no effect until 'c' is ON");
         } else if (c == '+') {
             float new_gain = ssb_dsp_get_master_gain_db(dsp_state_get_ssb()) + MASTER_GAIN_STEP_DB;
             dsp_state_set_master_gain_db(new_gain);
@@ -1050,7 +1078,7 @@ void handle_serial_commands(void)
             // env_predistort_enable, env_floor, freq_dev_slew_limit_hz,
             // envelope_interp_enable, envelope_interp_curve,
             // env_ampeq_enable, env_ampeq_shelf2_enable, env_gdeq_variant,
-            // env_alc_enable, env_softlimit_enable) -
+            // env_alc_enable, env_softlimit_enable, comp_mode) -
             // wrapped in braces with a trailing comma so the whole line
             // can be pasted directly into settingsPresets[] in settings.h
             // as a new preset entry.
@@ -1109,13 +1137,30 @@ void handle_serial_commands(void)
             // bench-testing choice, not this project's default.
             //
             // env_alc_enable ('l', envelope_alc.h) and env_softlimit_enable
-            // ('S', envelope_softlimit.h) are the newest trailing fields -
-            // added 2026-09-21. Both plain bools, printed the same way as
+            // ('S', envelope_softlimit.h) were the newest trailing fields as
+            // of 2026-09-21. Both plain bools, printed the same way as
             // env_ampeq_enable/env_ampeq_shelf2_enable above. NEITHER is
             // bench-validated yet - pasting "true" for either here means
             // that preset starts up with first-cut, unvalidated defaults
             // active; current project recommendation is "false" for both
             // until real-hardware testing says otherwise.
+            //
+            // comp_mode ('W', ssb_dsp.h's ssb_dsp_comp_mode_t) is the newest
+            // trailing field - added 2026-09-24, now a 3-way choice:
+            // SSB_DSP_COMP_MODE_RATIO (original threshold/ratio squashing
+            // curve + peak-tracked makeup gain), SSB_DSP_COMP_MODE_PEAK_NORMALIZE
+            // (linear scale-to-target-peak, no squashing curve, crest
+            // factor unchanged), and SSB_DSP_COMP_MODE_LIMIT_ONLY (same
+            // squashing curve as Ratio but makeup_gain permanently fixed at
+            // 1.0 - attenuate-only, can never amplify the noise floor or
+            // restore the compressed peak's level; added same day, directly
+            // from real-hardware feedback that the original fixed-makeup
+            // design forced a master-gain retrim whenever 'c' was toggled
+            // on, to avoid hitting the output ceiling). Prints as the enum
+            // constant name, same convention as adc_lpf_mode/
+            // envelope_interp_curve/env_gdeq_variant above. None of the
+            // three modes is bench-validated yet; SSB_DSP_COMP_MODE_RATIO
+            // (the original behavior) remains this project's default.
 #if AD9851_ATTACHED
             float rel_delay = relative_delay_get_samples();
             bool rf_enabled = carrier_output_get_rf_enabled();
@@ -1162,8 +1207,15 @@ void handle_serial_commands(void)
                 "ENV_GDEQ_VARIANT_DEFAULT", "ENV_GDEQ_VARIANT_AA_CANDIDATE",
                 "ENV_GDEQ_VARIANT_CANDIDATE_B", "ENV_GDEQ_VARIANT_A_CANDIDATE"
             };
+            // comp_mode prints as the enum constant name, same convention
+            // as the tables above - see this function's header comment's
+            // comp_mode note.
+            static const char *k_comp_mode_enum_name[3] = {
+                "SSB_DSP_COMP_MODE_RATIO", "SSB_DSP_COMP_MODE_PEAK_NORMALIZE",
+                "SSB_DSP_COMP_MODE_LIMIT_ONLY"
+            };
             serial_reply("-> settings line (paste into settingsPresets[] in settings.h, then rename \"Live\"):\r\n");
-            serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s, %s, %s, %s, %s, %s, %s },\r\n",
+            serial_reply("    { \"Live\", %s, %.2ff, %.2ff, %.2ff, %s, %s, %s, %s, %.1ff, %s, %s, %.2ff, %s, %s, %s, %s, %s, %s, %s, %s, %s },\r\n",
                           audio_source_enum_name(dsp_state_get_audio_source()),
                           rel_delay,
                           envelope_output_get_pwm_offset(),
@@ -1183,7 +1235,8 @@ void handle_serial_commands(void)
                           envelope_ampeq_shelf2_get_enabled() ? "true" : "false",
                           k_gdeq_variant_enum_name[envelope_gdeq_get_variant()],
                           envelope_alc_get_enabled() ? "true" : "false",
-                          envelope_softlimit_get_enabled() ? "true" : "false");
+                          envelope_softlimit_get_enabled() ? "true" : "false",
+                          k_comp_mode_enum_name[ssb_dsp_get_compressor_mode(dsp_state_get_ssb())]);
         } else if (c >= '0' && c <= '9') {
             int preset = c - '0';
             const PersistentSettings& p = settingsPresets[preset];
@@ -1273,6 +1326,12 @@ void handle_serial_commands(void)
             // added 2026-09-21 alongside env_alc_enable/env_softlimit_enable.
             envelope_alc_set_enabled(p.env_alc_enable);
             envelope_softlimit_set_enabled(p.env_softlimit_enable);
+
+            // No reset-on-change concern (see ssb_dsp_set_compressor_mode()'s
+            // own comment) - safe to call unconditionally on every preset
+            // load, same as adc_lpf_mode/envelope_interp_curve above.
+            // Added 2026-09-24.
+            ssb_dsp_set_compressor_mode(dsp_state_get_ssb(), p.comp_mode);
 
             serial_reply("-> preset %d: %s\r\n", preset, p.name);
         }

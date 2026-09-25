@@ -200,6 +200,15 @@ typedef struct
     bool env_alc_enable;         // 'l' - envelope_alc.h, off by default
     bool env_softlimit_enable;   // 'S' - envelope_softlimit.h, off by default
 
+    // Added 2026-09-24 when ssb_dsp_comp_mode_t (ssb_dsp.h) was introduced -
+    // appended at the END, same reasoning as every trailing field above:
+    // every existing preset's positional initializer list keeps working
+    // unchanged, C zero-fills this to SSB_DSP_COMP_MODE_RATIO (deliberately
+    // value 0 - see that enum's own comment), which is exactly the
+    // compressor's original behavior. Only a preset that wants the new
+    // SSB_DSP_COMP_MODE_PEAK_NORMALIZE mode deliberately needs to set this.
+    ssb_dsp_comp_mode_t comp_mode;  // 'W' - ssb_dsp.h, ratio mode by default
+
 } PersistentSettings;
 
 

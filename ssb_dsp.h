@@ -147,6 +147,67 @@ bool ssb_dsp_get_eq_enabled(ssb_dsp_handle_t handle);
 bool ssb_dsp_get_compressor_enabled(ssb_dsp_handle_t handle);
 
 /**
+ * @brief 2026-09-24: which ALGORITHM the compressor stage runs, independent
+ *        of comp_enable above (which just gates whether it runs at all).
+ *
+ *        SSB_DSP_COMP_MODE_RATIO (default, value 0 so existing
+ *        PersistentSettings presets/configs that never set this field keep
+ *        their exact original behavior): the original threshold/ratio
+ *        soft-knee curve - loud content gets squashed toward threshold,
+ *        proportionally more so at a higher ratio, then a peak-tracked
+ *        makeup gain restores the signal's own recently-observed peak.
+ *        This actively changes the signal's crest factor (peak-to-average
+ *        ratio) - that's the point of a ratio compressor.
+ *
+ *        SSB_DSP_COMP_MODE_PEAK_NORMALIZE: no squashing curve at all - a
+ *        single linear scale factor (comp_threshold still gates it: below
+ *        threshold, untouched) derived purely from the same peak tracker,
+ *        aimed at keeping the tracked peak sitting at a fixed target level
+ *        (see COMP_PEAK_NORMALIZE_TARGET in ssb_dsp.c). Crest factor is
+ *        UNCHANGED by this mode - quiet and loud content are scaled by
+ *        exactly the same factor at any instant, so for a source that's
+ *        already expected to reach its natural peaks reasonably often
+ *        (a reasonable assumption for voice's own high crest factor),
+ *        this needs LESS makeup gain than ratio mode to reach the same
+ *        target peak - see null_bias_investigation.md's 2026-09-24 entry
+ *        for the exact numeric comparison. First-cut, NOT bench-validated.
+ *
+ *        SSB_DSP_COMP_MODE_LIMIT_ONLY (added 2026-09-24, later, per a real
+ *        bench observation): the same threshold/ratio squashing curve as
+ *        RATIO above, but with NO makeup gain step at all - makeup_gain
+ *        is permanently 1.0, full stop, not tracked from anything. Below
+ *        threshold the signal is completely unchanged (bit-identical to
+ *        passthrough); above threshold it is ONLY EVER attenuated, never
+ *        restored or boosted. This is the one mode that can structurally
+ *        never amplify anything, at any instant, by construction - no
+ *        peak tracker, no lag, no threshold-crossing timing window for
+ *        noise to sneak through (the failure mode identified in this same
+ *        day's discussion of the other two modes' peak-hold release
+ *        time). The direct real-hardware motivation: the ORIGINAL
+ *        pre-2026-09-24 compressor's fixed makeup gain (~2.36x for
+ *        threshold=0.3/ratio=3.5) was applied unconditionally to
+ *        EVERYTHING, all the time, including below threshold - toggling
+ *        'c' on raised the whole signal (noise floor included) by that
+ *        fixed factor, which is why master gain needed re-trimming down
+ *        every time 'c' was toggled on to avoid hitting the output
+ *        ceiling. This mode is the direct fix for exactly that symptom:
+ *        no gain ever gets added, so 'c' toggling never requires a master
+ *        gain retrim. The cost, vs. the other two modes: it doesn't
+ *        restore the compressed peak's level (unlike RATIO/PEAK_NORMALIZE)
+ *        and doesn't raise RMS/reduce crest factor at all - loud content
+ *        gets quieter, nothing else changes. A plain peak limiter, not a
+ *        loudness-raising compressor.
+ */
+typedef enum {
+    SSB_DSP_COMP_MODE_RATIO = 0,
+    SSB_DSP_COMP_MODE_PEAK_NORMALIZE = 1,
+    SSB_DSP_COMP_MODE_LIMIT_ONLY = 2,
+} ssb_dsp_comp_mode_t;
+
+void IRAM_ATTR ssb_dsp_set_compressor_mode(ssb_dsp_handle_t handle, ssb_dsp_comp_mode_t mode);
+ssb_dsp_comp_mode_t ssb_dsp_get_compressor_mode(ssb_dsp_handle_t handle);
+
+/**
  * @brief 2026-09-11: NaN/Inf canary for this module's three IIR-style
  *        persistent states (eq_hpf/eq_presence biquad feedback, the
  *        compressor's envelope follower) - see moving_forward_notes.md's
