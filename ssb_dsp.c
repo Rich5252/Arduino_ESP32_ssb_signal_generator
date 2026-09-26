@@ -414,15 +414,43 @@ static inline float IRAM_ATTR compressor_process(compressor_t *c, float x)
     return x * gain * c->makeup_gain;
 }
 
-// Three-stage noise gate - see ssb_dsp_set_squelch_enabled()'s doc comment
-// in ssb_dsp.h for the full rationale. Detector tracks level (rejecting
-// brief clicks by construction), a Schmitt trigger turns that into a
-// hysteretic open/closed decision, and a separately-smoothed gain is what
-// actually gets multiplied - the only thing touching the sample value is
-// that last, continuous gain, so there is no hard clamp/kink anywhere in
-// the signal path itself (the class of bug envelope_floor.cpp's own
-// header documents two earlier, reverted designs hitting).
-static inline float IRAM_ATTR squelch_process(squelch_t *s, float x)
+// Three-stage noise gate DETECTOR/GAIN state machine - see
+// ssb_dsp_set_squelch_enabled()'s doc comment in ssb_dsp.h for the full
+// rationale. Detector tracks level (rejecting brief clicks by
+// construction), a Schmitt trigger turns that into a hysteretic
+// open/closed decision, and a separately-smoothed gain is the result,
+// left in s->gain for the caller to use.
+//
+// 2026-09-26 CORRECTION (real-hardware report): this function used to
+// also multiply x and `return x * s->gain`, applied HERE - BEFORE the
+// Hilbert transform. When the gate closed fully (gain -> 0), that drove
+// audio_sample to an exact, bit-constant 0.0, which fills the Hilbert
+// delay line with zeros (I=Q=0 once it settles), freezing phase at
+// atan2(0,0)'s degenerate fixed value and collapsing computed frequency
+// deviation to exactly 0 - a genuinely unmodulated carrier. Any real
+// analog RF leakage at the "envelope=0" operating point (a common
+// EER/polar-PA reality from finite switching-PA off-isolation, not
+// something firmware can necessarily eliminate) then presents as a
+// discrete, easily audible CW tone rather than as quiet noise - reported
+// by the user as squelch producing "no USB noise but only a small
+// carrier tone" instead of the desired "no USB noise, just quiet."
+//
+// Per explicit user instruction ("keep the hilbert fed with noise but
+// reduce env to zero"): this function now ONLY updates the detector/
+// hysteresis/gain state below - it no longer touches x, and no longer
+// returns anything. audio_sample flows into the Hilbert delay line
+// completely untouched by squelch, so phase (computed downstream via
+// atan2(Q,I) on that real, ungated signal) keeps dithering off genuine
+// noise and never freezes, gate open or closed. The caller instead
+// multiplies the computed ENVELOPE (post-Hilbert, post-sqrt) by this
+// s->gain - see ssb_dsp_process_sample() just after `envelope =
+// fast_sqrt(...)/sqrtf(...)`. This is sound specifically because phase
+// is mathematically scale-invariant to any uniform positive gain
+// (atan2(k*Q, k*I) == atan2(Q, I) for all k>0), while envelope scales
+// exactly as k*sqrt(I^2+Q^2) - so gating envelope alone gives true
+// RF-power silence (real zero, not just "very quiet") without
+// perturbing phase/frequency at all.
+static inline void IRAM_ATTR squelch_update(squelch_t *s, float x)
 {
     float ax = fabsf(x);
     float dcoef = (ax > s->detector_env) ? s->detector_attack_coef : s->detector_release_coef;
@@ -439,8 +467,6 @@ static inline float IRAM_ATTR squelch_process(squelch_t *s, float x)
     float target_gain = s->gate_open ? 1.0f : 0.0f;
     float gcoef = (target_gain > s->gain) ? s->gain_attack_coef : s->gain_release_coef;
     s->gain = flush_denorm(s->gain + gcoef * (target_gain - s->gain));
-
-    return x * s->gain;
 }
 
 struct ssb_dsp_s {
@@ -638,7 +664,7 @@ esp_err_t ssb_dsp_init(const ssb_dsp_config_t *cfg, ssb_dsp_handle_t *out_handle
     // point (see ssb_dsp_set_squelch_enabled()'s doc comment - this is a
     // reasoned first cut, not a measured optimum, tune on the bench).
     // Coefficients computed once here (expf() at init only, never in the
-    // per-sample squelch_process() path), same convention as the
+    // per-sample squelch_update() path), same convention as the
     // compressor's own attack/release coefficients below.
     h->squelch.enable = false;
     h->squelch.threshold = 0.01f;
@@ -1015,15 +1041,26 @@ void IRAM_ATTR ssb_dsp_process_sample(ssb_dsp_handle_t handle,
     int64_t t0 = esp_timer_get_time();
     audio_sample *= handle->mic_gain_linear;
 
-    // 2026-09-25: Mic Squelch - deliberately BEFORE the compressor, not
-    // downstream on the envelope like envelope_floor/ALC/Soft-Limit - see
-    // ssb_dsp_set_squelch_enabled()'s doc comment in ssb_dsp.h for why
-    // ordering matters here specifically (the compressor's makeup_gain
-    // multiplies every sample unconditionally, so gating after it would
-    // mean gating already-amplified noise). Unconditional check on
+    // 2026-09-25/26: Mic Squelch DETECTOR tap - deliberately here, reading
+    // the post-mic-gain/pre-compressor sample, not downstream on the
+    // envelope like envelope_floor/ALC/Soft-Limit - see
+    // ssb_dsp_set_squelch_enabled()'s doc comment in ssb_dsp.h for why that
+    // choice of TAP POINT still matters (the compressor's makeup_gain
+    // multiplies every sample unconditionally, so a level detector reading
+    // downstream of it would be looking at already-amplified noise).
+    //
+    // 2026-09-26 CORRECTION: this used to also gate audio_sample itself
+    // (return x * gain) right here, before the Hilbert transform - see
+    // squelch_update()'s doc comment above for the frozen-carrier bug that
+    // caused. As of today this call ONLY updates the detector/hysteresis/
+    // gain state machine; audio_sample is left completely untouched here
+    // and flows into the compressor/EQ/Hilbert path exactly as it would
+    // with squelch disabled. handle->squelch.gain (now just state, not
+    // applied here) gets multiplied into the computed envelope further
+    // down instead - see the comment there. Unconditional check on
     // squelch.enable, independent of audio_fx_configured - same "always
     // available" reasoning as mic gain just above.
-    if (handle->squelch.enable) audio_sample = squelch_process(&handle->squelch, audio_sample);
+    if (handle->squelch.enable) squelch_update(&handle->squelch, audio_sample);
 
     // Optional pre-Hilbert conditioning: compressor -> EQ, on the raw
     // sample, before anything enters the Hilbert delay line. This keeps
@@ -1140,6 +1177,22 @@ void IRAM_ATTR ssb_dsp_process_sample(ssb_dsp_handle_t handle,
     int64_t t4 = esp_timer_get_time();
     uint32_t sqrt_us = (uint32_t)(t4 - t3);
     if (sqrt_us > handle->max_sqrt_us) handle->max_sqrt_us = sqrt_us;
+
+    // 2026-09-26: Mic Squelch gate, applied HERE - to the computed ENVELOPE,
+    // post-Hilbert - rather than pre-Hilbert to audio_sample. See
+    // squelch_update()'s doc comment above for the frozen-carrier bug this
+    // replaces (gating audio_sample itself froze I=Q=0 -> atan2(0,0) ->
+    // zero frequency deviation, a genuine unmodulated carrier). `phase`
+    // above was already computed from the real, ungated I/Q and is left
+    // completely untouched - it's mathematically scale-invariant to this
+    // multiply (atan2(k*Q,k*I) == atan2(Q,I) for k>0) - so the Hilbert path
+    // keeps dithering off real mic noise even with the gate fully closed,
+    // while envelope (and so transmitted RF power, and the null-bias
+    // diagnostic's energy weighting just below, which should reflect what
+    // actually gets transmitted) can still be driven to a true, exact
+    // zero. handle->squelch.gain is plain state now (see squelch_update()),
+    // not applied anywhere else.
+    if (handle->squelch.enable) envelope *= handle->squelch.gain;
 
     float dphi = 0.0f;
     if (handle->have_prev_phase) {

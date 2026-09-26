@@ -264,24 +264,70 @@ float ssb_dsp_get_mic_gain_db(ssb_dsp_handle_t handle);
  *        "spiky/crackly output at low mic input" no matter how finely its
  *        step size was tuned, only reduce how far into a bad predistort
  *        region near-silence could drive. This is the actual gate: below
- *        threshold, output is forced toward true zero; above it, audio
- *        passes through unaffected.
+ *        threshold, transmitted RF power (the envelope) is forced toward
+ *        true zero; above it, audio passes through unaffected.
  *
- *        PLACEMENT - deliberately BEFORE the compressor/EQ (right after
- *        mic gain, at the very top of ssb_dsp_process_sample()), not
- *        downstream on the demodulated envelope like envelope_floor/
- *        envelope_alc/envelope_softlimit are. This matters mechanically,
- *        not just stylistically: the compressor's makeup_gain multiplies
- *        EVERY sample unconditionally, including ones below its own
- *        threshold (see compressor_process() in ssb_dsp.c - `gain=1.0`
- *        below threshold, but `x * gain * makeup_gain` still applies
- *        makeup regardless) - so quiet residual noise gets the same fixed
- *        dB boost real speech does. Squelching AFTER the compressor would
- *        mean gating a signal that's already been amplified up toward the
- *        same operating range as quiet real speech, making the two hard
- *        to tell apart. Squelching BEFORE it (here) gates the noise at
- *        its true, un-boosted level, before anything downstream gets a
- *        chance to amplify it.
+ *        2026-09-26 CORRECTION - WHERE the gate is APPLIED changed, based
+ *        on real-hardware feedback. The first cut (below, and still
+ *        accurate for everything except the exact application point)
+ *        multiplied audio_sample itself, before the Hilbert transform.
+ *        On real hardware this was reported as: "the squelch drops to
+ *        absolute zero input to dsp that results in no USB noise but only
+ *        a small carrier tone" - i.e. LESS pleasant than the noise it
+ *        replaced, not more. Root cause: forcing audio_sample to an exact,
+ *        bit-constant 0.0 fills the Hilbert delay line with zeros, so
+ *        I=Q=0; atan2(0,0) then returns a fixed, degenerate phase value
+ *        every sample (confirmed both analytically and with a standalone
+ *        test harness - see moving_forward_notes.md's 2026-09-26 entry),
+ *        collapsing computed frequency deviation to exactly 0. Any real
+ *        analog RF leakage at that "envelope=0" operating point (a common
+ *        EER/polar-PA reality from finite switching-PA off-isolation, not
+ *        something firmware can necessarily eliminate) then presents as a
+ *        discrete, easily audible CW tone rather than as quiet noise.
+ *
+ *        FIX (per explicit instruction: "keep the hilbert fed with noise
+ *        but reduce env to zero") - the gate/gain state machine below is
+ *        unchanged, but it no longer touches audio_sample at all.
+ *        audio_sample flows into the compressor/EQ/Hilbert path exactly as
+ *        it would with squelch disabled, so the Hilbert transform (and the
+ *        phase it derives via atan2(Q,I)) always sees the real,
+ *        unattenuated signal and never freezes. The resulting smoothed
+ *        gain is instead multiplied into the ENVELOPE - computed
+ *        downstream, post-Hilbert, as sqrt(I^2+Q^2) - in
+ *        ssb_dsp_process_sample(), immediately after that computation.
+ *        This is sound specifically because phase is mathematically
+ *        scale-invariant to any uniform positive gain
+ *        (atan2(k*Q, k*I) == atan2(Q, I) for all k > 0), while envelope
+ *        scales exactly as k*sqrt(I^2+Q^2) - so gating envelope alone
+ *        gives true RF-power silence (a real, exact zero - not just "very
+ *        quiet") without perturbing phase/frequency at all. Net effect:
+ *        when the gate is closed, the carrier keeps dithering off genuine
+ *        mic noise (turning any residual RF leakage into innocuous
+ *        incoherent noise, as it would be with squelch off) instead of
+ *        locking to a discrete, audible tone. See squelch_update()'s doc
+ *        comment in ssb_dsp.c for the code-level detail. NOT YET
+ *        bench-validated against real hardware - the original design's
+ *        gate/hysteresis/level-detector behavior WAS confirmed to "work
+ *        well" on real hardware (see moving_forward_notes.md), but that
+ *        was before this application-point correction.
+ *
+ *        PLACEMENT - the level DETECTOR taps the sample deliberately
+ *        BEFORE the compressor/EQ (right after mic gain, at the very top
+ *        of ssb_dsp_process_sample()), not downstream on the demodulated
+ *        envelope like envelope_floor/envelope_alc/envelope_softlimit are
+ *        - this is about where the gate LOOKS, not (as of the correction
+ *        above) where it ACTS. This matters mechanically, not just
+ *        stylistically: the compressor's makeup_gain multiplies EVERY
+ *        sample unconditionally, including ones below its own threshold
+ *        (see compressor_process() in ssb_dsp.c - `gain=1.0` below
+ *        threshold, but `x * gain * makeup_gain` still applies makeup
+ *        regardless) - so quiet residual noise gets the same fixed dB
+ *        boost real speech does. A detector reading downstream of the
+ *        compressor would be looking at a signal that's already been
+ *        amplified up toward the same operating range as quiet real
+ *        speech, making the two hard to tell apart. Reading it here gives
+ *        the detector the noise at its true, un-boosted level, before
+ *        anything downstream gets a chance to amplify it.
  *
  *        ALGORITHM - three stages, not a single instantaneous compare,
  *        specifically to avoid two failure modes: (1) a single noisy
@@ -314,11 +360,14 @@ float ssb_dsp_get_mic_gain_db(ssb_dsp_handle_t handle);
  *          c) GAIN RAMP - the resulting open/closed decision drives a
  *             SEPARATE one-pole smoothed gain (fast attack so genuine
  *             speech onsets aren't clipped, slow release so brief
- *             in-word dips don't cause audible chatter) that's what
- *             actually multiplies the sample - continuous by
- *             construction, so (unlike the reverted hard-clamp
- *             envelope_floor design) there's no derivative discontinuity
- *             introduced at the threshold itself.
+ *             in-word dips don't cause audible chatter). As of the
+ *             2026-09-26 correction above, this gain multiplies the
+ *             computed ENVELOPE (post-Hilbert), NOT audio_sample - but it
+ *             is still continuous by construction, so (unlike the
+ *             reverted hard-clamp envelope_floor design) there's no
+ *             derivative discontinuity introduced at the threshold
+ *             itself, now in the envelope rather than in the sample
+ *             stream.
  *
  *        Threshold is in the same full-scale-referenced linear units as
  *        SSB_DSP_COMP_THRESHOLD (0.30) and the ~0.85 mic-gain calibration
